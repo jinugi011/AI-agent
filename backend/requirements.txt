@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+python-dotenv==1.0.1
+ollama==0.4.0
+sentence-transformers==3.2.1
+faiss-cpu==1.15.1
+qdrant-client==1.13.3
+numpy>=2.0.2
+
