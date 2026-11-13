@@ -1,5 +1,6 @@
 import { ChildProcess, spawn } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { ChatViewProvider } from './chatView';
@@ -9,11 +10,22 @@ import { OriginalContentProvider } from './tools';
 let backendProc: ChildProcess | undefined;
 let output: vscode.OutputChannel;
 
-/** AI-agent 루트 찾기: 설정 → 확장 위치(개발 모드) → 워크스페이스. */
+/** install.sh 가 기록한 설치 위치 (~/.config/local-agent/config.json). */
+function installedRoot(): string {
+  try {
+    const file = path.join(os.homedir(), '.config', 'local-agent', 'config.json');
+    return JSON.parse(fs.readFileSync(file, 'utf8')).agentRoot ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/** AI-agent 루트 찾기: 설정 → 설치 기록 → 확장 위치(개발 모드) → 워크스페이스. */
 function findAgentRoot(ctx: vscode.ExtensionContext): string | undefined {
   const isRoot = (p: string) => fs.existsSync(path.join(p, 'backend', 'app', 'main.py')) && fs.existsSync(path.join(p, 'engine'));
   const candidates = [
     vscode.workspace.getConfiguration('localAgent').get<string>('agentRoot', ''),
+    installedRoot(),
     path.resolve(ctx.extensionPath, '..'),
     ...(vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
   ].filter(Boolean) as string[];

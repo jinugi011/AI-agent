@@ -1,0 +1,28 @@
+<idea-plugin>
+  <id>com.localagent.coding</id>
+  <name>Local Coding Agent</name>
+  <vendor>local</vendor>
+  <description><![CDATA[
+    Local coding agent chat powered by an on-device model (Rust + llama.cpp).<br/>
+    로컬 코딩 모델(Rust + llama.cpp)로 자연어 채팅을 통해 코딩하는 에이전트.
+    파일 읽기/수정, 명령 실행(승인), 선호·제약 저장, 요구사항 하네스, 모델 관리를 지원합니다.
+  ]]></description>
+  <depends>com.intellij.modules.platform</depends>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <toolWindow id="Local Agent" anchor="right" icon="/icons/agent.svg"
+                factoryClass="com.localagent.ChatToolWindowFactory"/>
+    <applicationService serviceImplementation="com.localagent.AgentSettings"/>
+    <applicationConfigurable parentId="tools" instance="com.localagent.AgentConfigurable"
+                             id="com.localagent.settings" displayName="Local Coding Agent"/>
+    <notificationGroup id="Local Agent" displayType="BALLOON"/>
+  </extensions>
+
+  <actions>
+    <action id="LocalAgent.AskSelection" class="com.localagent.AskSelectionAction"
+            text="Local Agent: 선택 영역에 대해 묻기" description="선택한 코드를 로컬 에이전트에 질문">
+      <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+      <keyboard-shortcut keymap="$default" first-keystroke="meta shift L"/>
+    </action>
+  </actions>
+</idea-plugin>

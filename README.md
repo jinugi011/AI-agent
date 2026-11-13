@@ -2,7 +2,7 @@
 
 로컬 GGUF 코딩 모델(Rust + llama.cpp/Metal)로 git 레포에 직접 코드를 작성하는 에이전트.
 요구사항을 먼저 테스트 하네스로 만들고, 테스트가 통과할 때까지 구현을 반복한다.
-VS Code 채팅 확장(`vscode-extension/`)으로 자연어 코딩을 지원한다.
+VS Code 확장(`vscode-extension/`)과 IntelliJ 플러그인(`intellij-plugin/`)의 채팅창으로 자연어 코딩을 지원한다.
 
 **전체 작업 내역과 사용 매뉴얼: [docs/MANUAL.md](docs/MANUAL.md)**
 
@@ -12,7 +12,15 @@ frontend (React)  ──►  backend (FastAPI :8010)  ──►  engine (Rust, l
                             └─►  Qdrant (:6333)  code-style / agent-preferences
 ```
 
-## 빠른 시작
+## 새 PC에 설치
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jinugi011/AI-agent/main/install.sh | bash
+local-agent start
+```
+자세한 내용: [docs/MANUAL.md §3.0](docs/MANUAL.md)
+
+## 빠른 시작 (이미 설치된 PC)
 
 ```bash
 brew install rust            # 최초 1회

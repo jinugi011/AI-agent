@@ -2,55 +2,143 @@
   "name": "local-coding-agent",
   "displayName": "Local Coding Agent",
   "description": "로컬 코딩 모델(Rust + llama.cpp)로 자연어 채팅을 통해 코딩하는 에이전트",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "local",
   "license": "UNLICENSED",
   "private": true,
-  "engines": { "vscode": "^1.95.0" },
-  "categories": ["AI", "Chat", "Programming Languages"],
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
   "main": "./out/extension.js",
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "viewsContainers": {
-      "activitybar": [
-        { "id": "localAgent", "title": "Local Agent", "icon": "media/icon.svg" }
+      "secondarySidebar": [
+        {
+          "id": "localAgentRight",
+          "title": "Local Agent",
+          "icon": "media/icon.svg"
+        }
       ]
     },
     "views": {
-      "localAgent": [
-        { "type": "webview", "id": "localAgent.chat", "name": "Chat" }
+      "localAgentRight": [
+        {
+          "type": "webview",
+          "id": "localAgent.chat",
+          "name": "Chat"
+        }
       ]
     },
     "commands": [
-      { "command": "localAgent.focus", "title": "Local Agent: 채팅 열기" },
-      { "command": "localAgent.newChat", "title": "Local Agent: 새 대화", "icon": "$(add)" },
-      { "command": "localAgent.askAboutSelection", "title": "Local Agent: 선택 영역에 대해 묻기" },
-      { "command": "localAgent.startBackend", "title": "Local Agent: 백엔드 시작" },
-      { "command": "localAgent.setAgentRoot", "title": "Local Agent: AI-agent 폴더 지정" }
+      {
+        "command": "localAgent.focus",
+        "title": "Local Agent: 채팅 열기"
+      },
+      {
+        "command": "localAgent.newChat",
+        "title": "Local Agent: 새 대화",
+        "icon": "$(add)"
+      },
+      {
+        "command": "localAgent.askAboutSelection",
+        "title": "Local Agent: 선택 영역에 대해 묻기"
+      },
+      {
+        "command": "localAgent.startBackend",
+        "title": "Local Agent: 백엔드 시작"
+      },
+      {
+        "command": "localAgent.setAgentRoot",
+        "title": "Local Agent: AI-agent 폴더 지정"
+      }
     ],
     "menus": {
       "view/title": [
-        { "command": "localAgent.newChat", "when": "view == localAgent.chat", "group": "navigation" }
+        {
+          "command": "localAgent.newChat",
+          "when": "view == localAgent.chat",
+          "group": "navigation"
+        }
       ],
       "editor/context": [
-        { "command": "localAgent.askAboutSelection", "when": "editorHasSelection", "group": "navigation@9" }
+        {
+          "command": "localAgent.askAboutSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@9"
+        }
       ]
     },
     "keybindings": [
-      { "command": "localAgent.focus", "key": "cmd+shift+l", "mac": "cmd+shift+l", "win": "ctrl+shift+l" }
+      {
+        "command": "localAgent.focus",
+        "key": "cmd+shift+l",
+        "mac": "cmd+shift+l",
+        "win": "ctrl+shift+l"
+      }
     ],
     "configuration": {
       "title": "Local Coding Agent",
       "properties": {
-        "localAgent.backendUrl": { "type": "string", "default": "http://127.0.0.1:8010", "description": "FastAPI 백엔드 주소" },
-        "localAgent.engineUrl": { "type": "string", "default": "http://127.0.0.1:8091", "description": "Rust 추론 엔진 주소" },
-        "localAgent.agentRoot": { "type": "string", "default": "", "description": "AI-agent 프로젝트 폴더 (백엔드 자동 실행에 사용)" },
-        "localAgent.autoStartBackend": { "type": "boolean", "default": true, "description": "백엔드가 꺼져 있으면 자동 실행" },
-        "localAgent.approveEdits": { "type": "string", "enum": ["auto", "ask"], "default": "auto", "description": "파일 수정 승인 방식 (auto 여도 대화별 되돌리기 가능)" },
-        "localAgent.approveCommands": { "type": "string", "enum": ["ask", "auto"], "default": "ask", "description": "터미널 명령 실행 승인 방식" },
-        "localAgent.maxSteps": { "type": "number", "default": 16, "description": "한 요청에서 도구 호출 최대 반복 수" },
-        "localAgent.maxTokens": { "type": "number", "default": 4096, "description": "응답 1회 최대 토큰" },
-        "localAgent.temperature": { "type": "number", "default": 0.2 }
+        "localAgent.backendUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8010",
+          "description": "FastAPI 백엔드 주소"
+        },
+        "localAgent.engineUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8091",
+          "description": "Rust 추론 엔진 주소"
+        },
+        "localAgent.agentRoot": {
+          "type": "string",
+          "default": "",
+          "description": "AI-agent 프로젝트 폴더 (백엔드 자동 실행에 사용)"
+        },
+        "localAgent.autoStartBackend": {
+          "type": "boolean",
+          "default": true,
+          "description": "백엔드가 꺼져 있으면 자동 실행"
+        },
+        "localAgent.approveEdits": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "ask"
+          ],
+          "default": "auto",
+          "description": "파일 수정 승인 방식 (auto 여도 대화별 되돌리기 가능)"
+        },
+        "localAgent.approveCommands": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "auto"
+          ],
+          "default": "ask",
+          "description": "터미널 명령 실행 승인 방식"
+        },
+        "localAgent.maxSteps": {
+          "type": "number",
+          "default": 16,
+          "description": "한 요청에서 도구 호출 최대 반복 수"
+        },
+        "localAgent.maxTokens": {
+          "type": "number",
+          "default": 4096,
+          "description": "응답 1회 최대 토큰"
+        },
+        "localAgent.temperature": {
+          "type": "number",
+          "default": 0.2
+        }
       }
     }
   },

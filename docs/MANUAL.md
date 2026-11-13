@@ -30,6 +30,7 @@
 | Rust 추론 엔진 | `engine/` | GGUF 모델을 Metal GPU로 구동. `/health`, `/generate`(일반/스트리밍) |
 | 백엔드 | `backend/app/` | 레포·선호·하네스·모델 관리 API |
 | VS Code 확장 | `vscode-extension/` | 채팅 UI와 에이전트 루프 |
+| IntelliJ 플러그인 | `intellij-plugin/` | 같은 채팅 UI(JCEF) + Kotlin 에이전트 루프 |
 | 웹 대시보드 | `frontend/` | 브라우저용 작업 화면 (Coding Agent 탭) |
 | 벡터 DB | Qdrant (Docker) | 코드 스타일·코딩 방법·선호 벡터 저장 |
 | 모델 파일 | `models/` | `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` (18.6GB, git 제외) |
@@ -78,7 +79,10 @@
 | Rust 엔진 (7B / 30B 실모델) | 7B ≈ 50 tok/s, 30B ≈ 60 tok/s, 한글 스트리밍·중단 정상 |
 | 하네스 작업 실모델 e2e (7B) | 데모 레포에서 테스트 생성→구현→통과→커밋 성공 (31초) |
 | 채팅 루프 실모델 시뮬레이션 (30B) | 도구 프로토콜 준수 확인. 아래 4.3의 품질 문제 발견 후 프롬프트·실행 규칙 보완 |
-| **VS Code 안에서 실제 UI 동작** | **아직 확인 전** — 설치 후 첫 사용 시 확인 필요 |
+| VS Code 확장 설치·표시 | 설치·활성화 확인, 0.1.1에서 오른쪽 보조 사이드바로 이동 (채팅 기능 전체 점검은 사용하면서 확인) |
+| IntelliJ 플러그인 빌드 · 프로토콜 테스트 · 구조 검증 | 성공 · 5개 통과 · 경고 없음 |
+| IntelliJ 플러그인 로드 (샌드박스 IDE) | 오류 없이 로드됨 ("Loaded custom plugins: Local Coding Agent") |
+| **IntelliJ 채팅 패널 실제 동작** | **아직 확인 전** — 프로젝트를 열고 툴 윈도우를 띄워 확인 필요 |
 
 ### 2.4 개발 중 발견해 고친 문제
 
@@ -94,7 +98,70 @@
 
 ## 3. 설치
 
-### 3.1 최초 1회
+### 3.0 새 PC에 한 번에 설치 (설치 스크립트 · 권장)
+
+다른 Mac에 같은 환경을 만들 때는 `install.sh` 하나로 끝납니다.
+
+**준비물**: macOS (Apple Silicon 권장), 인터넷, 디스크 여유 (30B 모델 기준 약 35GB).
+VS Code / IntelliJ 는 미리 설치해 두면 플러그인까지 자동으로 설치됩니다.
+
+**실행** — 터미널에서 둘 중 하나:
+```bash
+# 1) 한 줄 설치 (레포를 ~/AI-agent 에 받음)
+curl -fsSL https://raw.githubusercontent.com/jinugi011/AI-agent/main/install.sh | bash
+
+# 2) 레포를 직접 받은 뒤 실행
+git clone https://github.com/jinugi011/AI-agent.git ~/AI-agent
+cd ~/AI-agent && ./install.sh
+```
+> 레포가 비공개라면 먼저 GitHub 로그인(`brew install gh && gh auth login`)이 필요합니다.
+> 이 PC에서 작업한 최신 내용이 다른 PC에 가려면 **먼저 commit · push** 되어 있어야 합니다.
+
+**설치 스크립트가 하는 일** (이미 된 단계는 건너뜀 · 다시 실행해도 안전)
+
+| 단계 | 내용 |
+|---|---|
+| 1 | macOS·메모리·디스크 확인, Xcode Command Line Tools 확인 |
+| 2 | Homebrew (없으면 설치 여부 질문) → git, python@3.13, node, rust, cmake |
+| 3 | 레포 받기 (`~/AI-agent`, 이미 있으면 `git pull`) |
+| 4 | 백엔드 가상환경 + **검증된 고정 버전** 패키지 (`backend/requirements.lock.txt`) + 임베딩 모델 |
+| 5 | Rust 엔진 빌드 (llama.cpp + Metal) |
+| 6 | **메모리에 맞는 코딩 모델 자동 선택·다운로드** — 32GB↑: 30B · 16GB↑: 14B · 그 외: 7B |
+| 7 | Docker 확인 (없으면 Docker Desktop 설치 여부 질문) → Qdrant 실행 |
+| 8 | 웹 대시보드 의존성 |
+| 9 | VS Code 확장 빌드·설치 (VS Code 가 있을 때) |
+| 10 | IntelliJ 플러그인 빌드·설치 (IntelliJ 2025.2+ 가 있을 때, IDE 내장 Java 로 빌드 — 별도 JDK 불필요) |
+| 11 | 설치 위치를 `~/.config/local-agent/config.json` 에 기록 → **VS Code·IntelliJ 가 자동으로 찾음 (폴더 지정 불필요)** |
+| 12 | `local-agent` 명령 등록 (`~/.local/bin`, PATH 추가 여부 질문) |
+
+**옵션**
+
+| 옵션 | 설명 |
+|---|---|
+| `--model auto\|30b\|14b\|7b\|none` | 모델 선택 (기본 auto) |
+| `--dir <경로>` | 설치 위치 (기본 `~/AI-agent`) |
+| `--skip-vscode` · `--skip-intellij` · `--skip-docker` | 해당 단계 생략 |
+| `-y` | 모든 질문에 '예' |
+
+예) 메모리가 적은 노트북에 7B 로: `./install.sh --model 7b`
+
+**설치 후**
+```bash
+local-agent start      # Qdrant + 엔진 + 백엔드 실행 (새 터미널에서)
+local-agent status     # 상태 확인
+local-agent stop       # 종료
+local-agent logs       # 엔진·백엔드 로그
+local-agent update     # 최신 소스 받고 재설치 (모델 유지)
+```
+그다음 VS Code 는 **Developer: Reload Window** 후 `Cmd+Shift+P` → **Local Agent: 채팅 열기**,
+IntelliJ 는 재시작 후 오른쪽 사이드바 **Local Agent**.
+설치 로그: `~/.config/local-agent/install.log`
+
+**검증**: 이 PC에서 ① 이미 설치된 상태로 재실행(14초, 전 단계 통과) ② 가상환경·빌드·모델이 없는 빈 복사본에서
+처음부터 설치(1분 43초 — 패키지 캐시 있음, 새 PC는 모델 제외 10~20분 예상) 를 확인했습니다.
+아직 **실제 다른 Mac 에서는 실행해 보지 않았습니다.**
+
+### 3.1 수동 설치 (스크립트 없이)
 
 ```bash
 cd ~/Desktop/Project2026/AI-agent
@@ -102,8 +169,8 @@ cd ~/Desktop/Project2026/AI-agent
 # Rust (엔진 빌드용)
 brew install rust
 
-# 백엔드 가상환경
-cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && cd ..
+# 백엔드 가상환경 (검증된 고정 버전)
+cd backend && python3.13 -m venv .venv && .venv/bin/pip install -r requirements.lock.txt && cd ..
 
 # Rust 엔진 빌드 (수 분)
 cd engine && cargo build --release && cd ..
@@ -117,20 +184,102 @@ docker compose -f docker-compose.vector.yml up -d qdrant
 
 ### 3.2 VS Code 확장 설치
 
-```bash
-cd vscode-extension
-npm install && npm run package          # local-coding-agent-0.1.0.vsix 생성 (이미 생성됨)
-"/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
-  --install-extension local-coding-agent-0.1.0.vsix
+설치 파일: `vscode-extension/local-coding-agent-0.1.1.vsix` (이미 만들어져 있음)
+
+**1) 확장 설치** — 둘 중 편한 방법
+
+- 터미널:
+  ```bash
+  cd ~/Desktop/Project2026/AI-agent/vscode-extension
+  "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
+    --install-extension local-coding-agent-0.1.1.vsix --force
+  ```
+- VS Code 화면: 확장 탭(`Cmd+Shift+X`) → 오른쪽 위 **`…`** → **VSIX에서 설치…** → 위 파일 선택
+
+설치 후 `Cmd+Shift+P` → **Developer: Reload Window** 로 창을 새로고침합니다.
+
+**2) AI-agent 폴더 지정 (처음 한 번만)**
+
+`Cmd+,` → `localAgent.agentRoot` 검색 → 아래 경로 입력. 이후 VS Code를 켜면 백엔드가 자동 실행됩니다.
 ```
+/Users/<사용자>/Desktop/Project2026/AI-agent
+```
+(명령 팔레트의 **Local Agent: AI-agent 폴더 지정** 으로 폴더를 골라도 됩니다.)
 
-또는 VS Code → 확장 → `…` 메뉴 → **VSIX에서 설치…** → 위 파일 선택.
+**3) 채팅창 열기 — 오른쪽 보조 사이드바**
 
-설치 후 설정(`Cmd+,` → "Local Agent")에서 **`localAgent.agentRoot`** 를
-`/Users/<사용자>/Desktop/Project2026/AI-agent` 로 지정하면 백엔드가 자동으로 실행됩니다.
-(지정하지 않으면 명령 팔레트의 **Local Agent: 백엔드 시작** 실행 시 폴더를 물어봅니다.)
+0.1.1부터 채팅창은 **오른쪽 보조 사이드바**에 뜹니다.
+
+- 보조 사이드바가 닫혀 있으면 `Cmd+Option+B` (메뉴: 보기 → 모양 → 보조 사이드바)
+- 위쪽 탭에서 **Local Agent** 선택 (Codex 등 다른 탭과 나란히 표시)
+- 가장 확실한 방법: `Cmd+Shift+P` → **Local Agent: 채팅 열기**
+- 다른 위치가 좋으면 탭을 끌어서 옮기면 VS Code가 위치를 기억합니다.
+
+> `Cmd+Shift+L` 은 VS Code 기본 단축키("일치하는 항목 모두 선택")와 겹쳐 채팅이 안 열릴 수 있습니다. 명령 팔레트를 쓰세요.
+
+**4) 다시 설치할 때 (확장 코드를 고친 경우)**
+```bash
+cd ~/Desktop/Project2026/AI-agent/vscode-extension
+npm run package
+"/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
+  --install-extension local-coding-agent-0.1.1.vsix --force
+```
+그 다음 **Developer: Reload Window**.
 
 > 확장 개발 모드: `vscode-extension` 폴더를 VS Code로 열고 `F5` → 새 창에서 바로 테스트.
+
+### 3.3 IntelliJ 플러그인 설치
+
+IntelliJ IDEA **2025.2 이상**(CE/Ultimate)에서 동작합니다. 현재 설치된 IntelliJ IDEA CE 2025.2.3은 지원됩니다.
+Android Studio는 버전 체계가 달라 동작 여부를 확인하지 않았습니다.
+
+설치 파일: `intellij-plugin/build/distributions/local-coding-agent-intellij-0.1.0.zip` (이미 만들어져 있음)
+
+**1) 플러그인 설치**
+
+1. IntelliJ 메뉴 **IntelliJ IDEA → Settings…** (`Cmd+,`)
+2. 왼쪽 **Plugins**
+3. 위쪽 **⚙ (톱니바퀴)** → **Install Plugin from Disk…**
+4. 아래 파일 선택 (파일 창에서 `Cmd+Shift+G` 를 누르고 경로를 붙여넣으면 바로 이동)
+   ```
+   /Users/<사용자>/Desktop/Project2026/AI-agent/intellij-plugin/build/distributions/local-coding-agent-intellij-0.1.0.zip
+   ```
+5. **Restart IDE** — 실행 중인 앱(예: SpringBoot 서버)이 있으면 먼저 정리
+
+**2) AI-agent 폴더 지정 (처음 한 번만)**
+
+**Settings → Tools → Local Coding Agent** → **AI-agent 폴더**에 아래 경로 입력 → **OK**
+```
+/Users/<사용자>/Desktop/Project2026/AI-agent
+```
+백엔드가 꺼져 있으면 채팅창을 열 때 자동으로 실행됩니다.
+
+**3) 사용**
+
+1. 작업할 프로젝트를 엽니다 (git 레포).
+2. **오른쪽 사이드바**의 **Local Agent** 클릭
+3. 상단 상태 표시 확인 → 🟢 `Qwen3-Coder-30B…` 이면 바로 자연어로 요청
+   (🟡 엔진 꺼짐이면 카드의 **엔진 시작** 버튼 또는 "엔진 시작해줘")
+4. 에디터에서 코드 선택 → 우클릭 → **Local Agent: 선택 영역에 대해 묻기**
+
+| 기능 | IntelliJ에서 |
+|---|---|
+| 채팅 UI | VS Code 확장과 같은 화면(`chat.js`/`chat.css` 공유, JCEF 내장 브라우저), IDE 테마 색 자동 적용 |
+| 파일 수정 | IntelliJ 편집 명령으로 반영 → 에디터에서 **Cmd+Z** 로도 되돌리기 가능 |
+| diff | 채팅의 **diff** → IntelliJ 비교 창 |
+| 선택 영역 질문 | 에디터 우클릭 → **Local Agent: 선택 영역에 대해 묻기** (`Cmd+Shift+L`) |
+| 새 대화 | 툴 윈도우 제목줄의 **+** 버튼 또는 `/new` |
+| 설정 | Settings → Tools → Local Coding Agent (항목은 VS Code 설정과 동일) |
+| 백엔드 로그 | `backend/data/agent_state/backend-intellij.log` |
+
+**4) 다시 빌드·설치할 때 (플러그인 코드를 고친 경우)**
+```bash
+cd ~/Desktop/Project2026/AI-agent/intellij-plugin
+gradle buildPlugin
+```
+그 다음 1)의 **Install Plugin from Disk…** 로 새 zip을 설치하고 IDE를 재시작합니다.
+
+> 개발 모드: `gradle runIde` → 플러그인이 설치된 샌드박스 IntelliJ 실행 (사용자 설정과 분리됨).
 
 ---
 
@@ -139,8 +288,9 @@ npm install && npm run package          # local-coding-agent-0.1.0.vsix 생성 (
 ### 4.1 시작 순서
 
 1. Qdrant가 떠 있는지 확인 (`docker ps`에 `coding-agent-qdrant`)
-2. 작업할 프로젝트 폴더(git 레포)를 VS Code로 연다
-3. 사이드바의 **Local Agent** 아이콘(또는 `Cmd+Shift+L`)
+2. 작업할 프로젝트 폴더(git 레포)를 VS Code 또는 IntelliJ로 연다
+3. 채팅창 열기 — VS Code: 오른쪽 보조 사이드바의 **Local Agent** (`Cmd+Shift+P` → **Local Agent: 채팅 열기**) /
+   IntelliJ: 오른쪽 사이드바의 **Local Agent**
 4. 상단 상태줄 확인
    - 🔴 백엔드 꺼짐 → **백엔드 시작** 버튼
    - 🟡 엔진 꺼짐 → 설정 카드에서 모델의 **엔진 시작** (30B 로딩 약 10~30초), 또는 채팅에 "엔진 시작해줘"
@@ -260,6 +410,11 @@ Rust 엔진: `GET /health`, `POST /generate` `{messages, max_tokens, temperature
 
 | 증상 | 확인/조치 |
 |---|---|
+| VS Code에서 채팅창이 안 보임 | `Cmd+Shift+P` → **Local Agent: 채팅 열기**. 보조 사이드바가 닫혀 있으면 `Cmd+Option+B`. 그래도 없으면 **Developer: Reload Window**, 확장 탭에서 `Local Coding Agent` 설치 여부 확인 (VS Code 프로필을 여러 개 쓰면 다른 프로필에 설치됐을 수 있음) |
+| IntelliJ에서 Local Agent가 안 보임 | Settings → Plugins → Installed 에 `Local Coding Agent` 가 켜져 있는지 확인 → IDE 재시작. 메뉴 **View → Tool Windows → Local Agent** |
+| IntelliJ 채팅창이 빈 화면 | JCEF(내장 브라우저)가 꺼진 IDE일 수 있음 → JetBrains Runtime 으로 실행 중인지 확인 |
+| 설치 스크립트 실패 | `~/.config/local-agent/install.log` 확인 후 다시 `./install.sh` (중단된 단계부터 이어서 진행, 모델 다운로드도 이어받음) |
+| `local-agent: command not found` | `~/.local/bin/local-agent` 로 실행하거나 `~/.zshrc` 에 `export PATH="$HOME/.local/bin:$PATH"` 추가 |
 | 상태줄 "백엔드 꺼짐" | `localAgent.agentRoot` 지정 → **Local Agent: 백엔드 시작**. 로그는 출력 패널 "Local Agent" |
 | 엔진 시작 실패 | `backend/data/agent_state/engine.log` 확인. 바이너리 없으면 `cd engine && cargo build --release` |
 | 엔진 포트 충돌 | 8091을 쓰는 프로세스 확인: `lsof -nP -iTCP:8091 -sTCP:LISTEN` |
