@@ -5,21 +5,14 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 
-import ollama
-
+from . import llm_client
 from .config import settings
 from .vector_store import CodeVectorStore
 
 
 class LocalProjectAgent:
-    def __init__(self):
-        self.vector_store = CodeVectorStore(settings.vector_store_path)
-        self._bootstrap_default_project_style()
-
-    def _bootstrap_default_project_style(self):
-        default_project_root = Path("/Users/jinugi/Desktop/Project2026/YANGShopping")
-        if default_project_root.exists():
-            self.vector_store.add_project_style("YANGShopping", str(default_project_root))
+    def __init__(self, vector_store: CodeVectorStore | None = None):
+        self.vector_store = vector_store or CodeVectorStore(settings.vector_store_path)
 
     def _build_context(self, prompt: str) -> str:
         hits = self.vector_store.search(prompt, top_k=5)
@@ -77,17 +70,15 @@ class LocalProjectAgent:
         }}
         """
         try:
-            response = ollama.chat(
-                model=settings.default_model,
-                messages=[
+            response = llm_client.chat(
+                [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                format="json",
-                options={"temperature": 0.2, "num_predict": 1500},
+                max_tokens=1500,
+                temperature=0.2,
             )
-            raw = response["message"]["content"]
-            return json.loads(raw)
+            return llm_client.extract_json(response.text)
         except Exception:
             return {
                 "title": project_type.title(),
@@ -111,46 +102,97 @@ class LocalProjectAgent:
             }
 
     def create_project_template(self, payload: Dict[str, Any]) -> Path:
-        title = re.sub(r"[^a-zA-Z0-9가-힣\-_ ]", "", payload.get("title", "local-agent-project")).strip().replace(" ", "-").lower()
-        project_dir = Path(settings.project_root) / "generated_projects" / title
+        title = payload.get("title", "local-agent-project")
+        slug = re.sub(r"[^a-zA-Z0-9가-힣\-_ ]", "", title).strip().replace(" ", "-").lower() or "local-agent-project"
+        project_dir = Path(settings.project_root) / "generated_projects" / slug
         project_dir.mkdir(parents=True, exist_ok=True)
 
-        (project_dir / "README.md").write_text(
-            "# " + payload.get("title", "Generated Project") + "\n\n"
-            + payload.get("summary", "") + "\n\n"
-            + "## Stack\n" + "\n".join(f"- {x}" for x in payload.get("stack", [])) + "\n"
-            + "\n## Security\n" + "\n".join(f"- {x}" for x in payload.get("security", [])) + "\n",
-            encoding="utf-8",
-        )
+        stack = payload.get("stack", [])
+        features = payload.get("features", [])
+        security = payload.get("security", [])
+        tasks = payload.get("tasks", [])
+
+        readme_lines = [
+            f"# {title}",
+            "",
+            payload.get("summary", "A secure and scalable project scaffold."),
+            "",
+            "## Stack",
+            *[f"- {item}" for item in stack],
+            "",
+            "## Security",
+            *[f"- {item}" for item in security],
+            "",
+            "## Features",
+            *[f"- {item}" for item in features],
+            "",
+            "## Tasks",
+            *[f"- {task.get('phase', 'Planning')}: {task.get('task', '')}" for task in tasks],
+        ]
+        (project_dir / "README.md").write_text("\n".join(readme_lines) + "\n", encoding="utf-8")
+
+        project_manifest = {
+            "title": title,
+            "summary": payload.get("summary", ""),
+            "stack": stack,
+            "features": features,
+            "security": security,
+            "tasks": tasks,
+            "created_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        }
+        (project_dir / "project_manifest.json").write_text(json.dumps(project_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
         backend_dir = project_dir / "backend" / "app"
-        (backend_dir / "api").mkdir(parents=True, exist_ok=True)
-        (backend_dir / "services").mkdir(parents=True, exist_ok=True)
-        (backend_dir / "repositories").mkdir(parents=True, exist_ok=True)
-        (backend_dir / "models").mkdir(parents=True, exist_ok=True)
+        backend_api_dir = backend_dir / "api"
+        backend_services_dir = backend_dir / "services"
+        backend_repositories_dir = backend_dir / "repositories"
+        backend_models_dir = backend_dir / "models"
+        for directory in [backend_api_dir, backend_services_dir, backend_repositories_dir, backend_models_dir]:
+            directory.mkdir(parents=True, exist_ok=True)
+
+        (backend_dir / "__init__.py").write_text("", encoding="utf-8")
+        (backend_api_dir / "__init__.py").write_text("", encoding="utf-8")
+        (backend_services_dir / "__init__.py").write_text("", encoding="utf-8")
+        (backend_repositories_dir / "__init__.py").write_text("", encoding="utf-8")
+        (backend_models_dir / "__init__.py").write_text("", encoding="utf-8")
 
         (backend_dir / "main.py").write_text(
-            "from fastapi import FastAPI\n\nfrom app.api.routes import router\n\napp = FastAPI(title=\"Generated Project\")\napp.include_router(router)\n\n@app.get(\"/health\")\ndef health():\n    return {\"status\": \"ok\"}\n",
+            "from fastapi import FastAPI\n\nfrom app.api.routes import router\n\napp = FastAPI(title=\"" + title + "\")\napp.include_router(router)\n\n@app.get(\"/health\")\ndef health():\n    return {\"status\": \"ok\", \"project\": \"" + title + "\"}\n",
             encoding="utf-8",
         )
-        (backend_dir / "api" / "routes.py").write_text(
-            "from fastapi import APIRouter\n\nrouter = APIRouter(prefix=\"/api\", tags=[\"core\"])\n\n@router.get(\"/status\")\ndef status():\n    return {\"status\": \"ready\"}\n",
+        (backend_api_dir / "routes.py").write_text(
+            "from fastapi import APIRouter\n\nrouter = APIRouter(prefix=\"/api\", tags=[\"core\"])\n\n@router.get(\"/status\")\ndef status():\n    return {\"status\": \"ready\", \"message\": \"Project is running\"}\n\n@router.get(\"/summary\")\ndef summary():\n    return {\"summary\": \"Secure starter project scaffold\"}\n",
             encoding="utf-8",
         )
-        (backend_dir / "services" / "domain_service.py").write_text(
-            "class DomainService:\n    def get_status(self):\n        return {\"result\": \"ok\"}\n",
+        (backend_services_dir / "domain_service.py").write_text(
+            "class DomainService:\n    def get_status(self):\n        return {\"result\": \"ok\", \"source\": \"domain_service\"}\n",
             encoding="utf-8",
         )
-        (project_dir / "backend" / "requirements.txt").write_text("fastapi\nuvicorn\npydantic\n", encoding="utf-8")
+        (project_dir / "backend" / "requirements.txt").write_text(
+            "fastapi\nuvicorn\npydantic\npython-dotenv\n",
+            encoding="utf-8",
+        )
+        (project_dir / "backend" / ".env.example").write_text("APP_ENV=development\nSECRET_KEY=replace-me\n", encoding="utf-8")
 
         frontend_dir = project_dir / "frontend" / "src"
         frontend_dir.mkdir(parents=True, exist_ok=True)
         (frontend_dir / "App.jsx").write_text(
-            "export default function App() {\n  return (\n    <main style={{ padding: 24 }}>\n      <h1>Generated Project</h1>\n      <p>Secure, scalable starter UI</p>\n    </main>\n  );\n}\n",
+            "export default function App() {\n  return (\n    <main style={{ padding: 32, fontFamily: 'sans-serif', background: '#0f172a', color: '#e2e8f0', minHeight: '100vh' }}>\n      <h1>" + title + "</h1>\n      <p>Secure, scalable foundation generated by the local coding agent.</p>\n      <ul>\n        {['Project scaffold', 'API layer', 'Security controls'].map((item) => (\n          <li key={item}>{item}</li>\n        ))}\n      </ul>\n    </main>\n  );\n}\n",
             encoding="utf-8",
         )
         (frontend_dir / "styles.css").write_text(
-            "body { font-family: sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }\nmain { max-width: 960px; margin: 0 auto; padding: 32px; }\n",
+            "body { margin: 0; font-family: sans-serif; background: #0f172a; color: #e2e8f0; }\nmain { max-width: 960px; margin: 0 auto; }\nli { margin-bottom: 8px; }\n",
+            encoding="utf-8",
+        )
+
+        (project_dir / "docker-compose.yml").write_text(
+            "services:\n  api:\n    build: ./backend\n    ports:\n      - \"8000:8000\"\n",
+            encoding="utf-8",
+        )
+        docker_dir = project_dir / "docker"
+        docker_dir.mkdir(parents=True, exist_ok=True)
+        (docker_dir / "Dockerfile").write_text(
+            "FROM python:3.13-slim\nWORKDIR /app\nCOPY ../backend /app\nRUN pip install --no-cache-dir -r /app/requirements.txt\nEXPOSE 8000\nCMD [\"uvicorn\", \"app.main:app\", \"--host\", \"0.0.0.0\", \"--port\", \"8000\"]\n",
             encoding="utf-8",
         )
 
