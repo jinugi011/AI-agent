@@ -61,6 +61,21 @@ d=json.load(sys.stdin); n=(d.get('Self') or {}).get('DNSName','').rstrip('.')
 print('https://'+n if n else '')"
 }
 
+owner_login() { # 이 맥에 로그인된 Tailscale 계정
+  tsc status --json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin); uid=str((d.get('Self') or {}).get('UserID',''))
+print(((d.get('User') or {}).get(uid) or {}).get('LoginName',''))" 2>/dev/null
+}
+
+allow_owner() { # 소유자 계정은 토큰 없이 접속 (관리 페이지 포함)
+  local f="$STATE/tailscale_users.txt" who; who="$(owner_login)"
+  [[ -n "$who" ]] || return 0
+  touch "$f"; chmod 600 "$f"
+  grep -qixF "$who" "$f" || echo "$who" >> "$f"
+  ok "토큰 없이 접속 허용 계정: $(grep -v '^#' "$f" | paste -sd, -)  (목록: $f)"
+}
+
 logged_in() { tsc status --json 2>/dev/null | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('BackendState')=='Running' else 1)" 2>/dev/null; }
 
 case "${1:-status}" in
@@ -85,9 +100,11 @@ case "${1:-status}" in
       exit 1
     fi
     U="$(url)"; echo "$U" > "$STATE/tailscale_url"
+    allow_owner
     ok "내 Tailscale 기기에서만 접속 가능"
     echo "    1순위 HTTPS : $U"
     echo "    2순위 HTTP  : ${U/https:/http:}:$HTTP_PORT   (HTTPS 가 안 될 때. 사설망 구간은 WireGuard 로 암호화됨)"
+    echo "  관리 페이지: 위 주소를 브라우저로 열기 (허용 계정은 토큰 불필요)"
     echo "  API 토큰: $(token)"
     echo "  → 외부 PC 의 VS Code/IntelliJ 원격 설정에 위 주소와 토큰을 입력하세요."
     echo "  (설정은 재부팅 후에도 유지됩니다)"

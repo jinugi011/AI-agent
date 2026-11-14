@@ -98,3 +98,65 @@ def test_tailscale_serve_requests_are_remote(client, tmp_path):
     assert client.post("/api/agent/run", headers={**ts, "Authorization": f"Bearer {TOKEN}"}, json={}).status_code == 403
     last = json.loads((tmp_path / "access.log").read_text().splitlines()[-1])
     assert last["via"] == "tailscale" and last["user"] == "me@example.com" and last["ip"] == "100.101.102.103"
+
+
+OWNER = "owner@example.com"
+TS_OWNER = {"tailscale-user-login": OWNER, "x-forwarded-for": "100.93.131.23"}
+
+
+def test_trusted_tailscale_owner_needs_no_token(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_TS_USERS", OWNER)
+    assert client.get("/api/agent/jobs", headers=TS_OWNER).status_code == 200      # 로컬과 같은 권한
+    r = client.get("/", headers=TS_OWNER)                                             # 관리 페이지
+    assert r.status_code == 200 and "<div id=\"root\">" in r.text
+    last = json.loads((tmp_path / "access.log").read_text().splitlines()[-1])
+    assert last["auth"] == "tailscale-identity" and last["user"] == OWNER
+
+
+def test_tailscale_identity_cannot_be_spoofed(client, monkeypatch):
+    monkeypatch.setenv("AGENT_TS_USERS", OWNER)
+    # 허용 목록에 없는 계정
+    assert client.get("/", headers={**TS_OWNER, "tailscale-user-login": "other@example.com"}).status_code == 401
+    # Cloudflare 경유로 신원 헤더를 위조
+    assert client.get("/api/agent/jobs", headers={**TS_OWNER, **CF}).status_code == 401
+    # Tailscale 대역이 아닌 IP
+    assert client.get("/api/agent/jobs", headers={**TS_OWNER, "x-forwarded-for": "203.0.113.5"}).status_code == 401
+
+
+def test_token_admin_only_for_local_or_owner(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(security, "TOKENS_FILE", tmp_path / "tokens.json")
+    monkeypatch.setenv("AGENT_TS_USERS", OWNER)
+    # 내 Tailscale 계정으로 기기별 토큰 발급
+    r = client.post("/api/admin/tokens", headers=TS_OWNER, json={"name": "회사 노트북"})
+    assert r.status_code == 200
+    token, item = r.json()["token"], r.json()["item"]
+    assert token.startswith("la_") and "hash" not in item and item["prefix"] == token[:7]
+    assert token not in (tmp_path / "tokens.json").read_text()          # 서버에는 해시만 저장
+    # 발급한 토큰으로 원격 사용 가능 + 마지막 사용 시각 기록
+    assert client.get("/api/health", headers={**CF, "Authorization": f"Bearer {token}"}).status_code == 200
+    assert client.get("/api/admin/tokens", headers=TS_OWNER).json()["tokens"][0]["last_used"]
+    # 토큰으로는 토큰 관리 불가 (유출 토큰으로 새 토큰 발급 차단)
+    assert client.post("/api/admin/tokens", headers={**CF, "Authorization": f"Bearer {token}"}, json={"name": "x"}).status_code == 403
+    assert client.get("/api/admin/tokens/default", headers={**CF, "Authorization": f"Bearer {TOKEN}"}).status_code == 403
+    # 다른 Tailscale 계정은 접근 불가
+    assert client.get("/api/admin/tokens", headers={**TS_OWNER, "tailscale-user-login": "x@example.com"}).status_code == 401
+    # 폐기하면 더 이상 사용 불가
+    assert client.delete(f"/api/admin/tokens/{item['id']}", headers=TS_OWNER).status_code == 200
+    assert client.get("/api/health", headers={**CF, "Authorization": f"Bearer {token}"}).status_code == 401
+    # 이 맥(로컬)에서는 그대로 관리 가능
+    assert client.get("/api/admin/tokens").status_code == 200
+
+
+def test_plugin_downloads_for_local_and_owner_only(client, monkeypatch):
+    monkeypatch.setenv("AGENT_TS_USERS", OWNER)
+    listing = client.get("/api/downloads", headers=TS_OWNER).json()
+    kinds = {i["kind"]: i for i in listing["items"]}
+    assert set(kinds) == {"vscode", "intellij"}
+    for kind, item in kinds.items():
+        if item["available"]:
+            r = client.get(item["url"], headers=TS_OWNER)
+            assert r.status_code == 200 and len(r.content) == item["size"]
+            assert item["filename"] in r.headers["content-disposition"]
+    assert client.get("/api/downloads").status_code == 200                                   # 이 맥(로컬)
+    assert client.get("/api/downloads/vscode", headers=auth()).status_code == 403             # 토큰 원격 → 차단
+    assert client.get("/api/downloads/unknown", headers=TS_OWNER).status_code == 404

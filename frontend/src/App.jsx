@@ -1,7 +1,10 @@
 import { useEffect, useState } from 'react';
 import AgentWorkbench from './AgentWorkbench';
+import TokenManager from './TokenManager';
+import Downloads from './Downloads';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8010';
+// 같은 주소(origin)로 API 호출: 백엔드가 이 페이지를 직접 서비스하므로 localhost·Tailscale 주소 어디서 열어도 동작
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
 const defaultPrompt = `쇼핑몰, 영상 교육 플랫폼, 모바일 앱을 통합할 수 있는 보안 중심 프로젝트를 설계해줘. Java, Python, Dart, Kotlin, PostgreSQL을 사용하고 관리자/사용자/운영 보안 흐름을 포함해.`;
 
@@ -14,6 +17,8 @@ const promptTemplates = [
 
 const menuItems = [
   { id: 'agent', label: 'Yang Coding' },
+  { id: 'tokens', label: '접속 토큰' },
+  { id: 'downloads', label: '플러그인' },
   { id: 'overview', label: 'Overview' },
   { id: 'deploy', label: 'Deploy' },
   { id: 'cicd', label: 'CI/CD' },
@@ -530,6 +535,8 @@ function App() {
         </div>
 
         {selectedView === 'agent' && <AgentWorkbench apiBase={API_BASE_URL} />}
+        {selectedView === 'tokens' && <TokenManager apiBase={API_BASE_URL} />}
+        {selectedView === 'downloads' && <Downloads apiBase={API_BASE_URL} onOpenTokens={() => setSelectedView('tokens')} />}
         {selectedView === 'overview' && renderOverview()}
         {selectedView === 'deploy' && renderDeploy()}
         {selectedView === 'cicd' && renderCICD()}

@@ -716,3 +716,26 @@ button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
   .aw-logs li { grid-template-columns: 56px 1fr; }
   .aw-logs li > span:last-of-type { grid-column: 1 / -1; }
 }
+
+/* ---- 접속 토큰 관리 ------------------------------------------------------- */
+.tm-grid { grid-template-columns: minmax(300px, 1fr) minmax(360px, 1.6fr); }
+.tm-who { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; overflow-wrap: anywhere; }
+.tm-help { color: #9fb5d1; font-size: 0.85rem; margin: 0 0 14px; }
+.tm-issued, .tm-default { margin-top: 12px; padding: 12px; border-radius: 12px; background: rgba(34, 197, 94, 0.08); border: 1px solid rgba(34, 197, 94, 0.35); }
+.tm-default { background: rgba(148, 163, 184, 0.06); border-color: rgba(148, 163, 184, 0.2); }
+.tm-issued p { margin: 0 0 8px; font-size: 0.88rem; color: #dfeaf9; }
+.tm-issued code, .tm-default code { display: block; padding: 8px 10px; border-radius: 8px; background: #060a14; color: #c7d7ee; font-size: 0.82rem; overflow-wrap: anywhere; }
+.tm-actions { display: flex; gap: 8px; margin-top: 8px; }
+.tm-actions button { padding: 8px 14px; }
+.tm-row { cursor: default; }
+.tm-default-head { margin-top: 22px; }
+@media (max-width: 900px) { .tm-grid { grid-template-columns: 1fr; } }
+
+/* ---- 플러그인 다운로드 ------------------------------------------------------ */
+.dl-wide { grid-column: 1 / -1; }
+.dl-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+.dl-card { padding: 14px; border-radius: 14px; background: rgba(148, 163, 184, 0.06); border: 1px solid rgba(148, 163, 184, 0.16); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.dl-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.dl-card small { color: #8ea3bf; overflow-wrap: anywhere; }
+.dl-button { display: inline-block; text-align: center; padding: 10px 16px; border-radius: 12px; font-weight: 700; color: white; text-decoration: none; background: linear-gradient(135deg, #4f8cff, #7b61ff); }
+.dl-steps { margin: 4px 0 0; padding-left: 18px; color: #b9c7db; font-size: 0.84rem; display: grid; gap: 4px; }

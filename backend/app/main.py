@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 
@@ -36,6 +37,11 @@ async def remote_guard(request: Request, call_next):
     if not security.is_remote(request.headers):
         return await call_next(request)
     method, path = request.method, request.url.path
+    # 허용된 Tailscale 계정(본인)은 토큰 없이 로컬과 같은 권한 (관리 페이지 포함)
+    if security.trusted_tailscale_user(request.headers):
+        response = await call_next(request)
+        security.audit(request.headers, method, path, response.status_code)
+        return response
     if not security.token_ok(request.headers.get("authorization")):
         security.audit(request.headers, method, path, 401)
         return JSONResponse({"detail": "API 토큰이 필요합니다 (Authorization: Bearer …)"}, status_code=401)
@@ -492,3 +498,96 @@ def demo():
         "example_stack": ["Python", "FastAPI", "React", "PostgreSQL", "Redis"],
         "project_type": "ecommerce"
     }
+
+
+# ---- 원격 접속 토큰 관리 (이 맥 또는 '내 Tailscale 계정'으로만 접근) ------------------------
+# 토큰으로 들어온 원격 요청·Cloudflare 경유 요청은 미들웨어에서 403 → 유출된 토큰으로 새 토큰을 만들 수 없다.
+class TokenIssueRequest(BaseModel):
+    name: str
+
+
+@app.get("/api/admin/whoami")
+def admin_whoami(request: Request):
+    """관리 페이지에 표시할 '누구로 확인되었는지' (이 맥 또는 Tailscale 계정)."""
+    user = security.trusted_tailscale_user(request.headers)
+    return {"success": True, "via": "tailscale" if user else "local", "user": user or "이 맥(로컬)"}
+
+
+@app.get("/api/admin/tokens")
+def admin_tokens():
+    default = security.get_token(create=False)
+    return {"success": True, "default": {"exists": bool(default), "prefix": (default or "")[:7]},
+            "tokens": security.list_tokens()}
+
+
+@app.post("/api/admin/tokens")
+def admin_issue_token(request: TokenIssueRequest):
+    item, token = security.issue_token(request.name)
+    return {"success": True, "item": item, "token": token}
+
+
+@app.delete("/api/admin/tokens/{token_id}")
+def admin_revoke_token(token_id: str):
+    if not security.revoke_token(token_id):
+        raise HTTPException(status_code=404, detail="토큰이 없습니다")
+    return {"success": True}
+
+
+@app.get("/api/admin/tokens/default")
+def admin_default_token():
+    return {"success": True, "token": security.get_token()}
+
+
+@app.post("/api/admin/tokens/default/rotate")
+def admin_rotate_default():
+    return {"success": True, "token": security.rotate_token()}
+
+
+# ---- IDE 플러그인 다운로드 (이 맥 또는 '내 Tailscale 계정'으로만) ---------------------------
+_PLUGINS = {
+    "vscode": ("vscode-extension", "local-coding-agent-*.vsix", "VS Code 확장", "application/octet-stream"),
+    "intellij": ("intellij-plugin/build/distributions", "local-coding-agent-intellij-*.zip", "IntelliJ 플러그인", "application/zip"),
+}
+
+
+def _latest_plugin(kind: str) -> Optional[Path]:
+    folder, pattern, _, _ = _PLUGINS[kind]
+    files = sorted((Path(settings.project_root) / folder).glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+
+@app.get("/api/downloads")
+def downloads():
+    import re as _re
+    items = []
+    for kind, (_, _, label, _) in _PLUGINS.items():
+        f = _latest_plugin(kind)
+        items.append({
+            "kind": kind, "label": label, "available": f is not None,
+            "filename": f.name if f else "", "size": f.stat().st_size if f else 0,
+            "version": (_re.search(r"-(\d+\.\d+\.\d+)\.", f.name).group(1) if f and _re.search(r"-(\d+\.\d+\.\d+)\.", f.name) else ""),
+            "updated_at": datetime.fromtimestamp(f.stat().st_mtime).isoformat(timespec="minutes") if f else "",
+            "url": f"/api/downloads/{kind}",
+        })
+    ts_file = Path(settings.state_dir) / "tailscale_url"
+    ts = ts_file.read_text(encoding="utf-8").strip() if ts_file.exists() else ""
+    return {"success": True, "items": items,
+            "server": {"https": ts, "http": (ts.replace("https:", "http:") + ":18010") if ts else ""}}
+
+
+@app.get("/api/downloads/{kind}")
+def download_plugin(kind: str):
+    from fastapi.responses import FileResponse
+    if kind not in _PLUGINS:
+        raise HTTPException(status_code=404, detail="알 수 없는 플러그인")
+    f = _latest_plugin(kind)
+    if f is None:
+        raise HTTPException(status_code=404, detail="설치 파일이 아직 빌드되지 않았습니다")
+    return FileResponse(f, filename=f.name, media_type=_PLUGINS[kind][3])
+
+
+# ---- 관리 페이지(웹 대시보드): 빌드된 frontend/dist 를 같은 주소에서 서비스 ------------------
+# /api/* 라우트를 먼저 등록하고 마지막에 "/" 를 마운트해야 API 를 가리지 않는다.
+_DASHBOARD = Path(settings.project_root) / "frontend" / "dist"
+if _DASHBOARD.is_dir():
+    app.mount("/", StaticFiles(directory=_DASHBOARD, html=True), name="dashboard")
