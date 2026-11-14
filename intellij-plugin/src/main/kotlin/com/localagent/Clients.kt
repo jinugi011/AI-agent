@@ -19,7 +19,7 @@ data class GenerateStats(val completionTokens: Int, val tokensPerSecond: Double)
 class HttpError(val status: Int, message: String) : RuntimeException(message)
 
 /** FastAPI 백엔드 / Rust 엔진 HTTP 클라이언트.
- *  로컬 모드: 백엔드·엔진에 직접. 원격 모드: Cloudflare Tunnel 주소(serverUrl)의 백엔드 하나로, LLM 도 백엔드가 중계. */
+ *  로컬 모드: 백엔드·엔진에 직접. 원격 모드: Tailscale/Cloudflare 주소(serverUrl)의 백엔드 하나로, LLM 도 백엔드가 중계. */
 object Clients {
     @Volatile var lastBackendError: String = ""
 

@@ -15,7 +15,7 @@ import javax.swing.JTextField
 @State(name = "LocalAgentSettings", storages = [Storage("localAgent.xml")])
 class AgentSettings : PersistentStateComponent<AgentSettings.Data> {
     data class Data(
-        var mode: String = "local", // local | remote (Cloudflare Tunnel)
+        var mode: String = "local", // local | remote (Tailscale 또는 Cloudflare Tunnel)
         var serverUrl: String = "",
         var backendUrl: String = "http://127.0.0.1:8010",
         var engineUrl: String = "http://127.0.0.1:18091",
@@ -88,11 +88,11 @@ class AgentConfigurable : Configurable {
             }
         }
         panel = FormBuilder.createFormBuilder()
-            .addLabeledComponent("접속 방식 (local: 이 PC / remote: Cloudflare Tunnel)", mode)
-            .addLabeledComponent("원격 서버 주소 (https://…)", serverUrl)
-            .addLabeledComponent("원격 API 토큰 (서버에서 tunnel.sh token)", apiToken)
-            .addLabeledComponent("Cloudflare Access Client ID (선택)", cfId)
-            .addLabeledComponent("Cloudflare Access Client Secret (선택)", cfSecret)
+            .addLabeledComponent("접속 방식 (local: 이 맥에서 실행 / remote: 다른 PC에서 내 맥에 접속)", mode)
+            .addLabeledComponent("원격 서버 주소 (예: http://내맥이름.tailXXXX.ts.net:18010)", serverUrl)
+            .addLabeledComponent("원격 접속 토큰 (관리 페이지 → 접속 토큰에서 발급)", apiToken)
+            .addLabeledComponent("Cloudflare Access Client ID (Cloudflare 사용 시만)", cfId)
+            .addLabeledComponent("Cloudflare Access Client Secret (Cloudflare 사용 시만)", cfSecret)
             .addComponent(testButton)
             .addComponent(testResult)
             .addSeparator()
