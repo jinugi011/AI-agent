@@ -443,7 +443,7 @@ scripts/server-mode.sh status
 
 ### 4.8.3 외부 PC 설정
 1. Tailscale 설치 후 **맥과 같은 계정으로 로그인** (https://tailscale.com/download) — 회사 PC 라면 보안 정책을 먼저 확인하세요.
-2. 플러그인 설치 — VS Code `local-coding-agent-0.2.1.vsix`, IntelliJ `local-coding-agent-intellij-0.2.1.zip` (모델·백엔드·Docker 는 필요 없음)
+2. 플러그인 설치 — VS Code `local-coding-agent-0.2.2.vsix`, IntelliJ `local-coding-agent-intellij-0.2.1.zip` (모델·백엔드·Docker 는 필요 없음)
 3. 연결
    - **VS Code**: `Cmd+Shift+P` → **Yang Coding: 원격 접속 설정** → 주소 `https://<맥이름>.<tailnet>.ts.net` → API 토큰 → (Access 항목은 비워 두고 Enter)
    - **IntelliJ**: Settings → Tools → **Yang Coding** → 접속 방식 `remote`, 주소, 토큰 → **원격 연결 테스트**
@@ -451,9 +451,20 @@ scripts/server-mode.sh status
 
 원격 모드에서 되는 것/안 되는 것은 4.9.3 표와 같습니다 (자연어 코딩·외부 PC 에서 명령 실행·선호 저장 ✅ / 하네스·레포 연결·엔진 제어 ❌).
 
+### 4.8.3-1 접속 주소 (이 맥)
+| 순서 | 주소 | 비고 |
+|---|---|---|
+| 1순위 | `https://jinwook-macbookpro.tail1880e1.ts.net` | HTTPS. 이 맥 자신에서는 인증서 단계 오류가 나서 확인 불가 → **외부 PC 에서 먼저 시도** |
+| 2순위 | `http://jinwook-macbookpro.tail1880e1.ts.net:18010` | HTTPS 가 안 되면 사용. Tailscale 사설망 구간은 WireGuard 로 암호화되므로 안전. ✅ 확인됨 |
+
+VS Code 원격 설정은 `https://` 주소만 받지만, Tailscale 주소(`*.ts.net`, `100.x.x.x`)는 `http://` 도 허용합니다.
+
 ### 4.8.4 검증 상태
 - 백엔드: Tailscale 헤더가 붙은 요청 → 토큰 없으면 401, 있으면 200, 코드 실행 기능 403, 접속 기록 `via: tailscale` (자동 테스트 25개 통과)
-- **실제 Tailscale 연결(외부 PC → 맥)은 Tailscale 설치·로그인 후 확인 필요**
+- 2026-11-14 이 맥에서 Tailscale 주소로 확인: HTTP 경로(18010) 토큰 없음 401 · 토큰 200 · 코드 실행 403 · LLM 실시간 스트리밍 OK
+- HTTPS(443): 인증서 발급은 됐지만 이 맥 자신에서 접속 시 TLS 오류 → 외부 PC 에서 확인 필요
+- launchd 자동 실행: 프로젝트를 `~/AI-agent` 로 옮긴 뒤 정상 동작, 백엔드 강제 종료 시 2초 만에 자동 재시작 확인
+- **외부 PC 에서 실제 접속해 코딩하는 것은 아직 확인 전**
 
 ## 4.9 (대안) 외부에서 사용하기 — Cloudflare Tunnel
 

@@ -15,6 +15,7 @@ SELF="$(readlink "$0" 2>/dev/null || echo "$0")"
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 STATE="$ROOT/backend/data/agent_state"
 API_PORT="${API_PORT:-8010}"
+HTTP_PORT="${TS_HTTP_PORT:-18010}"   # HTTPS 가 안 될 때 쓰는 사설망 HTTP 경로 (Tailscale 이 WireGuard 로 암호화)
 mkdir -p "$STATE"
 
 ok()  { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -77,13 +78,16 @@ case "${1:-status}" in
     curl -s -m 3 "http://127.0.0.1:$API_PORT/api/health" >/dev/null || { bad "백엔드가 꺼져 있습니다: local-agent start (또는 scripts/server-mode.sh on)"; exit 1; }
     # 공개 인터넷 노출(Funnel)은 반드시 끔
     tsc funnel --https=443 off >/dev/null 2>&1 || true
+    TS_TIMEOUT=30 tsc serve --bg --http="$HTTP_PORT" "http://127.0.0.1:$API_PORT" >/dev/null 2>&1 || true
     if ! TS_TIMEOUT=30 tsc serve --bg "http://127.0.0.1:$API_PORT"; then
       bad "tailscale serve 실패. 처음이면 위에 표시된 링크에서 'HTTPS 인증서'를 켜고 다시 실행하세요."
       echo "    (관리 콘솔: https://login.tailscale.com/admin/dns → MagicDNS 와 HTTPS Certificates 켜기)"
       exit 1
     fi
     U="$(url)"; echo "$U" > "$STATE/tailscale_url"
-    ok "내 Tailscale 기기에서만 접속 가능: $U"
+    ok "내 Tailscale 기기에서만 접속 가능"
+    echo "    1순위 HTTPS : $U"
+    echo "    2순위 HTTP  : ${U/https:/http:}:$HTTP_PORT   (HTTPS 가 안 될 때. 사설망 구간은 WireGuard 로 암호화됨)"
     echo "  API 토큰: $(token)"
     echo "  → 외부 PC 의 VS Code/IntelliJ 원격 설정에 위 주소와 토큰을 입력하세요."
     echo "  (설정은 재부팅 후에도 유지됩니다)"
@@ -91,7 +95,8 @@ case "${1:-status}" in
 
   off)
     need_ts off
-    tsc serve --https=443 off >/dev/null 2>&1 || tsc serve reset
+    tsc serve --https=443 off >/dev/null 2>&1 || true
+    tsc serve --http="$HTTP_PORT" off >/dev/null 2>&1 || true
     ok "Tailscale 접속 경로를 닫았습니다"
     ;;
 
@@ -109,8 +114,12 @@ case "${1:-status}" in
     curl -s -m 3 "http://127.0.0.1:$API_PORT/api/health" >/dev/null && ok "백엔드 :$API_PORT" || bad "백엔드 꺼짐"
     U="$(url)"
     if [[ -n "$U" ]] && tsc serve status 2>/dev/null | grep -q "127.0.0.1:$API_PORT"; then
-      ok "접속 주소: $U"
       T="$(token)"
+      for addr in "$U" "${U/https:/http:}:$HTTP_PORT"; do
+        c=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H "Authorization: Bearer $T" "$addr/api/health" || true)
+        [[ "$c" == 200 ]] && ok "접속 OK: $addr" || echo "  · 접속 안 됨($c): $addr  ← 이 맥 자신에서 HTTPS 는 실패할 수 있음, 외부 PC 에서 확인"
+      done
+      U="${U/https:/http:}:$HTTP_PORT"
       c1=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H "Authorization: Bearer $T" "$U/api/health" || true)
       c2=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$U/api/health" || true)
       [[ "$c1" == 200 ]] && ok "토큰으로 접속 → 200" || bad "토큰으로 접속 실패 → $c1"

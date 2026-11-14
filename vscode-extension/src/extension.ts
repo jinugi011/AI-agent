@@ -73,10 +73,16 @@ async function configureRemote() {
   const c = vscode.workspace.getConfiguration('localAgent');
   const url = await vscode.window.showInputBox({
     title: '원격 접속 (1/3) 서버 주소',
-    prompt: 'Cloudflare Tunnel 주소 (예: https://agent.example.com 또는 https://xxxx.trycloudflare.com)',
+    prompt: 'Tailscale 주소 (예: https://맥이름.tailnet.ts.net 또는 http://맥이름.tailnet.ts.net:18010) 또는 Cloudflare 주소',
     value: c.get<string>('serverUrl', ''),
     ignoreFocusOut: true,
-    validateInput: (v) => (/^https:\/\/[^\s/]+/.test(v.trim()) ? undefined : 'https:// 로 시작하는 주소를 입력하세요'),
+    // https 필수. 단 Tailscale 사설망 주소(*.ts.net, 100.64.0.0/10)는 WireGuard 로 암호화되므로 http 도 허용
+    validateInput: (v) => {
+      const u = v.trim();
+      if (/^https:\/\/[^\s/]+/.test(u)) return undefined;
+      if (/^http:\/\/([\w-]+\.)+ts\.net(:\d+)?\/?$/.test(u) || /^http:\/\/100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+(:\d+)?\/?$/.test(u)) return undefined;
+      return 'https:// 주소를 입력하세요 (Tailscale 주소 *.ts.net 은 http:// 도 가능)';
+    },
   });
   if (!url) return;
   const token = await vscode.window.showInputBox({
