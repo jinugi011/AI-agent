@@ -13,7 +13,7 @@ const promptTemplates = [
 ];
 
 const menuItems = [
-  { id: 'agent', label: 'Coding Agent' },
+  { id: 'agent', label: 'Yang Coding' },
   { id: 'overview', label: 'Overview' },
   { id: 'deploy', label: 'Deploy' },
   { id: 'cicd', label: 'CI/CD' },
@@ -430,7 +430,7 @@ function App() {
         <div className="brand-box">
           <span className="brand-badge">AI</span>
           <div>
-            <h1>Coding Agent</h1>
+            <h1>Yang Coding</h1>
             <small>Local Workspace</small>
           </div>
         </div>

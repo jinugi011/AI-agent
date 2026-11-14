@@ -1,9 +1,10 @@
 /** 사이드바 채팅 웹뷰 ↔ 에이전트 세션 연결. */
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AgentEvent, AgentSession, EditorContext } from './agent';
-import { backend, engine } from './clients';
-import { parseToolCalls, ToolCall } from './protocol';
+import { AgentEvent, AgentLog, AgentSession, EditorContext } from './agent';
+import { backend, engine, isRemote, lastBackendError } from './clients';
+import { ensureRemoteIndex } from './remoteIndex';
+import { describeCall, parseToolCalls, ToolCall } from './protocol';
 import { Checkpoint, executeTool, OriginalContentProvider } from './tools';
 
 const HELP = `**사용법** — 자연어로 요청하면 됩니다. 예:
@@ -26,11 +27,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private statusTimer?: NodeJS.Timeout;
   private pending: AgentEvent[] = [];
 
-  constructor(private readonly ctx: vscode.ExtensionContext, private readonly diffProvider: OriginalContentProvider) {
+  constructor(
+    private readonly ctx: vscode.ExtensionContext,
+    private readonly diffProvider: OriginalContentProvider,
+    private readonly log: AgentLog,
+  ) {
     this.session = new AgentSession(
       (ev) => this.post(ev),
       (kind, title, detail) => this.askApproval(kind, title, detail),
       diffProvider,
+      log,
     );
   }
 
@@ -65,6 +71,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         models: models?.catalog ?? [],
         repo: this.session.repoName,
         workspace: vscode.workspace.workspaceFolders?.[0]?.name ?? '',
+        remote: isRemote(),
+        server: isRemote() ? vscode.workspace.getConfiguration('localAgent').get<string>('serverUrl', '') : '',
+        error: backendUp ? '' : lastBackendError,
       });
     };
     void tick();
@@ -110,6 +119,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return this.runDirect({ kind: 'model', action: m.action, arg: m.model ?? '' });
       case 'startBackend':
         return vscode.commands.executeCommand('localAgent.startBackend');
+      case 'configureRemote':
+        return vscode.commands.executeCommand('localAgent.configureRemote');
     }
   }
 
@@ -142,10 +153,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri;
     if (!root) return this.post({ type: 'notice', level: 'warn', text: '폴더를 먼저 열어주세요.' });
     const ctrl = new AbortController();
+    this.log.line(`▶ (직접 실행) ${describeCall(call)}`, 'tool');
     const result = await executeTool(call, {
       root, repoName: this.session.repoName, signal: ctrl.signal, checkpoint: new Checkpoint(),
       approve: async () => true, emit: (ev) => this.post(ev),
     }, this.diffProvider);
+    this.log.line(result.split('\n').map((l) => '    ' + l).join('\n'), result.includes('오류') ? 'error' : 'result');
     this.post({ type: 'notice', level: result.includes('오류') ? 'error' : 'info', text: result.split('\n')[0] });
   }
 
@@ -162,6 +175,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case '/new': case '/clear': return this.newChat();
         case '/stop': return this.session.stop();
         case '/undo': return this.undo();
+        case '/log': return vscode.commands.executeCommand('localAgent.showLog');
         case '/model': {
           const [action = 'status', ...a] = rest;
           return this.runDirect({ kind: 'model', action, arg: a.join(' ') });
@@ -173,6 +187,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case '/connect': return this.runDirect({ kind: 'connect', location: arg });
         case '/task': return this.session.send(`다음 요구사항을 HARNESS 도구로 구현해줘:\n${arg}`, this.editorContext(extraEditor));
         case '/reindex':
+          if (isRemote()) {
+            const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+            if (!root) return;
+            await ensureRemoteIndex(root, this.log, true);
+            return this.post({ type: 'notice', level: 'info', text: '원격 서버에서 재색인을 시작했습니다.' });
+          }
           if (!this.session.repoName) return this.post({ type: 'notice', level: 'warn', text: '연결된 레포가 없습니다. 먼저 아무 요청이나 보내면 자동 연결됩니다.' });
           await backend.post(`/api/repos/${this.session.repoName}/reindex`, {}, 600_000);
           return this.post({ type: 'notice', level: 'info', text: `${this.session.repoName} 재색인 완료` });

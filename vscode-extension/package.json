@@ -1,8 +1,8 @@
 {
   "name": "local-coding-agent",
-  "displayName": "Local Coding Agent",
-  "description": "로컬 코딩 모델(Rust + llama.cpp)로 자연어 채팅을 통해 코딩하는 에이전트",
-  "version": "0.1.1",
+  "displayName": "Yang Coding",
+  "description": "Yang Coding — 로컬 코딩 모델(Rust + llama.cpp)로 자연어 채팅을 통해 코딩하는 에이전트",
+  "version": "0.2.1",
   "publisher": "local",
   "license": "UNLICENSED",
   "private": true,
@@ -23,7 +23,7 @@
       "secondarySidebar": [
         {
           "id": "localAgentRight",
-          "title": "Local Agent",
+          "title": "Yang Coding",
           "icon": "media/icon.svg"
         }
       ]
@@ -40,32 +40,50 @@
     "commands": [
       {
         "command": "localAgent.focus",
-        "title": "Local Agent: 채팅 열기"
+        "title": "Yang Coding: 채팅 열기"
       },
       {
         "command": "localAgent.newChat",
-        "title": "Local Agent: 새 대화",
+        "title": "Yang Coding: 새 대화",
         "icon": "$(add)"
       },
       {
         "command": "localAgent.askAboutSelection",
-        "title": "Local Agent: 선택 영역에 대해 묻기"
+        "title": "Yang Coding: 선택 영역에 대해 묻기"
       },
       {
         "command": "localAgent.startBackend",
-        "title": "Local Agent: 백엔드 시작"
+        "title": "Yang Coding: 백엔드 시작"
       },
       {
         "command": "localAgent.setAgentRoot",
-        "title": "Local Agent: AI-agent 폴더 지정"
+        "title": "Yang Coding: AI-agent 폴더 지정"
+      },
+      {
+        "command": "localAgent.showLog",
+        "title": "Yang Coding: 작업 로그 보기",
+        "icon": "$(output)"
+      },
+      {
+        "command": "localAgent.configureRemote",
+        "title": "Yang Coding: 원격 접속 설정 (Cloudflare Tunnel)"
+      },
+      {
+        "command": "localAgent.useLocal",
+        "title": "Yang Coding: 로컬 모드로 전환"
       }
     ],
     "menus": {
       "view/title": [
         {
+          "command": "localAgent.showLog",
+          "when": "view == localAgent.chat",
+          "group": "navigation@1"
+        },
+        {
           "command": "localAgent.newChat",
           "when": "view == localAgent.chat",
-          "group": "navigation"
+          "group": "navigation@2"
         }
       ],
       "editor/context": [
@@ -85,8 +103,26 @@
       }
     ],
     "configuration": {
-      "title": "Local Coding Agent",
+      "title": "Yang Coding",
       "properties": {
+        "localAgent.mode": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote"
+          ],
+          "default": "local",
+          "enumDescriptions": [
+            "이 PC 의 백엔드·엔진 사용",
+            "Cloudflare Tunnel 로 원격 서버(맥)에 접속"
+          ],
+          "description": "접속 방식"
+        },
+        "localAgent.serverUrl": {
+          "type": "string",
+          "default": "",
+          "description": "원격 모드 서버 주소 (예: https://agent.example.com). 토큰은 'Yang Coding: 원격 접속 설정' 명령으로 안전하게 저장"
+        },
         "localAgent.backendUrl": {
           "type": "string",
           "default": "http://127.0.0.1:8010",
@@ -94,7 +130,7 @@
         },
         "localAgent.engineUrl": {
           "type": "string",
-          "default": "http://127.0.0.1:8091",
+          "default": "http://127.0.0.1:18091",
           "description": "Rust 추론 엔진 주소"
         },
         "localAgent.agentRoot": {
@@ -138,6 +174,11 @@
         "localAgent.temperature": {
           "type": "number",
           "default": 0.2
+        },
+        "localAgent.showLogOnRequest": {
+          "type": "boolean",
+          "default": true,
+          "description": "요청을 보낼 때 작업 로그 콘솔(출력 패널)을 자동으로 표시"
         }
       }
     }

@@ -61,4 +61,11 @@ REMEMBER>>>
     fun `diff 통계`() {
         assertEquals(2 to 1, Protocol.lineDiffStats("a\nb\nc", "a\nB\nc\nd"))
     }
+
+    @Test
+    fun `작업 로그 요약`() {
+        assertEquals("READ a.py:3-9", Protocol.describeCall(ToolCall.Read("a.py", 3, 9)))
+        assertEquals("EDIT b.py (1블록)", Protocol.describeCall(ToolCall.Edit("b.py", listOf(SearchReplace("x", "y")))))
+        assertEquals("FILE c.py (2줄)", Protocol.describeCall(ToolCall.Write("c.py", "a\nb")))
+    }
 }

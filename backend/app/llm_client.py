@@ -42,9 +42,13 @@ def _post_json(url: str, body: dict, timeout: float) -> dict:
 def engine_health(timeout: float = 2.0) -> Optional[dict]:
     try:
         with urllib.request.urlopen(f"{settings.engine_url}/health", timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            data = json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
+    # 같은 포트를 다른 서버(예: Spring 앱)가 쓰는 경우를 엔진으로 착각하지 않도록 모델 정보 확인
+    if not isinstance(data, dict) or not isinstance(data.get("model"), dict) or "model_name" not in data["model"]:
+        return None
+    return data
 
 
 def chat(

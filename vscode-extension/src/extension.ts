@@ -3,8 +3,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { OutputAgentLog } from './agentLog';
 import { ChatViewProvider } from './chatView';
-import { backend } from './clients';
+import { backend, initClients, isRemote, SECRET_CF_ID, SECRET_CF_SECRET, SECRET_TOKEN, setSecret } from './clients';
 import { OriginalContentProvider } from './tools';
 
 let backendProc: ChildProcess | undefined;
@@ -34,7 +35,7 @@ function findAgentRoot(ctx: vscode.ExtensionContext): string | undefined {
 
 async function startBackend(ctx: vscode.ExtensionContext, interactive: boolean): Promise<boolean> {
   if (await backend.alive()) {
-    if (interactive) vscode.window.showInformationMessage('Local Agent 백엔드가 이미 실행 중입니다.');
+    if (interactive) vscode.window.showInformationMessage('Yang Coding 백엔드가 이미 실행 중입니다.');
     return true;
   }
   let root = findAgentRoot(ctx);
@@ -64,22 +65,65 @@ async function startBackend(ctx: vscode.ExtensionContext, interactive: boolean):
     await new Promise((r) => setTimeout(r, 1000));
     if (await backend.alive()) return true;
   }
-  vscode.window.showErrorMessage('백엔드 시작 실패 — 출력 패널(Local Agent)을 확인하세요.');
+  vscode.window.showErrorMessage('백엔드 시작 실패 — 출력 패널(Yang Coding)을 확인하세요.');
   return false;
 }
 
-export function activate(ctx: vscode.ExtensionContext) {
-  output = vscode.window.createOutputChannel('Local Agent');
+async function configureRemote() {
+  const c = vscode.workspace.getConfiguration('localAgent');
+  const url = await vscode.window.showInputBox({
+    title: '원격 접속 (1/3) 서버 주소',
+    prompt: 'Cloudflare Tunnel 주소 (예: https://agent.example.com 또는 https://xxxx.trycloudflare.com)',
+    value: c.get<string>('serverUrl', ''),
+    ignoreFocusOut: true,
+    validateInput: (v) => (/^https:\/\/[^\s/]+/.test(v.trim()) ? undefined : 'https:// 로 시작하는 주소를 입력하세요'),
+  });
+  if (!url) return;
+  const token = await vscode.window.showInputBox({
+    title: '원격 접속 (2/3) API 토큰', prompt: '서버(맥)에서 scripts/tunnel.sh token 으로 확인한 값',
+    password: true, ignoreFocusOut: true,
+  });
+  if (token === undefined) return;
+  const cfId = await vscode.window.showInputBox({
+    title: '원격 접속 (3/3) Cloudflare Access 서비스 토큰 (선택)',
+    prompt: 'Cloudflare Access 를 켰다면 Client ID 입력, 아니면 비워 두고 Enter', ignoreFocusOut: true,
+  });
+  let cfSecret = '';
+  if (cfId) cfSecret = (await vscode.window.showInputBox({ title: 'Cloudflare Access Client Secret', password: true, ignoreFocusOut: true })) ?? '';
+
+  await c.update('serverUrl', url.trim().replace(/\/$/, ''), vscode.ConfigurationTarget.Global);
+  if (token) await setSecret(SECRET_TOKEN, token.trim());
+  await setSecret(SECRET_CF_ID, (cfId ?? '').trim());
+  await setSecret(SECRET_CF_SECRET, cfSecret.trim());
+  await c.update('mode', 'remote', vscode.ConfigurationTarget.Global);
+
+  const ok = await backend.alive();
+  const { lastBackendError } = await import('./clients');
+  vscode.window.showInformationMessage(ok ? `원격 서버 연결 성공: ${url}` : `원격 서버 연결 실패: ${lastBackendError}`);
+}
+
+export async function activate(ctx: vscode.ExtensionContext) {
+  output = vscode.window.createOutputChannel('Yang Coding');
+  await initClients(ctx.secrets);
   const diffProvider = new OriginalContentProvider();
-  const chat = new ChatViewProvider(ctx, diffProvider);
+  const agentLog = new OutputAgentLog();
+  const chat = new ChatViewProvider(ctx, diffProvider, agentLog);
 
   ctx.subscriptions.push(
     output,
+    agentLog,
+    vscode.commands.registerCommand('localAgent.showLog', () => agentLog.channel.show(true)),
     vscode.workspace.registerTextDocumentContentProvider(OriginalContentProvider.scheme, diffProvider),
     vscode.window.registerWebviewViewProvider(ChatViewProvider.id, chat, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.commands.registerCommand('localAgent.focus', () => vscode.commands.executeCommand('localAgent.chat.focus')),
     vscode.commands.registerCommand('localAgent.newChat', () => chat.newChat()),
-    vscode.commands.registerCommand('localAgent.startBackend', () => startBackend(ctx, true)),
+    vscode.commands.registerCommand('localAgent.startBackend', () =>
+      isRemote() ? vscode.window.showWarningMessage('원격 모드입니다. 백엔드는 서버(맥)에서 실행됩니다.') : startBackend(ctx, true)),
+    vscode.commands.registerCommand('localAgent.configureRemote', configureRemote),
+    vscode.commands.registerCommand('localAgent.useLocal', async () => {
+      await vscode.workspace.getConfiguration('localAgent').update('mode', 'local', vscode.ConfigurationTarget.Global);
+      vscode.window.showInformationMessage('로컬 모드로 전환했습니다 (이 PC 의 백엔드·엔진 사용).');
+    }),
     vscode.commands.registerCommand('localAgent.setAgentRoot', async () => {
       const picked = await vscode.window.showOpenDialog({ canSelectFolders: true, openLabel: 'AI-agent 폴더 선택' });
       if (picked?.[0]) await vscode.workspace.getConfiguration('localAgent').update('agentRoot', picked[0].fsPath, vscode.ConfigurationTarget.Global);
@@ -92,7 +136,7 @@ export function activate(ctx: vscode.ExtensionContext) {
     }),
   );
 
-  if (vscode.workspace.getConfiguration('localAgent').get<boolean>('autoStartBackend', true)) {
+  if (!isRemote() && vscode.workspace.getConfiguration('localAgent').get<boolean>('autoStartBackend', true)) {
     void startBackend(ctx, false);
   }
 }

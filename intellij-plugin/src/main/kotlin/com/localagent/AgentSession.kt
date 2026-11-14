@@ -19,6 +19,12 @@ data class EditorContext(
 )
 
 private const val CONTEXT_CHAR_BUDGET = 70_000
+
+private fun indent(s: String, max: Int = 40): String {
+    val lines = s.trim().lines()
+    val shown = lines.take(max).joinToString("\n") { "    $it" }
+    return if (lines.size > max) "$shown\n    …(${lines.size - max}줄 더)" else shown
+}
 private val TREE_EXCLUDES = setOf("node_modules", ".git", "dist", "build", "target", ".venv", "venv", "__pycache__", ".next", "Pods", ".dart_tool", ".gradle", "models", "out", ".idea")
 
 /** 채팅 에이전트 루프 (VS Code agent.ts 와 동일한 동작). 백그라운드 스레드에서 send() 를 호출한다. */
@@ -26,6 +32,7 @@ class AgentSession(
     private val project: Project,
     private val emit: (Map<String, Any?>) -> Unit,
     private val requestApproval: (kind: String, title: String, detail: String) -> String, // allow|always|deny (블로킹)
+    private val log: AgentLog,
 ) {
     private val history = mutableListOf<ChatMessage>()
     private val alwaysAllowed = mutableSetOf<String>()
@@ -55,7 +62,9 @@ class AgentSession(
         val s = AgentSettings.current
         val mode = if (kind == "edit") s.approveEdits else s.approveCommands
         if (mode == "auto" || kind in alwaysAllowed) return true
+        log.line("[승인 대기] $title")
         val answer = requestApproval(kind, title, detail)
+        log.line("[승인] " + (mapOf("allow" to "허용", "always" to "항상 허용", "deny" to "거부")[answer] ?: answer), if (answer == "deny") "error" else "info")
         if (answer == "always") alwaysAllowed += kind
         return answer != "deny"
     }
@@ -68,7 +77,15 @@ class AgentSession(
         override val originals = this@AgentSession.originals
         override fun isCancelled() = cancelled.get()
         override fun approve(kind: String, title: String, detail: String) = autoApprove || this@AgentSession.approve(kind, title, detail)
-        override fun emit(event: Map<String, Any?>) = this@AgentSession.emit(event)
+        private var lastDetail: Any? = null
+        override fun emit(event: Map<String, Any?>) {
+            // 하네스 등 오래 걸리는 도구의 진행 상황을 콘솔에도 표시
+            if (event["type"] == "tool" && event["status"] == "running" && event["detail"] != null && event["detail"] != lastDetail) {
+                lastDetail = event["detail"]
+                log.line("    … " + event["detail"].toString().lineSequence().first(), "result")
+            }
+            this@AgentSession.emit(event)
+        }
         override fun registerProcess(p: Process?) { runningProcess = p }
     }
 
@@ -80,9 +97,14 @@ class AgentSession(
         return files.joinToString("\n") + if (files.size >= 250) "\n…(더 있음: LIST 로 확인)" else ""
     }
 
-    private fun systemPrompt(ctx: JsonObject?, repoInfo: String, editor: EditorContext, tree: String): String {
+    private fun editorBlock(editor: EditorContext): String =
+        "(에디터 상태) 현재 파일: ${editor.file ?: "없음"} · 열린 파일: ${editor.openFiles.take(15).joinToString(", ").ifBlank { "없음" }}" +
+            (editor.selection?.let { "\n선택 영역 (${editor.selectionRange}):\n```\n${it.take(4000)}\n```" } ?: "")
+
+    // 시스템 프롬프트는 대화 중 바뀌지 않는 내용만 담는다 → 엔진 KV 캐시 재사용으로 다음 요청이 빨라짐.
+    private fun systemPrompt(ctx: JsonObject?, repoInfo: String, tree: String): String {
         fun s(key: String) = ctx?.get(key)?.takeIf { !it.isJsonNull }?.asString
-        return """당신은 사용자의 IntelliJ IDE 안에서 동작하는 로컬 코딩 에이전트입니다 (Claude Code 와 유사).
+        return """당신은 "Yang Coding" — 사용자의 IntelliJ IDE 안에서 동작하는 로컬 코딩 에이전트입니다 (Claude Code 와 유사). 이름을 물으면 Yang Coding 이라고 답한다.
 사용자의 자연어 요청을 이해해 코드를 읽고, 수정하고, 명령을 실행해 작업을 끝까지 완료합니다.
 
 ## 일하는 방식
@@ -109,11 +131,6 @@ ${s("preferences")?.ifBlank { null } ?: "- (없음)"}
 
 ## 이 레포의 코딩 방법 (자동 추출)
 ${s("methods") ?: "(색인 전)"}
-
-## 에디터 상태
-현재 파일: ${editor.file ?: "(없음)"}
-열린 파일: ${editor.openFiles.take(15).joinToString(", ").ifBlank { "(없음)" }}
-${editor.selection?.let { "선택 영역 (${editor.selectionRange}):\n```\n${it.take(4000)}\n```" } ?: ""}
 
 ## 파일 목록 (일부)
 $tree"""
@@ -148,6 +165,12 @@ $tree"""
         cancelled.set(false)
         val checkpoint = Checkpoint().also { lastCheckpoint = it }
         emit(mapOf("type" to "busy", "busy" to true))
+        val started = System.currentTimeMillis()
+        var steps = 0
+        var outcome = "완료"
+        log.show()
+        log.line("━━━━━━━━ [${java.time.LocalTime.now().withNano(0)}] 요청 ━━━━━━━━", "head")
+        log.line(if (userText.length > 500) userText.take(500) + "…" else userText)
         try {
             val root = projectRoot(project) ?: run {
                 emit(mapOf("type" to "notice", "level" to "warn", "text" to "프로젝트 폴더를 먼저 여세요.")); return
@@ -156,12 +179,20 @@ $tree"""
                 say(it); return
             }
             if (Clients.engineHealth() == null) {
+                log.line("[엔진] 꺼져 있음 → 설정 요청만 처리")
                 handleOffline(userText); return
             }
             val ctx = try {
-                Clients.post("/api/context", mapOf("query" to userText, "workspace_path" to root.toString(), "top_k" to 6), 600)
+                if (Clients.remote) {
+                    // 원격: 이 PC 의 파일을 서버로 올려 벡터화(처음/6시간마다) 후 프로젝트 이름으로 컨텍스트 조회
+                    runCatching { RemoteIndex.ensure(root, log) }.onFailure { log.line("[원격 색인] 실패: ${it.message}", "error") }
+                    Clients.post("/api/context", mapOf("query" to userText, "project" to RemoteIndex.projectName(root), "top_k" to 6), 60)
+                } else {
+                    Clients.post("/api/context", mapOf("query" to userText, "workspace_path" to root.toString(), "top_k" to 6), 600)
+                }
             } catch (e: Exception) {
                 emit(mapOf("type" to "notice", "level" to "warn", "text" to "백엔드 컨텍스트를 가져오지 못했습니다 (선호/벡터 검색 없이 진행): ${e.message}"))
+                log.line("[컨텍스트] 실패: ${e.message}", "error")
                 null
             }
             val repo = ctx?.get("repo")?.takeIf { it.isJsonObject }?.asJsonObject
@@ -172,21 +203,32 @@ $tree"""
             }.orEmpty()
 
             synchronized(history) {
-                history += ChatMessage("user", if (related.isNotBlank()) "$userText\n\n(참고: 벡터 검색으로 찾은 관련 코드)\n$related" else userText)
+                history += ChatMessage("user", "$userText\n\n${editorBlock(editor)}" +
+                    if (related.isNotBlank()) "\n\n(참고: 벡터 검색으로 찾은 관련 코드)\n$related" else "")
             }
-            val system = systemPrompt(ctx, repoInfo, editor, fileTree(root))
+            // 같은 대화에서 시스템 프롬프트가 그대로면 엔진이 앞부분을 재사용한다
+            val system = systemPrompt(ctx, repoInfo, fileTree(root))
+            val prefCount = ctx?.get("preferences")?.takeIf { !it.isJsonNull }?.asString?.lines()?.count { it.isNotBlank() } ?: 0
+            val hitNames = ctx?.getAsJsonArray("hits")?.joinToString(", ") { it.asJsonObject.get("source").asString }.orEmpty()
+            log.line("[컨텍스트] 레포 $repoInfo")
+            log.line("[컨텍스트] 선호·제약 ${prefCount}개 · 코딩 방법 ${if (ctx?.get("methods")?.isJsonNull == false) "있음" else "없음"} · 관련 코드 ${hitNames.ifBlank { "없음" }}")
+            log.line("[컨텍스트] 현재 파일 ${editor.file ?: "-"}${editor.selectionRange?.let { " · 선택 $it" } ?: ""} · 시스템 프롬프트 ${"%,d".format(system.length)}자")
             val h = host(root, checkpoint)
             val s = AgentSettings.current
 
             for (step in 0 until s.maxSteps) {
                 if (cancelled.get()) break
+                steps = step + 1
                 val id = "a${System.currentTimeMillis()}"
                 emit(mapOf("type" to "assistant-start", "id" to id))
                 val raw = StringBuilder()
                 var lastShown = ""
                 val messages = compact((listOf(ChatMessage("system", system)) + synchronized(history) { history.toList() }).toMutableList())
+                val stepStart = System.currentTimeMillis()
+                log.line("[모델 #$steps] 생성 시작 · 메시지 ${messages.size}개 · ${"%,d".format(messages.sumOf { it.content.length })}자", "head")
                 val (text, stats) = Clients.stream(messages, s.maxTokens, s.temperature, streamHandle, { cancelled.get() }) { tok ->
                     raw.append(tok)
+                    log.raw(tok)
                     val shown = Protocol.stripToolBlocks(raw.toString())
                     if (shown != lastShown) {
                         lastShown = shown
@@ -196,18 +238,30 @@ $tree"""
                 emit(mapOf("type" to "assistant-end", "id" to id,
                     "stats" to stats?.let { "${it.completionTokens} tok · ${"%.1f".format(it.tokensPerSecond)} tok/s" }))
                 synchronized(history) { history += ChatMessage("assistant", text) }
+                log.raw("\n")
+                log.line("[모델 #$steps] 완료 · ${stats?.completionTokens ?: "?"} tok · ${stats?.let { "%.1f".format(it.tokensPerSecond) } ?: "?"} tok/s · ${"%.1f".format((System.currentTimeMillis() - stepStart) / 1000.0)}s", "head")
                 if (cancelled.get()) break
 
                 var calls = Protocol.parseToolCalls(text)
-                if (calls.isEmpty()) break
+                if (calls.isEmpty()) {
+                    log.line("[턴 종료] 도구 호출 없음 → 최종 답변")
+                    break
+                }
                 // 결과를 보기 전에 수정·실행을 몰아서 호출하지 못하게: 앞쪽 조회 도구만 실행
                 val firstAction = calls.indexOfFirst { !it.readOnly }
                 val deferred = if (firstAction > 0) calls.size - firstAction else 0
                 if (deferred > 0) calls = calls.subList(0, firstAction)
+                log.line("[도구 계획] " + calls.joinToString(" | ") { Protocol.describeCall(it) } +
+                    if (deferred > 0) "  (+수정/실행 ${deferred}개 보류: 조회 결과 확인 후 재요청)" else "", "tool")
                 val results = mutableListOf<String>()
                 for (call in calls) {
                     if (cancelled.get()) break
-                    results += executeTool(call, h)
+                    val t0 = System.currentTimeMillis()
+                    log.line("▶ " + Protocol.describeCall(call), "tool")
+                    val result = executeTool(call, h)
+                    results += result
+                    val failed = Regex("오류\\]|실패|거부|exit code [1-9]").containsMatchIn(result.lineSequence().first())
+                    log.line(indent(result, if (call is ToolCall.Read) 3 else 40) + "\n    (${"%.1f".format((System.currentTimeMillis() - t0) / 1000.0)}s)", if (failed) "error" else "result")
                 }
                 if (deferred > 0) results += "(주의: 같은 응답의 수정/실행 도구 ${deferred}개는 실행하지 않았습니다. 위 조회 결과를 확인한 뒤 필요한 수정만 다시 요청하세요.)"
                 synchronized(history) { history += ChatMessage("user", "[도구 결과]\n" + results.joinToString("\n\n")) }
@@ -217,9 +271,14 @@ $tree"""
             }
             if (cancelled.get()) emit(mapOf("type" to "notice", "level" to "info", "text" to "중단했습니다."))
         } catch (e: Exception) {
+            outcome = if (cancelled.get()) "중단" else "오류"
+            if (!cancelled.get()) log.line("[오류] ${e.stackTraceToString().take(3000)}", "error")
             emit(mapOf("type" to "notice", "level" to if (cancelled.get()) "info" else "error",
                 "text" to if (cancelled.get()) "중단했습니다." else (e.message ?: e.toString())))
         } finally {
+            if (cancelled.get()) outcome = "중단"
+            log.line("━━━━━━━━ $outcome · ${steps}단계 · 변경 파일 ${checkpoint.originals.size}개 · ${"%.1f".format((System.currentTimeMillis() - started) / 1000.0)}s ━━━━━━━━\n",
+                if (outcome == "오류") "error" else "head")
             running = false
             emit(mapOf("type" to "turn-end", "changedFiles" to checkpoint.originals.size))
             emit(mapOf("type" to "busy", "busy" to false))
@@ -235,6 +294,12 @@ $tree"""
 
     /** 엔진이 꺼져 있을 때 모델 다운로드/시작 같은 설정 요청은 규칙 기반으로 처리. */
     private fun handleOffline(text: String) {
+        if (Clients.remote) {
+            say(if (Clients.backendAlive())
+                "원격 서버(맥)의 코딩 엔진이 꺼져 있습니다. 서버에서 `local-agent start` 를 실행하거나 서버 모드(`scripts/server-mode.sh on`)를 켜 두세요."
+            else "원격 서버에 연결할 수 없습니다: ${Clients.lastBackendError}\nSettings → Tools → Yang Coding 에서 주소와 토큰을 확인하세요.")
+            return
+        }
         val t = text.lowercase()
         val key = when {
             Regex("30b|qwen3").containsMatchIn(t) -> "qwen3-coder-30b"

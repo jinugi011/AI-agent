@@ -598,7 +598,7 @@ textarea {
   }
 }
 
-/* ---- Coding Agent workbench ---------------------------------------------- */
+/* ---- Yang Coding workbench ---------------------------------------------- */
 .aw-grid {
   display: grid;
   grid-template-columns: minmax(280px, 1fr) minmax(360px, 1.6fr) minmax(280px, 1fr);

@@ -27,13 +27,17 @@ struct Args {
     model: String,
     #[arg(long, env = "ENGINE_HOST", default_value = "127.0.0.1")]
     host: String,
-    #[arg(long, env = "ENGINE_PORT", default_value_t = 8091)]
+    #[arg(long, env = "ENGINE_PORT", default_value_t = 18091)]
     port: u16,
     /// 컨텍스트 길이 (M3 Max 36GB + 30B-A3B Q4 기준 32k 권장)
     #[arg(long, env = "ENGINE_CTX", default_value_t = 32768)]
     ctx: u32,
-    #[arg(long, default_value_t = 512)]
+    /// 프롬프트를 한 번에 넣는 토큰 수 (클수록 긴 프롬프트 처리가 빠름)
+    #[arg(long, default_value_t = 2048)]
     batch: u32,
+    /// GPU 한 번 연산 단위 (Metal 은 512 가 적당)
+    #[arg(long, default_value_t = 512)]
+    ubatch: u32,
     /// Metal 로 올릴 레이어 수 (999 = 전부)
     #[arg(long, default_value_t = 999)]
     gpu_layers: u32,
@@ -98,6 +102,7 @@ fn main() -> Result<()> {
         model_path: args.model.clone(),
         n_ctx: args.ctx,
         n_batch: args.batch,
+        n_ubatch: args.ubatch,
         n_gpu_layers: args.gpu_layers,
         n_threads: args.threads,
     };
@@ -185,8 +190,9 @@ fn main() -> Result<()> {
             .map_err(|e| format!("{e:#}"));
         if let Ok(r) = &res {
             eprintln!(
-                "[engine] prompt {} + gen {} tokens ({:.1} tok/s, {})",
-                r.prompt_tokens, r.completion_tokens, r.tokens_per_second, r.finish_reason
+                "[engine] prompt {} (재사용 {}, 새로 계산 {} · {:.1}s) + gen {} tokens ({:.1} tok/s, {})",
+                r.prompt_tokens, r.cached_tokens, r.prompt_tokens - r.cached_tokens, r.prompt_seconds,
+                r.completion_tokens, r.tokens_per_second, r.finish_reason
             );
         }
         let _ = reply.send(Event::Done(res));

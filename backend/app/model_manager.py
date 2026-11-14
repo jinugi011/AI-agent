@@ -49,7 +49,7 @@ class ModelManager:
         self._downloads: Dict[str, Dict] = {}
         self._engine: Optional[subprocess.Popen] = None
         self._engine_model: str = ""
-        self._engine_log = Path(settings.state_dir) / "engine.log"
+        self._engine_log = Path(settings.state_dir) / "engine-backend.log"
         self._lock = threading.Lock()
 
     # ---- 카탈로그 / 로컬 모델 ------------------------------------------------------
@@ -126,7 +126,18 @@ class ModelManager:
         }
 
     def start_engine(self, model: str = "", ctx: int = 0, wait: float = 180) -> Dict:
+        running = llm_client.engine_health()
+        if running and not model:
+            # 이미 떠 있는 엔진(local-agent start 등으로 실행)을 중복 실행하지 않는다
+            return {"status": "already-running", "model": running.get("model")}
         path = self.resolve_model_path(model)
+        if running and Path(running["model"].get("model_path", "")).resolve() == path.resolve():
+            return {"status": "already-running", "model": running.get("model")}
+        if running and not (self._engine is not None and self._engine.poll() is None):
+            raise RuntimeError(
+                f"다른 엔진({running['model'].get('model_name')})이 이미 실행 중입니다. "
+                "local-agent stop 으로 끈 뒤 다시 시도하세요."
+            )
         if not ENGINE_BIN.exists():
             build = subprocess.run(["cargo", "build", "--release"], cwd=ROOT / "engine", capture_output=True, text=True)
             if build.returncode != 0:

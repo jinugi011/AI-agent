@@ -188,3 +188,24 @@ export function lineDiffStats(before: string, after: string): { added: number; r
   }
   return { added: b.length - common, removed: a.length - common };
 }
+
+/** 작업 로그용 한 줄 요약 (예: "READ shop/cart.py:10-20", "EDIT a.py (2블록)"). */
+export function describeCall(c: ToolCall): string {
+  const one = (s: string, n = 80) => {
+    const line = s.split('\n')[0];
+    return line.length > n ? line.slice(0, n) + '…' : line;
+  };
+  switch (c.kind) {
+    case 'read': return `READ ${c.path}${c.start ? `:${c.start}-${c.end}` : ''}`;
+    case 'list': return `LIST ${c.pattern}`;
+    case 'grep': return `GREP ${c.pattern}`;
+    case 'search': return `SEARCH ${one(c.query)}`;
+    case 'write': return `FILE ${c.path} (${c.content.split('\n').length}줄)`;
+    case 'edit': return `EDIT ${c.path} (${c.blocks.length}블록)`;
+    case 'run': return `RUN ${one(c.command, 120)}`;
+    case 'remember': return `REMEMBER ${c.memKind} ${c.scope}${c.scopeValue ? ':' + c.scopeValue : ''} — ${one(c.text)}`;
+    case 'harness': return `HARNESS ${one(c.task)}`;
+    case 'model': return `MODEL ${c.action}${c.arg ? ' ' + c.arg : ''}`;
+    case 'connect': return `CONNECT ${c.location}`;
+  }
+}

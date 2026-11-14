@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { applySearchReplace, lineDiffStats, parseToolCalls, stripToolBlocks } from '../protocol';
+import { applySearchReplace, describeCall, lineDiffStats, parseToolCalls, stripToolBlocks } from '../protocol';
 
 test('여러 도구를 등장 순서대로 파싱', () => {
   const text = `먼저 확인합니다.
@@ -58,4 +58,10 @@ test('SEARCH/REPLACE: 정확 일치, 들여쓰기 차이 허용, 중복/실패 �
 test('diff 통계', () => {
   assert.deepEqual(lineDiffStats('a\nb\nc', 'a\nB\nc\nd'), { added: 2, removed: 1 });
   assert.deepEqual(lineDiffStats('', 'x\ny'), { added: 2, removed: 0 });
+});
+
+test('작업 로그 요약', () => {
+  assert.equal(describeCall({ kind: 'read', path: 'a.py', start: 3, end: 9 }), 'READ a.py:3-9');
+  assert.equal(describeCall({ kind: 'edit', path: 'b.py', blocks: [{ search: 'x', replace: 'y' }] }), 'EDIT b.py (1블록)');
+  assert.equal(describeCall({ kind: 'write', path: 'c.py', content: 'a\nb' }), 'FILE c.py (2줄)');
 });

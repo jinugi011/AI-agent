@@ -177,4 +177,22 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
         }
         return (b.size - common) to (a.size - common)
     }
+
+    /** 작업 로그용 한 줄 요약 (VS Code describeCall 과 동일). */
+    fun describeCall(c: ToolCall): String {
+        fun one(t: String, n: Int = 80): String { val l = t.lineSequence().first(); return if (l.length > n) l.take(n) + "…" else l }
+        return when (c) {
+            is ToolCall.Read -> "READ ${c.path}" + if (c.start != null) ":${c.start}-${c.end}" else ""
+            is ToolCall.ListFiles -> "LIST ${c.pattern}"
+            is ToolCall.Grep -> "GREP ${c.pattern}"
+            is ToolCall.Search -> "SEARCH ${one(c.query)}"
+            is ToolCall.Write -> "FILE ${c.path} (${c.content.split("\n").size}줄)"
+            is ToolCall.Edit -> "EDIT ${c.path} (${c.blocks.size}블록)"
+            is ToolCall.Run -> "RUN ${one(c.command, 120)}"
+            is ToolCall.Remember -> "REMEMBER ${c.memKind} ${c.scope}${if (c.scopeValue.isNotEmpty()) ":" + c.scopeValue else ""} — ${one(c.text)}"
+            is ToolCall.Harness -> "HARNESS ${one(c.task)}"
+            is ToolCall.Model -> "MODEL ${c.action}${if (c.arg.isNotEmpty()) " " + c.arg else ""}"
+            is ToolCall.Connect -> "CONNECT ${c.location}"
+        }
+    }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Local Coding Agent 설치 스크립트 (macOS, Apple Silicon 권장)
+#  Yang Coding 설치 스크립트 (macOS, Apple Silicon 권장)
 #
 #  새 PC 에서:
 #    curl -fsSL https://raw.githubusercontent.com/jinugi011/AI-agent/main/install.sh | bash
@@ -277,7 +277,7 @@ ok "$CONFIG_DIR/config.json"
 ok "명령어: ~/.local/bin/local-agent (start | stop | status | update)"
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]] && ! grep -q '.local/bin' "$HOME/.zshrc" 2>/dev/null; then
   if ask "local-agent 명령을 쓰려면 ~/.local/bin 을 PATH 에 추가해야 합니다. ~/.zshrc 에 추가할까요?"; then
-    printf '\n# Local Coding Agent\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zshrc"
+    printf '\n# Yang Coding\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zshrc"
     ok "~/.zshrc 에 PATH 추가 (새 터미널부터 적용)"
   else
     warn "~/.local/bin 이 PATH 에 없습니다. 전체 경로로 실행: ~/.local/bin/local-agent"
@@ -295,8 +295,8 @@ echo " 설치 완료: $INSTALL_DIR"
 echo "================================================================"
 echo " 시작하기"
 echo "  1) local-agent start        # Qdrant + 엔진 + 백엔드 실행 (새 터미널에서)"
-echo "  2) VS Code: Cmd+Shift+P → 'Local Agent: 채팅 열기' (오른쪽 사이드바)"
-echo "     IntelliJ: 재시작 후 오른쪽 사이드바 'Local Agent'"
+echo "  2) VS Code: Cmd+Shift+P → 'Yang Coding: 채팅 열기' (오른쪽 사이드바)"
+echo "     IntelliJ: 재시작 후 오른쪽 사이드바 'Yang Coding'"
 echo "  3) 프로젝트 폴더를 열고 자연어로 요청"
 echo
 echo " 매뉴얼: $INSTALL_DIR/docs/MANUAL.md   설치 로그: $LOG"

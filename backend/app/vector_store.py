@@ -10,7 +10,7 @@ import re
 import uuid
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -63,8 +63,26 @@ def chunk_text(text: str, lines_per_chunk: int = CHUNK_LINES) -> List[str]:
     return ["\n".join(lines[i : i + lines_per_chunk]) for i in range(0, len(lines), lines_per_chunk)] or [text]
 
 
+SourceDoc = Tuple[str, str]  # (레포 기준 상대경로, 내용)
+
+
+def read_docs(root: Path, files: List[Path]) -> List[SourceDoc]:
+    docs: List[SourceDoc] = []
+    for path in files:
+        try:
+            docs.append((str(path.relative_to(root)), path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return docs
+
+
 def extract_coding_methods(root: Path, files: List[Path]) -> Dict[str, Any]:
-    """레포에서 코딩 방법(관례)을 휴리스틱으로 추출한다. LLM 없이 빠르게 동작."""
+    configs = {f: (root / f).read_text(encoding="utf-8", errors="replace") for f in STYLE_CONFIG_FILES if (root / f).is_file()}
+    return extract_coding_methods_docs(read_docs(root, files), set(configs))
+
+
+def extract_coding_methods_docs(docs: List[SourceDoc], config_names: set) -> Dict[str, Any]:
+    """코딩 방법(관례)을 휴리스틱으로 추출한다. LLM 없이 빠르게 동작. 디스크/업로드 파일 모두 지원."""
     lang_counter: Counter = Counter()
     indent_counter: Counter = Counter()
     quote_counter: Counter = Counter()
@@ -72,15 +90,11 @@ def extract_coding_methods(root: Path, files: List[Path]) -> Dict[str, Any]:
     semicolon_lines = js_lines = 0
     typed_defs = py_defs = 0
     async_uses = 0
-    for path in files:
-        lang = CODE_EXTENSIONS[path.suffix.lower()]
-        if lang in {"markdown", "json", "yaml", "toml"}:
+    for rel, text in docs:
+        lang = CODE_EXTENSIONS.get(Path(rel).suffix.lower())
+        if lang is None or lang in {"markdown", "json", "yaml", "toml"}:
             continue
         lang_counter[lang] += 1
-        try:
-            text = path.read_text(encoding="utf-8")
-        except Exception:
-            continue
         for line in text.splitlines()[:400]:
             stripped = line.lstrip()
             if not stripped:
@@ -118,14 +132,15 @@ def extract_coding_methods(root: Path, files: List[Path]) -> Dict[str, Any]:
         indent = "2" if indent_counter["2"] > 0.15 * spaced else "4"
     else:
         indent = "unknown"
-    top_dirs = sorted({p.relative_to(root).parts[0] for p in files if len(p.relative_to(root).parts) > 1})[:15]
-    test_files = [str(p.relative_to(root)) for p in files if re.search(r"(^|/)(tests?|__tests__|spec)(/|$)|(_test|\.test|\.spec|Tests?)\.\w+$", str(p.relative_to(root)))]
+    rels = [rel for rel, _ in docs]
+    top_dirs = sorted({Path(r).parts[0] for r in rels if len(Path(r).parts) > 1})[:15]
+    test_files = [r for r in rels if re.search(r"(^|/)(tests?|__tests__|spec)(/|$)|(_test|\.test|\.spec|Tests?)\.\w+$", r)]
     methods: Dict[str, Any] = {
         "languages": dict(lang_counter.most_common(6)),
         "indentation": "tabs" if indent == "tabs" else f"{indent} spaces",
         "naming": naming.most_common(1)[0][0] if naming else "unknown",
         "top_level_dirs": top_dirs,
-        "style_configs": [f for f in STYLE_CONFIG_FILES if (root / f).exists()],
+        "style_configs": [f for f in STYLE_CONFIG_FILES if f in config_names],
         "test_files_sample": test_files[:10],
         "has_tests": bool(test_files),
         "uses_async": async_uses > 5,
@@ -235,36 +250,35 @@ class CodeVectorStore:
 
     # ---- 레포 색인 (요구사항 3, 8) ------------------------------------------------
     def index_repository(self, project: str, root: str) -> Dict[str, Any]:
-        """레포 전체를 청크 단위로 벡터화하고 코딩 방법 요약을 함께 저장한다. 재연결 시 이전 색인을 교체."""
+        """디스크의 레포를 색인 (연결/재연결/작업 시작 시)."""
         root_path = Path(root)
         files = list(iter_source_files(root_path))
-        methods = extract_coding_methods(root_path, files)
+        configs = {f: (root_path / f).read_text(encoding="utf-8", errors="replace")[:4000]
+                   for f in STYLE_CONFIG_FILES if (root_path / f).is_file()}
+        return self.index_docs(project, read_docs(root_path, files), configs)
+
+    def index_docs(self, project: str, docs: List[SourceDoc], configs: Dict[str, str]) -> Dict[str, Any]:
+        """파일 내용 목록을 청크 단위로 벡터화하고 코딩 방법 요약을 함께 저장한다. 이전 색인은 교체.
+        원격 PC 의 IDE 플러그인이 업로드한 파일도 이 경로로 색인된다."""
+        docs = [(rel, text) for rel, text in docs if Path(rel).suffix.lower() in CODE_EXTENSIONS]
+        methods = extract_coding_methods_docs(docs, set(configs))
 
         items: List[Dict[str, Any]] = []
-        for path in files:
-            try:
-                text = path.read_text(encoding="utf-8")
-            except Exception:
-                continue
+        for rel, text in docs:
             if not text.strip():
                 continue
-            rel = str(path.relative_to(root_path))
-            lang = CODE_EXTENSIONS[path.suffix.lower()]
+            lang = CODE_EXTENSIONS[Path(rel).suffix.lower()]
             for i, chunk in enumerate(chunk_text(text)):
                 items.append({
                     "id_key": f"{project}:{rel}:{i}",
                     "text": f"{project} {rel}\n{chunk[:2000]}",
                     "payload": {"project": project, "source": rel, "language": lang, "kind": "code", "chunk": i, "content": chunk[:4000]},
                 })
-        for cfg in methods["style_configs"]:
-            try:
-                content = (root_path / cfg).read_text(encoding="utf-8")[:4000]
-            except Exception:
-                continue
+        for cfg, content in configs.items():
             items.append({
                 "id_key": f"{project}:config:{cfg}",
-                "text": f"{project} style config {cfg}\n{content}",
-                "payload": {"project": project, "source": cfg, "language": "config", "kind": "style-config", "content": content},
+                "text": f"{project} style config {cfg}\n{content[:4000]}",
+                "payload": {"project": project, "source": cfg, "language": "config", "kind": "style-config", "content": content[:4000]},
             })
         methods_text = methods_to_text(project, methods)
         items.append({
@@ -275,7 +289,7 @@ class CodeVectorStore:
 
         self.delete_where(self.collection_name, "project", project)
         count = self.upsert(self.collection_name, items)
-        return {"files": len(files), "chunks": count, "methods": methods, "backend": self.backend}
+        return {"files": len(docs), "chunks": count, "methods": methods, "backend": self.backend}
 
     def project_methods(self, project: str) -> Optional[str]:
         hits = self.query(self.collection_name, f"{project} 코딩 방법 요약", top_k=1, filters={"project": project, "kind": "methods"})

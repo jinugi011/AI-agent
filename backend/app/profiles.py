@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -115,31 +115,40 @@ def get_profile(key: str) -> ProjectProfile:
 
 
 def detect_profile(repo: Path) -> Optional[ProjectProfile]:
-    """레포 내용으로 프로필을 추정한다. 더 구체적인 마커를 먼저 본다."""
-    if (repo / "pubspec.yaml").exists():
-        return PROFILES["flutter"]
-    if (repo / "app" / "build.gradle.kts").exists() or (repo / "app" / "build.gradle").exists():
-        return PROFILES["android-kotlin"]
-    if (repo / "Package.swift").exists():
-        return PROFILES["ios-swift"]
-    if (repo / "Cargo.toml").exists():
-        return PROFILES["rust"]
-    if (repo / "go.mod").exists():
-        return PROFILES["go-server"]
-    if any((repo / m).exists() for m in ("build.gradle.kts", "build.gradle", "pom.xml")):
-        return PROFILES["spring-boot"]
-    pkg = repo / "package.json"
-    if pkg.exists():
+    """디스크의 레포 내용으로 프로필을 추정한다."""
+    def read(name: str) -> Optional[str]:
         try:
-            deps = json.loads(pkg.read_text(encoding="utf-8"))
+            return (repo / name).read_text(encoding="utf-8")
+        except Exception:
+            return None
+    return detect_profile_from(lambda name: (repo / name).exists(), read)
+
+
+def detect_profile_from(exists: Callable[[str], bool], read: Callable[[str], Optional[str]]) -> Optional[ProjectProfile]:
+    """파일 존재 여부/내용 함수로 프로필을 추정한다 (원격 업로드 파일 목록에도 사용). 구체적인 마커를 먼저 본다."""
+    if exists("pubspec.yaml"):
+        return PROFILES["flutter"]
+    if exists("app/build.gradle.kts") or exists("app/build.gradle"):
+        return PROFILES["android-kotlin"]
+    if exists("Package.swift"):
+        return PROFILES["ios-swift"]
+    if exists("Cargo.toml"):
+        return PROFILES["rust"]
+    if exists("go.mod"):
+        return PROFILES["go-server"]
+    if any(exists(m) for m in ("build.gradle.kts", "build.gradle", "pom.xml")):
+        return PROFILES["spring-boot"]
+    if exists("package.json"):
+        try:
+            deps = json.loads(read("package.json") or "{}")
             names = {**deps.get("dependencies", {}), **deps.get("devDependencies", {})}
         except Exception:
             names = {}
         if "react-native" in names or "expo" in names:
             return PROFILES["react-native"]
-        if "react" in names and ("vite" in names or any((repo / f).exists() for f in ("vite.config.js", "vite.config.ts"))):
+        if "react" in names and ("vite" in names or exists("vite.config.js") or exists("vite.config.ts")):
             return PROFILES["react-web"]
         return PROFILES["node-server"]
-    if any((repo / m).exists() for m in ("pyproject.toml", "requirements.txt", "setup.py")):
+    if any(exists(m) for m in ("pyproject.toml", "requirements.txt", "setup.py")):
         return PROFILES["python-fastapi"]
     return None

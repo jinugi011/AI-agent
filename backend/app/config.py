@@ -10,7 +10,7 @@ class Settings:
     project_root: str = os.getenv("PROJECT_ROOT", str(_ROOT))
 
     # Rust 추론 엔진 (engine/) — 기본 LLM 경로
-    engine_url: str = os.getenv("ENGINE_URL", "http://127.0.0.1:8091")
+    engine_url: str = os.getenv("ENGINE_URL", "http://127.0.0.1:18091")
     engine_timeout: float = float(os.getenv("ENGINE_TIMEOUT", "900"))
     model_path: str = os.getenv(
         "ENGINE_MODEL_PATH", str(_ROOT / "models" / "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf")

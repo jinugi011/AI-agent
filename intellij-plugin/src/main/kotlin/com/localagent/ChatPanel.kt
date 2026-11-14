@@ -35,12 +35,14 @@ private val HELP = """**사용법** — 자연어로 요청하면 됩니다. 예
 - "30B 모델 다운로드해줘" / "엔진 시작해줘" / "모델 상태"
 
 **슬래시 명령**
-- `/new` 새 대화 · `/stop` 중단 · `/undo` 마지막 턴의 파일 변경 되돌리기
+- `/new` 새 대화 · `/stop` 중단 · `/undo` 마지막 턴의 파일 변경 되돌리기 · `/log` 작업 로그 콘솔 열기
 - `/model [status|download <key>|start [key]|stop]`
 - `/remember <style|preference|constraint> <global|language:x|profile:x|project> 내용`
-- `/task 요구사항` → 하네스(테스트 우선) 자동 구현 · `/connect 경로|URL` · `/reindex`"""
+- `/task 요구사항` → 하네스(테스트 우선) 자동 구현 · `/connect 경로|URL` · `/reindex`
 
-/** Local Agent 툴 윈도우: JCEF 로 채팅 UI(VS Code 확장과 동일한 chat.js/css)를 띄우고 세션과 연결한다. */
+**원격 모드**에서는 하네스·레포 연결·모델 다운로드/시작이 서버 보안상 막혀 있습니다 (읽기·수정·명령 실행·선호 저장은 가능)."""
+
+/** Yang Coding 툴 윈도우: JCEF 로 채팅 UI(VS Code 확장과 동일한 chat.js/css)를 띄우고 세션과 연결한다. */
 class ChatPanel(private val project: Project) : Disposable {
     companion object {
         val instances = ConcurrentHashMap<Project, ChatPanel>()
@@ -53,7 +55,8 @@ class ChatPanel(private val project: Project) : Disposable {
     private val pending = mutableListOf<String>()
     @Volatile private var ready = false
     private val scheduler = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "local-agent-status").apply { isDaemon = true } }
-    private val session = AgentSession(project, ::post, ::askApproval)
+    private val log = AgentLogService.of(project)
+    private val session = AgentSession(project, ::post, ::askApproval, log)
 
     init {
         instances[project] = this
@@ -111,6 +114,9 @@ class ChatPanel(private val project: Project) : Disposable {
             "models" to (models?.map { Clients.gson.fromJson(it, Map::class.java) } ?: emptyList<Any>()),
             "repo" to session.repoName,
             "workspace" to project.name,
+            "remote" to Clients.remote,
+            "server" to if (Clients.remote) AgentSettings.current.serverUrl else "",
+            "error" to if (backendUp) "" else Clients.lastBackendError,
         )
         post(status)
     }
@@ -221,9 +227,20 @@ class ChatPanel(private val project: Project) : Disposable {
                     LocalFileSystem.getInstance().refreshAndFindFileByNioFile(p)?.let { FileEditorManager.getInstance(project).openFile(it, true) }
                 }
             }
-            "setup" -> pooled { notice(session.runDirect(ToolCall.Model(s("action"), s("model")))) }
+            "setup" -> pooled { notice(direct(ToolCall.Model(s("action"), s("model")))) }
             "startBackend" -> pooled { notice(BackendLauncher.ensureRunning(project.basePath) ?: "백엔드가 실행되었습니다.") }
+            "configureRemote" -> ApplicationManager.getApplication().invokeLater {
+                com.intellij.openapi.options.ShowSettingsUtil.getInstance().showSettingsDialog(project, AgentConfigurable::class.java)
+            }
         }
+    }
+
+    /** 승인 없이 도구 하나를 바로 실행 (슬래시 명령·설정 카드) + 작업 로그 기록 */
+    private fun direct(call: ToolCall): String {
+        log.line("▶ (직접 실행) " + Protocol.describeCall(call), "tool")
+        val result = session.runDirect(call)
+        log.line(result.lines().joinToString("\n") { "    $it" }, if ("오류" in result) "error" else "result")
+        return result
     }
 
     private fun pooled(block: () -> Unit) = ApplicationManager.getApplication().executeOnPooledThread(block)
@@ -280,12 +297,18 @@ class ChatPanel(private val project: Project) : Disposable {
                 "/new", "/clear" -> newChat()
                 "/stop" -> session.stop()
                 "/undo" -> pooled { undo() }
-                "/model" -> pooled { notice(session.runDirect(ToolCall.Model(parts.getOrElse(1) { "status" }, parts.drop(2).joinToString(" ")))) }
+                "/log" -> log.show()
+                "/model" -> pooled { notice(direct(ToolCall.Model(parts.getOrElse(1) { "status" }, parts.drop(2).joinToString(" ")))) }
                 "/remember" -> Protocol.parseToolCalls("<<<REMEMBER ${parts.drop(1).take(2).joinToString(" ")}\n${parts.drop(3).joinToString(" ")}\nREMEMBER>>>")
-                    .firstOrNull()?.let { call -> pooled { notice(session.runDirect(call)) } }
-                "/connect" -> pooled { notice(session.runDirect(ToolCall.Connect(arg))) }
+                    .firstOrNull()?.let { call -> pooled { notice(direct(call)) } }
+                "/connect" -> pooled { notice(direct(ToolCall.Connect(arg))) }
                 "/task" -> { val ctx = editorContext(); pooled { session.send("다음 요구사항을 HARNESS 도구로 구현해줘:\n$arg", ctx) } }
                 "/reindex" -> pooled {
+                    if (Clients.remote) {
+                        projectRoot(project)?.let { RemoteIndex.ensure(it, log, force = true) }
+                        notice("원격 서버에서 재색인을 시작했습니다.")
+                        return@pooled
+                    }
                     if (session.repoName.isBlank()) notice("연결된 레포가 없습니다. 먼저 아무 요청이나 보내면 자동 연결됩니다.")
                     else { Clients.post("/api/repos/${session.repoName}/reindex", emptyMap<String, Any>(), 600); notice("${session.repoName} 재색인 완료") }
                 }

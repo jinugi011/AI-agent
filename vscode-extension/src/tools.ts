@@ -2,7 +2,7 @@
 import { spawn } from 'child_process';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { backend } from './clients';
+import { backend, isRemote } from './clients';
 import { applySearchReplace, lineDiffStats, ToolCall } from './protocol';
 
 const EXCLUDE = '**/{node_modules,.git,dist,build,target,.venv,venv,__pycache__,.next,Pods,.dart_tool,.gradle,models}/**';
@@ -129,6 +129,14 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
   const emit = (title: string, status: 'running' | 'done' | 'error' | 'denied', extra: Partial<Extract<UiEvent, { type: 'tool' }>> = {}) =>
     host.emit({ type: 'tool', id, title, status, ...extra });
 
+  // 원격 모드: 서버(맥)에서 코드를 실행하거나 서버 설정을 바꾸는 기능은 쓸 수 없다
+  const serverSide = call.kind === 'harness' || call.kind === 'connect' ||
+    (call.kind === 'model' && ['download', 'start', 'stop'].includes(call.action));
+  if (isRemote() && serverSide) {
+    emit(`${call.kind}`, 'denied', { detail: '원격 모드에서는 사용할 수 없음' });
+    return `[${call.kind.toUpperCase()}] 원격 모드에서는 사용할 수 없습니다 (서버에서 코드를 실행/설정하는 기능은 보안상 차단). ` +
+      '대신 이 PC 에서 READ/EDIT/RUN 으로 직접 구현·테스트하세요.';
+  }
   try {
     switch (call.kind) {
       case 'read': {

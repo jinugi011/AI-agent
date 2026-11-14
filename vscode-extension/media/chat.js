@@ -64,6 +64,25 @@
 
   // ---- 상태 / 설정 카드 ---------------------------------------------------------
   function renderStatus(s) {
+    if (s.remote) {
+      const host = (s.server || '').replace(/^https?:\/\//, '');
+      if (!s.backend) {
+        statusDot.className = 'dot off';
+        statusText.textContent = `원격 연결 실패 · ${host || '주소 없음'}`;
+        setup.hidden = false;
+        setup.innerHTML = `<p>원격 서버에 연결할 수 없습니다.<br><small>${esc(s.error || '')}</small></p><button data-act="configureRemote">원격 접속 설정</button>`;
+        return;
+      }
+      setup.hidden = true;
+      if (s.engine) {
+        statusDot.className = 'dot on';
+        statusText.textContent = `🌐 ${s.engine.name} @ ${host}${s.repo ? ' · ' + s.repo : ''}`;
+      } else {
+        statusDot.className = 'dot warn';
+        statusText.textContent = `🌐 서버 엔진 꺼짐 @ ${host}`;
+      }
+      return;
+    }
     if (!s.backend) {
       statusDot.className = 'dot off';
       statusText.textContent = '백엔드 꺼짐';
@@ -102,6 +121,7 @@
     if (!btn) return;
     const act = btn.dataset.act;
     if (act === 'backend') vscode.postMessage({ type: 'startBackend' });
+    else if (act === 'configureRemote') vscode.postMessage({ type: 'configureRemote' });
     else {
       btn.setAttribute('disabled', '');
       btn.textContent = act === 'start' ? '로딩 중…' : '시작 중…';
@@ -220,7 +240,7 @@
   stopBtn.addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
 
   function welcome() {
-    add(div('welcome', `<p><strong>Local Coding Agent</strong></p>
+    add(div('welcome', `<p><strong>Yang Coding</strong></p>
       <p>현재 워크스페이스에서 자연어로 코딩합니다. 처음 요청 시 레포가 자동으로 연결·벡터화됩니다.</p>
       <p class="li">• "회원가입 API 만들고 테스트 돌려줘"</p>
       <p class="li">• "앞으로 커밋 메시지는 한국어로 해줘" (선호 저장)</p>

@@ -1,13 +1,13 @@
-# Local Coding Agent
+# Yang Coding
 
 로컬 GGUF 코딩 모델(Rust + llama.cpp/Metal)로 git 레포에 직접 코드를 작성하는 에이전트.
 요구사항을 먼저 테스트 하네스로 만들고, 테스트가 통과할 때까지 구현을 반복한다.
 VS Code 확장(`vscode-extension/`)과 IntelliJ 플러그인(`intellij-plugin/`)의 채팅창으로 자연어 코딩을 지원한다.
 
-**전체 작업 내역과 사용 매뉴얼: [docs/MANUAL.md](docs/MANUAL.md)**
+**전체 작업 내역과 사용 매뉴얼: [docs/MANUAL.md](docs/MANUAL.md)** · 외부 접속(Tailscale): [§4.8](docs/MANUAL.md)
 
 ```
-frontend (React)  ──►  backend (FastAPI :8010)  ──►  engine (Rust, llama.cpp Metal :8091)
+frontend (React)  ──►  backend (FastAPI :8010)  ──►  engine (Rust, llama.cpp Metal :18091)
                             │                              └─ models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
                             └─►  Qdrant (:6333)  code-style / agent-preferences
 ```

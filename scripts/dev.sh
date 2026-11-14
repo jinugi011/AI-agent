@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODEL_REPO="${MODEL_REPO:-unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF}"
 MODEL_FILE="${MODEL_FILE:-Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf}"
 export ENGINE_MODEL_PATH="${ENGINE_MODEL_PATH:-$ROOT/models/$MODEL_FILE}"
-export ENGINE_PORT="${ENGINE_PORT:-8091}"
+export ENGINE_PORT="${ENGINE_PORT:-18091}"
 export ENGINE_URL="${ENGINE_URL:-http://127.0.0.1:$ENGINE_PORT}"
 API_PORT="${API_PORT:-8010}"
 

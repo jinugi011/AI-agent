@@ -82,7 +82,7 @@ object FileOps {
     fun write(project: Project, path: Path, content: String) {
         val text = content.replace("\r\n", "\n")
         ApplicationManager.getApplication().invokeAndWait {
-            WriteCommandAction.runWriteCommandAction(project, "Local Agent 편집", "local-agent", {
+            WriteCommandAction.runWriteCommandAction(project, "Yang Coding 편집", "local-agent", {
                 val parent = VfsUtil.createDirectoryIfMissing(path.parent.toString())
                     ?: throw IllegalStateException("폴더를 만들 수 없습니다: ${path.parent}")
                 val vf = parent.findChild(path.fileName.toString()) ?: parent.createChildData(this, path.fileName.toString())
@@ -99,7 +99,7 @@ object FileOps {
 
     fun delete(project: Project, path: Path) {
         ApplicationManager.getApplication().invokeAndWait {
-            WriteCommandAction.runWriteCommandAction(project, "Local Agent 삭제", "local-agent", {
+            WriteCommandAction.runWriteCommandAction(project, "Yang Coding 삭제", "local-agent", {
                 LocalFileSystem.getInstance().refreshAndFindFileByNioFile(path)?.delete(this)
             })
         }
@@ -158,6 +158,14 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
     fun emit(title: String, status: String, detail: String? = null, diff: Map<String, Any>? = null) =
         host.emit(mapOf("type" to "tool", "id" to id, "title" to title, "status" to status, "detail" to detail, "diff" to diff))
 
+    // 원격 모드: 서버(맥)에서 코드를 실행하거나 서버 설정을 바꾸는 기능은 쓸 수 없다
+    val serverSide = call is ToolCall.Harness || call is ToolCall.Connect ||
+        (call is ToolCall.Model && call.action in setOf("download", "start", "stop"))
+    if (Clients.remote && serverSide) {
+        emit(call.kind, "denied", "원격 모드에서는 사용할 수 없음")
+        return "[${call.kind.uppercase()}] 원격 모드에서는 사용할 수 없습니다 (서버에서 코드를 실행/설정하는 기능은 보안상 차단). " +
+            "대신 이 PC 에서 READ/EDIT/RUN 으로 직접 구현·테스트하세요."
+    }
     return try {
         when (call) {
             is ToolCall.Read -> {

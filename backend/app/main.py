@@ -2,10 +2,11 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from . import llm_client
 from .agent_service import LocalProjectAgent
@@ -17,8 +18,9 @@ from .preferences import PreferenceStore
 from .profiles import PROFILES, get_profile
 from .repo_manager import RepoManager
 from .vector_store import CodeVectorStore
+from . import remote, security
 
-app = FastAPI(title="Local Coding Agent", version="1.0.0")
+app = FastAPI(title="Yang Coding", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,6 +28,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def remote_guard(request: Request, call_next):
+    """Cloudflare Tunnel 을 거친 원격 요청: API 토큰 필수 + 허용 목록 기능만."""
+    if not security.is_remote(request.headers):
+        return await call_next(request)
+    method, path = request.method, request.url.path
+    if not security.token_ok(request.headers.get("authorization")):
+        security.audit(request.headers, method, path, 401)
+        return JSONResponse({"detail": "API 토큰이 필요합니다 (Authorization: Bearer …)"}, status_code=401)
+    if not security.remote_allowed(method, path):
+        security.audit(request.headers, method, path, 403)
+        return JSONResponse({"detail": "원격 접속에서는 사용할 수 없는 기능입니다 (서버에서 코드를 실행하는 기능은 차단)"}, status_code=403)
+    response = await call_next(request)
+    security.audit(request.headers, method, path, response.status_code)
+    return response
 
 vector_store = CodeVectorStore(settings.vector_store_path)
 agent = LocalProjectAgent(vector_store)
@@ -84,7 +103,7 @@ def health():
     engine = llm_client.engine_health()
     return {
         "status": "ok",
-        "service": "local-coding-agent",
+        "service": "yang-coding",
         "engine": {"url": settings.engine_url, "online": engine is not None, "info": (engine or {}).get("model")},
         "model": ((engine or {}).get("model") or {}).get("model_name") or f"(engine offline) fallback {settings.default_model}",
         "vector_backend": vector_store.backend,
@@ -106,7 +125,28 @@ class ContextRequest(BaseModel):
     query: str
     workspace_path: str = ""
     repo: str = ""
+    project: str = ""  # 원격 PC 프로젝트 이름 (/api/remote/index 로 색인한 것)
     top_k: int = 6
+
+
+class LLMRequest(BaseModel):
+    messages: List[Dict[str, str]]
+    max_tokens: int = 4096
+    temperature: float = 0.2
+    top_p: float = 0.9
+    stop: List[str] = []
+    stream: bool = True
+
+
+class RemoteFile(BaseModel):
+    path: str
+    content: str
+
+
+class RemoteIndexRequest(BaseModel):
+    project: str
+    files: List[RemoteFile]
+    language: str = ""
 
 
 @app.get("/api/models")
@@ -157,17 +197,56 @@ def _repo_for(workspace_path: str, repo: str):
 
 @app.post("/api/context")
 def chat_context(request: ContextRequest):
-    record = _repo_for(request.workspace_path, request.repo)
-    project = record.name if record else ""
+    if request.project:  # 원격 PC 프로젝트
+        rp = remote.get_project(request.project)
+        repo = {"name": rp["name"], "profile": rp.get("profile", ""), "language": rp.get("language", ""),
+                "remote": True, "status": rp.get("status")} if rp else None
+    else:
+        record = _repo_for(request.workspace_path, request.repo)
+        repo = asdict(record) if record else None
+    project = repo["name"] if repo else ""
     return {
         "success": True,
-        "repo": asdict(record) if record else None,
+        "repo": repo,
         "preferences": preferences.render_for(request.query, project=project,
-                                              language=record.language if record else "",
-                                              profile=record.profile if record else ""),
+                                              language=repo["language"] if repo else "",
+                                              profile=repo["profile"] if repo else ""),
         "methods": vector_store.project_methods(project) if project else None,
         "hits": vector_store.search(request.query, top_k=request.top_k, project=project or None) if request.query else [],
     }
+
+
+# ---- 원격 PC 지원: LLM 중계 · 업로드 색인 -------------------------------------------
+@app.post("/api/llm/generate")
+def llm_generate(request: LLMRequest):
+    """엔진은 localhost 에만 두고 백엔드가 중계한다 (원격 PC 의 IDE 플러그인용)."""
+    body = request.model_dump()
+    body["max_tokens"] = min(body["max_tokens"], 8192)
+    if not request.stream:
+        try:
+            result = llm_client.chat(body["messages"], max_tokens=body["max_tokens"], temperature=body["temperature"], stop=body["stop"])
+        except llm_client.LLMError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        return {"text": result.text, "completion_tokens": result.completion_tokens, "tokens_per_second": result.tokens_per_second}
+    return StreamingResponse(
+        remote.stream_generate(body),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/remote/index")
+def remote_index(request: RemoteIndexRequest):
+    try:
+        record = remote.start_index(vector_store, request.project, [f.model_dump() for f in request.files], request.language)
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
+    return {"success": True, "project": record}
+
+
+@app.get("/api/remote/projects")
+def remote_projects():
+    return {"success": True, "projects": remote.list_projects()}
 
 
 # ---- 프로젝트 프로필 (서버/웹/모바일) -------------------------------------------

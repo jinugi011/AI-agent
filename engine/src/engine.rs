@@ -11,6 +11,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
+use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::sampling::LlamaSampler;
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,10 @@ pub struct GenerateResponse {
     pub completion_tokens: usize,
     pub finish_reason: String,
     pub tokens_per_second: f64,
+    /// 이전 요청과 같은 앞부분이라 다시 계산하지 않은(KV 캐시 재사용) 토큰 수
+    pub cached_tokens: usize,
+    /// 프롬프트 처리(프리필) 시간 (초)
+    pub prompt_seconds: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +78,7 @@ pub struct EngineConfig {
     pub model_path: String,
     pub n_ctx: u32,
     pub n_batch: u32,
+    pub n_ubatch: u32,
     pub n_gpu_layers: u32,
     pub n_threads: i32,
 }
@@ -81,6 +87,8 @@ pub struct Engine<'m> {
     model: &'m LlamaModel,
     ctx: LlamaContext<'m>,
     n_batch: usize,
+    /// 현재 KV 캐시에 들어 있는 토큰 열. 다음 요청과 공통된 앞부분은 다시 계산하지 않는다.
+    cached: Vec<LlamaToken>,
     pub info: ModelInfo,
 }
 
@@ -108,6 +116,7 @@ impl<'m> Engine<'m> {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_batch(cfg.n_batch)
+            .with_n_ubatch(cfg.n_ubatch.min(cfg.n_batch))
             .with_n_threads(cfg.n_threads)
             .with_n_threads_batch(cfg.n_threads);
         let ctx = model
@@ -124,7 +133,7 @@ impl<'m> Engine<'m> {
             n_params: model.n_params(),
             size_bytes: model.size(),
         };
-        Ok(Self { model, ctx, n_batch: cfg.n_batch as usize, info })
+        Ok(Self { model, ctx, n_batch: cfg.n_batch as usize, cached: Vec::new(), info })
     }
 
     fn render_prompt(&self, messages: &[ChatMessage]) -> Result<String> {
@@ -182,20 +191,33 @@ impl<'m> Engine<'m> {
         }
         let max_new = req.max_tokens.min(n_ctx - tokens.len() - 1);
 
-        self.ctx.clear_kv_cache();
+        // ---- KV 프리픽스 캐시: 이전 요청과 같은 앞부분(시스템 프롬프트·이전 대화)은 재사용 ----
+        // 마지막 토큰의 logits 가 필요하므로 최소 1토큰은 다시 계산한다.
+        let mut common = self.cached.iter().zip(tokens.iter()).take_while(|(a, b)| a == b).count();
+        common = common.min(tokens.len() - 1);
+        if !self.ctx.clear_kv_cache_seq(Some(0), Some(common as u32), None).unwrap_or(false) {
+            self.ctx.clear_kv_cache(); // 부분 삭제가 안 되면 전부 다시 계산
+            common = 0;
+        }
+        // 실패 시 캐시 상태를 믿을 수 없으므로, 성공적으로 끝날 때만 갱신한다.
+        self.cached.clear();
+
         let mut sampler = self.build_sampler(req)?;
         let mut batch = LlamaBatch::new(self.n_batch.max(1), 1);
 
-        // 프롬프트 프리필: n_batch 단위로 나눠서 디코딩, 마지막 토큰에서만 logits 계산
+        // 프롬프트 프리필: 재사용하지 못한 부분만 n_batch 단위로 디코딩, 마지막 토큰에서만 logits 계산
+        let prefill_started = Instant::now();
         let last = tokens.len() - 1;
-        for (chunk_idx, chunk) in tokens.chunks(self.n_batch.max(1)).enumerate() {
+        for (chunk_idx, chunk) in tokens[common..].chunks(self.n_batch.max(1)).enumerate() {
             batch.clear();
             for (i, tok) in chunk.iter().enumerate() {
-                let pos = chunk_idx * self.n_batch + i;
+                let pos = common + chunk_idx * self.n_batch + i;
                 batch.add(*tok, pos as i32, &[0], pos == last)?;
             }
             self.ctx.decode(&mut batch).map_err(|e| anyhow!("프롬프트 디코딩 실패: {e}"))?;
         }
+        let prompt_seconds = prefill_started.elapsed().as_secs_f64();
+        let mut decoded: Vec<LlamaToken> = Vec::new(); // KV 에 들어간 생성 토큰
 
         let started = Instant::now();
         let mut out_bytes: Vec<u8> = Vec::new();
@@ -241,7 +263,11 @@ impl<'m> Engine<'m> {
             batch.add(token, n_past as i32, &[0], true)?;
             n_past += 1;
             self.ctx.decode(&mut batch).map_err(|e| anyhow!("토큰 디코딩 실패: {e}"))?;
+            decoded.push(token);
         }
+
+        self.cached = tokens.clone();
+        self.cached.extend(decoded);
 
         let secs = started.elapsed().as_secs_f64().max(1e-6);
         Ok(GenerateResponse {
@@ -251,6 +277,8 @@ impl<'m> Engine<'m> {
             completion_tokens: produced,
             finish_reason,
             tokens_per_second: produced as f64 / secs,
+            cached_tokens: common,
+            prompt_seconds,
         })
     }
 }

@@ -1,6 +1,6 @@
 <idea-plugin>
   <id>com.localagent.coding</id>
-  <name>Local Coding Agent</name>
+  <name>Yang Coding</name>
   <vendor>local</vendor>
   <description><![CDATA[
     Local coding agent chat powered by an on-device model (Rust + llama.cpp).<br/>
@@ -10,17 +10,19 @@
   <depends>com.intellij.modules.platform</depends>
 
   <extensions defaultExtensionNs="com.intellij">
-    <toolWindow id="Local Agent" anchor="right" icon="/icons/agent.svg"
+    <toolWindow id="Yang Coding" anchor="right" icon="/icons/agent.svg"
                 factoryClass="com.localagent.ChatToolWindowFactory"/>
+    <toolWindow id="Yang Coding 로그" anchor="bottom" icon="/icons/agent.svg"
+                factoryClass="com.localagent.LogToolWindowFactory"/>
     <applicationService serviceImplementation="com.localagent.AgentSettings"/>
     <applicationConfigurable parentId="tools" instance="com.localagent.AgentConfigurable"
-                             id="com.localagent.settings" displayName="Local Coding Agent"/>
-    <notificationGroup id="Local Agent" displayType="BALLOON"/>
+                             id="com.localagent.settings" displayName="Yang Coding"/>
+    <notificationGroup id="Yang Coding" displayType="BALLOON"/>
   </extensions>
 
   <actions>
     <action id="LocalAgent.AskSelection" class="com.localagent.AskSelectionAction"
-            text="Local Agent: 선택 영역에 대해 묻기" description="선택한 코드를 로컬 에이전트에 질문">
+            text="Yang Coding: 선택 영역에 대해 묻기" description="선택한 코드를 로컬 에이전트에 질문">
       <add-to-group group-id="EditorPopupMenu" anchor="last"/>
       <keyboard-shortcut keymap="$default" first-keystroke="meta shift L"/>
     </action>

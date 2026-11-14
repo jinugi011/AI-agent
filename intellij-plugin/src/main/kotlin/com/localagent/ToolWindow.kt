@@ -32,10 +32,10 @@ class AskSelectionAction : AnAction(), DumbAware {
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
         val hasSelection = e.getData(CommonDataKeys.EDITOR)?.selectionModel?.hasSelection() == true
-        val window = ToolWindowManager.getInstance(project).getToolWindow("Local Agent") ?: return
+        val window = ToolWindowManager.getInstance(project).getToolWindow("Yang Coding") ?: return
         window.activate {
             if (!hasSelection) return@activate
-            val q = Messages.showInputDialog(project, "선택한 코드에 대해 무엇을 할까요?", "Local Agent", null,
+            val q = Messages.showInputDialog(project, "선택한 코드에 대해 무엇을 할까요?", "Yang Coding", null,
                 "", null) ?: return@activate
             ChatPanel.instances[project]?.handleInput(q)
         }
