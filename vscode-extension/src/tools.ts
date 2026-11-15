@@ -4,13 +4,14 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { backend, isRemote } from './clients';
 import { applySearchReplace, lineDiffStats, ToolCall } from './protocol';
+import { runCheck, runPlay } from './debugRunner';
 
 const EXCLUDE = '**/{node_modules,.git,dist,build,target,.venv,venv,__pycache__,.next,Pods,.dart_tool,.gradle,models}/**';
 const MAX_READ = 60_000;
 const MAX_OUT = 8_000;
 
 export type UiEvent =
-  | { type: 'tool'; id: string; title: string; status: 'running' | 'done' | 'error' | 'denied'; detail?: string; diff?: { path: string; added: number; removed: number } }
+  | { type: 'tool'; id: string; title: string; status: 'running' | 'done' | 'error' | 'denied'; detail?: string; diff?: { path: string; added: number; removed: number }; images?: string[] }
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; text: string };
 
 export interface ToolHost {
@@ -25,9 +26,17 @@ export interface ToolHost {
 /** 대화 턴 단위 변경 기록: 원본 스냅샷으로 diff 표시·되돌리기. */
 export class Checkpoint {
   readonly originals = new Map<string, string | null>(); // fsPath → 원본(null = 새 파일)
+  readonly binaries = new Map<string, Uint8Array>();     // 이미지 등 바이너리 원본
 
   record(uri: vscode.Uri, before: string | null) {
     if (!this.originals.has(uri.fsPath)) this.originals.set(uri.fsPath, before);
+  }
+
+  /** 바이너리 파일(이미지) 원본 기록: null = 새 파일 */
+  recordBinary(uri: vscode.Uri, before: Uint8Array | null) {
+    if (this.originals.has(uri.fsPath)) return;
+    this.originals.set(uri.fsPath, before === null ? null : '');
+    if (before) this.binaries.set(uri.fsPath, before);
   }
 
   async revert(): Promise<string[]> {
@@ -36,12 +45,15 @@ export class Checkpoint {
       const uri = vscode.Uri.file(fsPath);
       if (before === null) {
         await vscode.workspace.fs.delete(uri, { useTrash: true }).then(undefined, () => undefined);
+      } else if (this.binaries.has(fsPath)) {
+        await vscode.workspace.fs.writeFile(uri, this.binaries.get(fsPath)!);
       } else {
         await writeDocument(uri, before);
       }
       reverted.push(fsPath);
     }
     this.originals.clear();
+    this.binaries.clear();
     return reverted;
   }
 }
@@ -231,6 +243,28 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
         return `[RUN ${call.command}] exit code ${res.code}\n${out}`;
       }
 
+      case 'image': return await runImage(call, host, emit);
+
+      case 'check': {
+        emit('Check (정적 검사)', 'running');
+        const rep = await runCheck(host.root, null);
+        emit('Check (정적 검사)', rep.errors ? 'error' : 'done', { detail: rep.text.slice(0, 3000) });
+        return rep.text.replace('[자동 검사]', '[CHECK]');
+      }
+
+      case 'play': {
+        const r = call.req;
+        const title = `Play: ${r.kind}${r.target ? ' ' + r.target : ''}${r.seconds ? ` (${r.seconds}초)` : ''}`;
+        if (!(await host.approve('run', title, `게임·앱을 실행해 오류와 화면을 확인합니다.\n${title}`))) {
+          emit(title, 'denied');
+          return `[PLAY] 사용자가 실행을 거부했습니다. CHECK 나 코드 확인으로 대신 진행하세요.`;
+        }
+        emit(title, 'running');
+        const res = await runPlay(host.root, r, host.signal, (s) => emit(title, 'running', { detail: s }));
+        emit(title, res.errors ? 'error' : 'done', { detail: res.text.slice(0, 4000) });
+        return res.text;
+      }
+
       case 'remember': {
         const scopeValue = call.scope === 'project' ? call.scopeValue || host.repoName : call.scopeValue;
         await backend.post('/api/preferences', { text: call.text, kind: call.memKind, scope: call.scope, scope_value: scopeValue });
@@ -300,4 +334,82 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
     emit(`${call.kind}`, 'error', { detail: msg });
     return `[${call.kind.toUpperCase()} 오류] ${msg}`;
   }
+}
+
+
+// ---- IMAGE: 맥의 이미지 모델로 생성·가공해 프로젝트에 저장 -----------------------------------------
+async function readB64(host: ToolHost, rel: string): Promise<string> {
+  const uri = resolveIn(host.root, rel);
+  return Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('base64');
+}
+
+function resolveIn(root: vscode.Uri, rel: string): vscode.Uri {
+  const abs = path.resolve(root.fsPath, rel);
+  if (!abs.startsWith(root.fsPath)) throw new Error(`워크스페이스 밖 경로: ${rel}`);
+  return vscode.Uri.file(abs);
+}
+
+async function runImage(call: Extract<ToolCall, { kind: 'image' }>, host: ToolHost,
+  emit: (title: string, status: 'running' | 'done' | 'error' | 'denied', extra?: Partial<Extract<UiEvent, { type: 'tool' }>>) => void): Promise<string> {
+  const f = call.fields;
+  const title = `Image: ${call.path}${f.size ? ` (${f.size})` : ''}`;
+  if (!/\.(png|webp)$/i.test(call.path)) return `[IMAGE ${call.path}] 오류: 저장 경로는 .png (또는 .webp) 여야 합니다`;
+  if (!(await host.approve('edit', title, `${f.prompt ? '생성: ' + f.prompt : '가공: ' + (f.ops ?? '')}`))) {
+    emit(title, 'denied');
+    return `[IMAGE ${call.path}] 사용자가 거부했습니다`;
+  }
+  emit(title, 'running', { detail: f.prompt ? '이미지 생성 중 (15~40초)…' : '이미지 가공 중…' });
+  const size = /^(\d+)\s*[x×*]\s*(\d+)$/i.exec(f.size ?? '');
+  const yes = (v?: string) => /^(yes|true|y|1|예|네)$/i.test((v ?? '').trim());
+  const body: any = {
+    prompt: f.prompt ?? '', width: size ? +size[1] : 0, height: size ? +size[2] : 0,
+    transparent: yes(f.transparent), pixel: Number(f.pixel ?? 0) || 0, colors: Number(f.colors ?? 24) || 24,
+    strength: Number(f.strength ?? 0) || 0, ops: f.ops ?? '', cols: Number(f.cols ?? 0) || 0, seed: f.seed ? Number(f.seed) : undefined,
+  };
+  try {
+    const ref = (f.ref ?? '').trim();
+    if (ref.startsWith('search:')) body.ref_search = ref.slice(7).trim();
+    else if (ref.startsWith('attachment:')) body.ref_attachment = ref.slice(11).trim();
+    else if (ref) body.refs = [await readB64(host, ref)];
+    if (f.from) body.source = await readB64(host, f.from.trim());
+    if (f.join) body.join = await Promise.all(f.join.split(',').map((x) => x.trim()).filter(Boolean).map((x) => readB64(host, x)));
+  } catch (e: any) {
+    emit(title, 'error', { detail: e.message });
+    return `[IMAGE ${call.path}] 오류: 참고/원본 이미지를 읽을 수 없습니다 — ${e.message}`;
+  }
+  let res: any;
+  try {
+    res = await backend.post('/api/images/generate', body, 900_000);
+  } catch (e: any) {
+    emit(title, 'error', { detail: e.message });
+    return `[IMAGE ${call.path}] 오류: ${e.message}`;
+  }
+  const images: string[] = res.images ?? [];
+  const ext = path.extname(call.path);
+  const targets = images.length === 1 ? [call.path] : images.map((_, i) => call.path.slice(0, -ext.length) + `_${i}` + ext);
+  for (let i = 0; i < images.length; i++) {
+    const uri = resolveIn(host.root, targets[i]);
+    const before = await vscode.workspace.fs.readFile(uri).then((b) => b, () => null);
+    host.checkpoint.recordBinary(uri, before);
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(uri.fsPath)));
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(images[i], 'base64'));
+  }
+  // 웹 참고 이미지를 썼으면 출처 기록 (CC0·퍼블릭 도메인은 표기 의무는 없지만 추적용)
+  if (res.credits?.length) {
+    const credits = vscode.Uri.joinPath(host.root, 'ASSET_CREDITS.md');
+    const before = await readText(credits);
+    host.checkpoint.record(credits, before);
+    const lines = res.credits.map((c: any) => `- \`${call.path}\` 스타일 참고: [${c.title || '제목 없음'}](${c.source}) — ${c.creator || '작성자 미상'} · ${c.license} ${c.license_url}`);
+    await writeDocument(credits, (before ?? '# 에셋 출처\n\n프로젝트 그림은 FLUX.1-schnell(Apache-2.0)로 생성했습니다. 아래는 스타일 참고에 쓴 무료 이미지입니다.\n\n') + lines.join('\n') + '\n');
+  }
+  const t = res.timings ?? {};
+  const sizes = (res.sizes ?? []).map((s: number[]) => s.join('x')).join(', ');
+  const summary = `${targets.join(', ')} 저장 (${sizes}) · ${t.total ?? '?'}초` +
+    (t.generate ? ` (생성 ${t.generate}s${t.style ? ` · 스타일 분석 ${t.style}s` : ''}${t.process ? ` · 가공 ${t.process}s` : ''})` : '');
+  emit(title, 'done', { detail: summary + (res.prompt_used ? `\n프롬프트: ${res.prompt_used}` : ''), images: images.slice(0, 4).map((b) => `data:image/png;base64,${b}`) });
+  return `[IMAGE ${call.path}] 완료: ${summary}` +
+    (res.prompt_used ? `\n사용한 프롬프트: ${res.prompt_used}` : '') +
+    (res.style ? `\n참고 이미지 스타일: ${res.style}` : '') +
+    (res.credits?.length ? `\n참고 출처를 ASSET_CREDITS.md 에 기록함` : '') +
+    '\n(코드에서 이 경로로 불러오세요. 확인이 필요하면 PLAY 로 화면을 보세요.)';
 }

@@ -43,17 +43,30 @@ interface ToolHost {
 /** 대화 턴 단위 변경 기록: 원본 스냅샷으로 되돌리기. */
 class Checkpoint {
     val originals = LinkedHashMap<String, String?>() // 절대경로 → 원본(null = 새 파일)
+    val binaries = HashMap<String, ByteArray>()       // 이미지 등 바이너리 원본
 
     fun record(path: Path, before: String?) {
         originals.putIfAbsent(path.toString(), before)
     }
 
+    /** 바이너리 파일(이미지) 원본 기록: null = 새 파일 */
+    fun recordBinary(path: Path, before: ByteArray?) {
+        if (originals.containsKey(path.toString())) return
+        originals[path.toString()] = if (before == null) null else ""
+        if (before != null) binaries[path.toString()] = before
+    }
+
     fun revert(project: Project): Int {
         val n = originals.size
         for ((p, before) in originals) {
-            if (before == null) FileOps.delete(project, Path.of(p)) else FileOps.write(project, Path.of(p), before)
+            when {
+                before == null -> FileOps.delete(project, Path.of(p))
+                binaries.containsKey(p) -> FileOps.writeBytes(project, Path.of(p), binaries.getValue(p))
+                else -> FileOps.write(project, Path.of(p), before)
+            }
         }
         originals.clear()
+        binaries.clear()
         return n
     }
 }
@@ -79,6 +92,17 @@ object FileOps {
     }
 
     /** IntelliJ 문서 편집으로 기록 → 에디터에서 Cmd+Z 로 되돌릴 수 있다. */
+    fun writeBytes(project: Project, path: Path, bytes: ByteArray) {
+        ApplicationManager.getApplication().invokeAndWait {
+            WriteCommandAction.runWriteCommandAction(project, "Yang Coding 이미지", "local-agent", {
+                val parent = VfsUtil.createDirectoryIfMissing(path.parent.toString())
+                    ?: throw IllegalStateException("폴더를 만들 수 없습니다: ${path.parent}")
+                val vf = parent.findChild(path.fileName.toString()) ?: parent.createChildData(this, path.fileName.toString())
+                vf.setBinaryContent(bytes)
+            })
+        }
+    }
+
     fun write(project: Project, path: Path, content: String) {
         val text = content.replace("\r\n", "\n")
         ApplicationManager.getApplication().invokeAndWait {
@@ -264,6 +288,28 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
                 "[RUN ${call.command}] exit code $code\n$t"
             }
 
+            is ToolCall.Image -> runImage(call, host) { t, st, d, imgs -> host.emit(mapOf("type" to "tool", "id" to id, "title" to t, "status" to st, "detail" to d, "images" to imgs)) }
+
+            is ToolCall.Check -> {
+                emit("Check (정적 검사)", "running")
+                val rep = DebugRunner.runCheck(host.project, host.root, null)
+                emit("Check (정적 검사)", if (rep.errors > 0) "error" else "done", rep.text.take(3000))
+                rep.text.replace("[자동 검사]", "[CHECK]")
+            }
+
+            is ToolCall.Play -> {
+                val r = call.req
+                val title = "Play: ${r.kind}${if (r.target.isNotBlank()) " " + r.target else ""}${if (r.seconds > 0) " (${r.seconds}초)" else ""}"
+                if (!host.approve("run", title, "게임·앱을 실행해 오류와 화면을 확인합니다.\n$title")) {
+                    emit(title, "denied")
+                    return "[PLAY] 사용자가 실행을 거부했습니다. CHECK 나 코드 확인으로 대신 진행하세요."
+                }
+                emit(title, "running")
+                val res = DebugRunner.runPlay(host.root, r, { host.isCancelled() }) { emit(title, "running", it) }
+                emit(title, if (res.errors > 0) "error" else "done", res.text.take(4000))
+                res.text
+            }
+
             is ToolCall.Remember -> {
                 val value = if (call.scope == "project") call.scopeValue.ifBlank { host.repoName } else call.scopeValue
                 Clients.post("/api/preferences", mapOf("text" to call.text, "kind" to call.memKind, "scope" to call.scope, "scope_value" to value))
@@ -347,3 +393,80 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
 }
 
 fun projectRoot(project: Project): Path? = project.basePath?.let { File(it).toPath() }
+
+
+// ---- IMAGE: 맥의 이미지 모델로 생성·가공해 프로젝트에 저장 ----------------------------------------------
+private fun runImage(call: ToolCall.Image, host: ToolHost, emit: (String, String, String?, List<String>?) -> Unit): String {
+    val f = call.fields
+    val title = "Image: ${call.path}${f["size"]?.let { " ($it)" } ?: ""}"
+    if (!Regex("""\.(png|webp)$""", RegexOption.IGNORE_CASE).containsMatchIn(call.path)) return "[IMAGE ${call.path}] 오류: 저장 경로는 .png (또는 .webp) 여야 합니다"
+    if (!host.approve("edit", title, f["prompt"]?.let { "생성: $it" } ?: "가공: ${f["ops"] ?: ""}")) {
+        emit(title, "denied", null, null)
+        return "[IMAGE ${call.path}] 사용자가 거부했습니다"
+    }
+    emit(title, "running", if (f["prompt"] != null) "이미지 생성 중 (15~40초)…" else "이미지 가공 중…", null)
+    val size = Regex("""^(\d+)\s*[x×*]\s*(\d+)$""", RegexOption.IGNORE_CASE).find(f["size"]?.trim() ?: "")
+    fun yes(v: String?) = Regex("^(yes|true|y|1|예|네)$", RegexOption.IGNORE_CASE).matches(v?.trim() ?: "")
+    val b64 = java.util.Base64.getEncoder()
+    fun read(rel: String) = b64.encodeToString(Files.readAllBytes(FileOps.resolveInRoot(host.root, rel.trim())))
+    val body = HashMap<String, Any?>()
+    body["prompt"] = f["prompt"] ?: ""
+    body["width"] = size?.groupValues?.get(1)?.toInt() ?: 0
+    body["height"] = size?.groupValues?.get(2)?.toInt() ?: 0
+    body["transparent"] = yes(f["transparent"])
+    body["pixel"] = f["pixel"]?.toIntOrNull() ?: 0
+    body["colors"] = f["colors"]?.toIntOrNull() ?: 24
+    body["strength"] = f["strength"]?.toDoubleOrNull() ?: 0.0
+    body["ops"] = f["ops"] ?: ""
+    body["cols"] = f["cols"]?.toIntOrNull() ?: 0
+    f["seed"]?.toIntOrNull()?.let { body["seed"] = it }
+    try {
+        val ref = f["ref"]?.trim() ?: ""
+        when {
+            ref.startsWith("search:") -> body["ref_search"] = ref.removePrefix("search:").trim()
+            ref.startsWith("attachment:") -> body["ref_attachment"] = ref.removePrefix("attachment:").trim()
+            ref.isNotEmpty() -> body["refs"] = listOf(read(ref))
+        }
+        f["from"]?.let { body["source"] = read(it) }
+        f["join"]?.let { j -> body["join"] = j.split(",").map { it.trim() }.filter { it.isNotEmpty() }.map { read(it) } }
+    } catch (e: Exception) {
+        emit(title, "error", e.message, null)
+        return "[IMAGE ${call.path}] 오류: 참고/원본 이미지를 읽을 수 없습니다 — ${e.message}"
+    }
+    val res = try { Clients.post("/api/images/generate", body, 900) } catch (e: Exception) {
+        emit(title, "error", e.message, null)
+        return "[IMAGE ${call.path}] 오류: ${e.message}"
+    }
+    val images = res.getAsJsonArray("images")?.map { it.asString } ?: emptyList()
+    val ext = call.path.substringAfterLast('.', "png")
+    val base = call.path.removeSuffix(".$ext")
+    val targets = if (images.size == 1) listOf(call.path) else images.indices.map { "${base}_$it.$ext" }
+    val dec = java.util.Base64.getDecoder()
+    images.forEachIndexed { i, img ->
+        val p = FileOps.resolveInRoot(host.root, targets[i])
+        host.checkpoint.recordBinary(p, if (Files.exists(p)) Files.readAllBytes(p) else null)
+        FileOps.writeBytes(host.project, p, dec.decode(img))
+    }
+    val credits = res.getAsJsonArray("credits")?.map { it.asJsonObject } ?: emptyList()
+    if (credits.isNotEmpty()) {
+        val cp = host.root.resolve("ASSET_CREDITS.md")
+        val before = FileOps.read(cp)
+        host.checkpoint.record(cp, before)
+        val lines = credits.joinToString("\n") { c ->
+            "- `${call.path}` 스타일 참고: [${c.get("title")?.asString?.ifBlank { "제목 없음" }}](${c.get("source")?.asString}) — ${c.get("creator")?.asString?.ifBlank { "작성자 미상" }} · ${c.get("license")?.asString} ${c.get("license_url")?.asString}"
+        }
+        FileOps.write(host.project, cp, (before ?: "# 에셋 출처\n\n프로젝트 그림은 FLUX.1-schnell(Apache-2.0)로 생성했습니다. 아래는 스타일 참고에 쓴 무료 이미지입니다.\n\n") + lines + "\n")
+    }
+    val t = res.getAsJsonObject("timings")
+    fun tm(k: String) = t?.get(k)?.asString
+    val sizes = res.getAsJsonArray("sizes")?.joinToString(", ") { s -> s.asJsonArray.joinToString("x") { it.asString } } ?: ""
+    val summary = "${targets.joinToString(", ")} 저장 ($sizes) · ${tm("total") ?: "?"}초" +
+        (tm("generate")?.let { g -> " (생성 ${g}s${tm("style")?.let { " · 스타일 분석 ${it}s" } ?: ""}${tm("process")?.let { " · 가공 ${it}s" } ?: ""})" } ?: "")
+    val prompt = res.get("prompt_used")?.asString ?: ""
+    emit(title, "done", summary + if (prompt.isNotEmpty()) "\n프롬프트: $prompt" else "", images.take(4).map { "data:image/png;base64,$it" })
+    return "[IMAGE ${call.path}] 완료: $summary" +
+        (if (prompt.isNotEmpty()) "\n사용한 프롬프트: $prompt" else "") +
+        (res.get("style")?.asString?.takeIf { it.isNotEmpty() }?.let { "\n참고 이미지 스타일: $it" } ?: "") +
+        (if (credits.isNotEmpty()) "\n참고 출처를 ASSET_CREDITS.md 에 기록함" else "") +
+        "\n(코드에서 이 경로로 불러오세요. 확인이 필요하면 PLAY 로 화면을 보세요.)"
+}

@@ -28,6 +28,52 @@ private fun indent(s: String, max: Int = 40): String {
 private val TREE_EXCLUDES = setOf("node_modules", ".git", "dist", "build", "target", ".venv", "venv", "__pycache__", ".next", "Pods", ".dart_tool", ".gradle", "models", "out", ".idea")
 
 /** 채팅 에이전트 루프 (VS Code agent.ts 와 동일한 동작). 백그라운드 스레드에서 send() 를 호출한다. */
+/** 서버가 분석한 첨부 파일 (이미지 · PDF · MD) */
+data class Attachment(
+    val id: String, val name: String, val kind: String, val content: String, val chars: Int,
+    val pages: Int = 0, val visionPages: Int = 0, val notes: List<String> = emptyList(),
+) {
+    companion object {
+        fun from(o: JsonObject) = Attachment(
+            id = o.get("id").asString, name = o.get("name").asString, kind = o.get("kind").asString,
+            content = o.get("content")?.asString ?: "", chars = o.get("chars")?.asInt ?: 0,
+            pages = o.get("pages")?.asInt ?: 0, visionPages = o.get("vision_pages")?.asInt ?: 0,
+            notes = o.getAsJsonArray("notes")?.map { it.asString } ?: emptyList(),
+        )
+    }
+}
+
+private const val ATT_PER_FILE = 12_000  // 첨부 하나를 대화에 넣는 최대 글자 수
+private const val ATT_TOTAL = 24_000     // 한 요청의 첨부 합계 (나머지는 .yang/attachments 파일을 READ)
+private const val ATT_DIR = ".yang/attachments"
+
+/** 첨부 분석 결과를 프로젝트의 .yang/attachments/ 에 저장 (에이전트가 READ/GREP 로 전체를 볼 수 있게, git 에는 안 올라감) */
+private fun saveAttachments(root: Path, atts: List<Attachment>): Map<String, String> = try {
+    val dir = root.resolve(ATT_DIR).also { Files.createDirectories(it) }
+    Files.writeString(root.resolve(".yang/.gitignore"), "*\n")
+    atts.associate { a ->
+        val file = "${a.id}-${a.name.replace(Regex("[^\\w.가-힣-]"), "_")}.md"
+        Files.writeString(dir.resolve(file), a.content)
+        a.id to "$ATT_DIR/$file"
+    }
+} catch (e: Exception) { emptyMap() }
+
+private fun attachmentBlock(atts: List<Attachment>, paths: Map<String, String>): String {
+    if (atts.isEmpty()) return ""
+    var budget = ATT_TOTAL
+    val kinds = mapOf("image" to "이미지 (비전 모델 분석 결과)", "pdf" to "PDF", "text" to "문서")
+    val parts = atts.map { a ->
+        val limit = maxOf(1500, minOf(ATT_PER_FILE, budget))
+        val cut = a.content.length > limit
+        val body = if (cut) a.content.take(limit) + "\n…(이하 ${"%,d".format(a.content.length - limit)}자 생략)" else a.content
+        budget -= minOf(a.content.length, limit)
+        val full = paths[a.id]?.let { " · 전체: $it" + if (cut) " (READ 로 나머지 확인)" else "" } ?: ""
+        "### 📎 ${a.name} — ${kinds[a.kind] ?: a.kind}$full\n$body"
+    }
+    return "\n\n[첨부 파일 ${atts.size}개] 사용자가 첨부한 자료입니다. 요청을 처리할 때 이 내용을 근거로 사용하세요." +
+        " 이미지는 비전 모델이 글로 풀어 쓴 것이므로 수치(색·간격)는 추정일 수 있습니다.\n\n" + parts.joinToString("\n\n")
+}
+
 class AgentSession(
     private val project: Project,
     private val emit: (Map<String, Any?>) -> Unit,
@@ -110,7 +156,8 @@ class AgentSession(
 ## 일하는 방식
 - 추측하지 말고 먼저 READ/GREP/SEARCH 로 확인한 뒤 수정한다.
 - 기존 코드의 스타일·구조·네이밍을 그대로 따른다. 아래 선호/제약은 반드시 지킨다.
-- 수정 후에는 가능하면 RUN 으로 테스트/빌드를 실행해 검증한다.
+- 파일을 고치면 [자동 검사] 결과(문법·타입·IDE 오류·리소스 경로)가 도구 결과에 붙는다. 오류가 있으면 먼저 고친다.
+- 수정 후에는 RUN(테스트·빌드) 또는 PLAY(게임·앱 실행)로 실제 동작을 확인한다. 확인하지 못했으면 그 사실을 답변에 적는다.
 - 사용자가 지정한 함수 이름·시그니처·동작은 절대 바꾸지 않는다 (예: total(prices) 를 total() 로 바꾸지 말 것).
 - 테스트가 실패하면 테스트를 구현에 맞추지 말고, 요구사항에 맞게 구현을 고친다. 테스트 자체가 요구사항과
   모순될 때만 테스트를 고치고, 그 이유를 답변에 명시한다. 테스트를 약화시켜 통과시키는 것은 금지.
@@ -118,8 +165,11 @@ class AgentSession(
 - 큰 기능(여러 파일, 명확한 요구사항)은 HARNESS 로 테스트 우선 구현을 수행해도 된다.
 - 사용자가 "기억해", "앞으로는", "항상" 같은 말로 스타일/선호/제약을 알려주면 REMEMBER 로 저장한다.
 - 사용자가 모델 다운로드/교체/엔진 관련 요청을 하면 MODEL 도구를 쓴다.
+- 프로젝트에 필요한 그림(캐릭터·배경·아이콘·UI)은 인터넷에서 받지 말고 IMAGE 로 생성한다. prompt 는 영어로 쓴다. 생성한 경로를 코드에서 정확히 불러온다.
 - 답변은 사용자의 언어(기본 한국어)로 간결하게. 완료 후에는 무엇을 바꿨는지 1~3줄로 요약한다.
 - 도구 결과를 기다려야 하면 그 응답에서는 도구 블록까지만 쓰고 멈춘다. 파일을 READ 하기 전에는 EDIT 하지 않는다.
+
+${DebugKit.DEBUG_RULES}
 
 ${Protocol.TOOL_DOCS}
 
@@ -159,7 +209,7 @@ $tree"""
         return executeTool(call, host(root, Checkpoint(), autoApprove = true))
     }
 
-    fun send(userText: String, editor: EditorContext) {
+    fun send(userText: String, editor: EditorContext, attachments: List<Attachment> = emptyList(), debug: Boolean = false) {
         if (running) return
         running = true
         cancelled.set(false)
@@ -186,9 +236,9 @@ $tree"""
                 if (Clients.remote) {
                     // 원격: 이 PC 의 파일을 서버로 올려 벡터화(처음/6시간마다) 후 프로젝트 이름으로 컨텍스트 조회
                     runCatching { RemoteIndex.ensure(root, log) }.onFailure { log.line("[원격 색인] 실패: ${it.message}", "error") }
-                    Clients.post("/api/context", mapOf("query" to userText, "project" to RemoteIndex.projectName(root), "top_k" to 6), 60)
+                    Clients.post("/api/context", mapOf("query" to userText, "project" to RemoteIndex.projectName(root), "attachment_project" to RemoteIndex.projectName(root), "top_k" to 6), 60)
                 } else {
-                    Clients.post("/api/context", mapOf("query" to userText, "workspace_path" to root.toString(), "top_k" to 6), 600)
+                    Clients.post("/api/context", mapOf("query" to userText, "workspace_path" to root.toString(), "attachment_project" to RemoteIndex.projectName(root), "top_k" to 6), 600)
                 }
             } catch (e: Exception) {
                 emit(mapOf("type" to "notice", "level" to "warn", "text" to "백엔드 컨텍스트를 가져오지 못했습니다 (선호/벡터 검색 없이 진행): ${e.message}"))
@@ -202,8 +252,18 @@ $tree"""
                 val h = it.asJsonObject; "--- ${h.get("source").asString} ---\n${h.get("content").asString}"
             }.orEmpty()
 
+            // 이번에 첨부한 파일은 내용을 직접 넣고, 예전에 올린 첨부는 질문과 관련된 부분만 (벡터 검색)
+            val attPaths = saveAttachments(root, attachments)
+            val thisTurn = attachments.map { it.id }.toSet()
+            val pastAtts = ctx?.getAsJsonArray("attachments")?.map { it.asJsonObject }
+                ?.filter { it.get("attachment_id")?.asString !in thisTurn }?.take(2)
+                ?.joinToString("\n") { "--- 📎 ${it.get("source").asString} ---\n${it.get("content").asString}" }.orEmpty()
+            if (attachments.isNotEmpty()) {
+                log.line("[첨부] ${attachments.joinToString(", ") { "${it.name}(${"%,d".format(it.chars)}자)" }} → 대화에 포함 · 전체는 $ATT_DIR/")
+            }
             synchronized(history) {
-                history += ChatMessage("user", "$userText\n\n${editorBlock(editor)}" +
+                history += ChatMessage("user", "$userText\n\n${editorBlock(editor)}" + attachmentBlock(attachments, attPaths) +
+                    (if (pastAtts.isNotBlank()) "\n\n(참고: 이전에 첨부한 자료 중 관련 부분)\n$pastAtts" else "") +
                     if (related.isNotBlank()) "\n\n(참고: 벡터 검색으로 찾은 관련 코드)\n$related" else "")
             }
             // 같은 대화에서 시스템 프롬프트가 그대로면 엔진이 앞부분을 재사용한다
@@ -215,8 +275,11 @@ $tree"""
             log.line("[컨텍스트] 현재 파일 ${editor.file ?: "-"}${editor.selectionRange?.let { " · 선택 $it" } ?: ""} · 시스템 프롬프트 ${"%,d".format(system.length)}자")
             val h = host(root, checkpoint)
             val s = AgentSettings.current
+            // 디버그 모드는 재현 → 계측 → 수정 → 재검증으로 단계가 많아 두 배까지 허용
+            val maxSteps = if (debug) maxOf(24, s.maxSteps * 2) else s.maxSteps
+            val gate = Gate()
 
-            for (step in 0 until s.maxSteps) {
+            for (step in 0 until maxSteps) {
                 if (cancelled.get()) break
                 steps = step + 1
                 val id = "a${System.currentTimeMillis()}"
@@ -244,6 +307,12 @@ $tree"""
 
                 var calls = Protocol.parseToolCalls(text)
                 if (calls.isEmpty()) {
+                    val nudge = if (step < maxSteps - 1) finishGate(checkpoint, gate, s.verifyBeforeFinish || debug) else ""
+                    if (nudge.isNotEmpty()) {
+                        log.line("[완료 관문] " + nudge.lineSequence().first())
+                        synchronized(history) { history += ChatMessage("user", nudge) }
+                        continue
+                    }
                     log.line("[턴 종료] 도구 호출 없음 → 최종 답변")
                     break
                 }
@@ -264,9 +333,32 @@ $tree"""
                     log.line(indent(result, if (call is ToolCall.Read) 3 else 40) + "\n    (${"%.1f".format((System.currentTimeMillis() - t0) / 1000.0)}s)", if (failed) "error" else "result")
                 }
                 if (deferred > 0) results += "(주의: 같은 응답의 수정/실행 도구 ${deferred}개는 실행하지 않았습니다. 위 조회 결과를 확인한 뒤 필요한 수정만 다시 요청하세요.)"
+                // 실행으로 확인했는지 · CHECK 결과 기록
+                calls.forEachIndexed { i, c ->
+                    if (c is ToolCall.Run || c is ToolCall.Play || c is ToolCall.Harness) gate.ran = true
+                    if (c is ToolCall.Check) {
+                        gate.errors = Regex("오류 (\\d+)개").find(results.getOrElse(i) { "" })?.groupValues?.get(1)?.toInt() ?: 0
+                        gate.errorText = if (gate.errors > 0) results[i] else ""
+                    }
+                }
+                // 수정 직후 자동 검사: 문법·타입·IDE 오류·리소스 경로를 바로 돌려줘 다음 단계에서 고치게 한다
+                val changed = calls.mapNotNull { c -> (c as? ToolCall.Write)?.path ?: (c as? ToolCall.Edit)?.path }.distinct()
+                if (changed.isNotEmpty()) {
+                    if (changed.any { Regex("""\.(py|m?jsx?|cjs|tsx?|dart|gd|cs|html?|kt|java|rs|go|lua|vue|svelte)$""", RegexOption.IGNORE_CASE).containsMatchIn(it) }) gate.codeChanged = true
+                    if (s.autoCheck && !cancelled.get()) {
+                        val t0 = System.currentTimeMillis()
+                        val rep = try { DebugRunner.runCheck(project, root, changed) } catch (e: Exception) { DebugRunner.CheckReport(0, 0, "[자동 검사] 실패: ${e.message}") }
+                        gate.errors = rep.errors
+                        gate.errorText = if (rep.errors > 0) rep.text else ""
+                        results += rep.text
+                        log.line(indent(rep.text, 30) + "\n    (${"%.1f".format((System.currentTimeMillis() - t0) / 1000.0)}s)", if (rep.errors > 0) "error" else "result")
+                        if (rep.errors + rep.warnings > 0) emit(mapOf("type" to "tool", "id" to "chk${System.currentTimeMillis()}",
+                            "title" to "자동 검사: 오류 ${rep.errors} · 경고 ${rep.warnings}", "status" to if (rep.errors > 0) "error" else "done", "detail" to rep.text.take(3000)))
+                    }
+                }
                 synchronized(history) { history += ChatMessage("user", "[도구 결과]\n" + results.joinToString("\n\n")) }
-                if (step == s.maxSteps - 1) {
-                    emit(mapOf("type" to "notice", "level" to "warn", "text" to "최대 단계(${s.maxSteps})에 도달해 멈췄습니다. \"계속\"이라고 입력하면 이어서 진행합니다."))
+                if (step == maxSteps - 1) {
+                    emit(mapOf("type" to "notice", "level" to "warn", "text" to "최대 단계(${maxSteps})에 도달해 멈췄습니다. \"계속\"이라고 입력하면 이어서 진행합니다."))
                 }
             }
             if (cancelled.get()) emit(mapOf("type" to "notice", "level" to "info", "text" to "중단했습니다."))
@@ -283,6 +375,41 @@ $tree"""
             emit(mapOf("type" to "turn-end", "changedFiles" to checkpoint.originals.size))
             emit(mapOf("type" to "busy", "busy" to false))
         }
+    }
+
+    /** 완료 관문 상태: 남은 오류 · 실행 확인 여부 · 같은 독촉 반복 횟수 */
+    private class Gate {
+        var errors = 0
+        var errorText = ""
+        var ran = false
+        var codeChanged = false
+        var nudgeErrors = 0
+        var nudgeMarkers = 0
+        var nudgeVerify = 0
+    }
+
+    /** 모델이 끝내려 할 때 남은 오류·임시 로그·미검증을 확인해 한 번 더 일하게 한다. 할 말이 없으면 "". */
+    private fun finishGate(checkpoint: Checkpoint, gate: Gate, verify: Boolean): String {
+        if (gate.errors > 0 && gate.nudgeErrors < 2) {
+            gate.nudgeErrors++
+            return "[완료 관문] 아직 오류 ${gate.errors}개가 남아 있습니다. 고친 뒤 끝내세요. 고칠 수 없거나 의도된 것이면 이유를 설명하고 끝내세요.\n\n${gate.errorText.take(3000)}"
+        }
+        if (gate.nudgeMarkers < 1) {
+            val left = checkpoint.originals.keys.flatMap { p ->
+                try { Files.readAllLines(Path.of(p)).mapIndexedNotNull { i, l -> if ("YANG-DEBUG" in l) "${projectRoot(project)?.relativize(Path.of(p)) ?: p}:${i + 1}: ${l.trim()}" else null } }
+                catch (e: Exception) { emptyList() }
+            }
+            if (left.isNotEmpty()) {
+                gate.nudgeMarkers++
+                return "[완료 관문] 임시 디버그 로그(YANG-DEBUG)가 남아 있습니다. 모두 지운 뒤 끝내세요:\n" + left.take(15).joinToString("\n")
+            }
+        }
+        if (verify && gate.codeChanged && !gate.ran && gate.nudgeVerify < 1) {
+            gate.nudgeVerify++
+            return "[완료 관문] 코드를 바꿨지만 실행으로 확인하지 않았습니다. 테스트가 있으면 RUN, 게임·앱이면 PLAY 로 실제 동작을 확인하세요. " +
+                "실행할 수 없는 상황이면(필요한 도구·기기 없음 등) 그 이유를 한 줄로 말하고 끝내세요."
+        }
+        return ""
     }
 
     private fun say(text: String) {

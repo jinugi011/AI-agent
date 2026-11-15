@@ -16,15 +16,19 @@ sealed class ToolCall {
     data class Harness(val task: String) : ToolCall()
     data class Model(val action: String, val arg: String) : ToolCall()
     data class Connect(val location: String) : ToolCall()
+    object Check : ToolCall()
+    data class Play(val req: PlayRequest) : ToolCall()
+    data class Image(val path: String, val fields: Map<String, String>) : ToolCall()
 
     val kind: String
         get() = when (this) {
             is Read -> "read"; is ListFiles -> "list"; is Grep -> "grep"; is Search -> "search"
             is Write -> "write"; is Edit -> "edit"; is Run -> "run"; is Remember -> "remember"
             is Harness -> "harness"; is Model -> "model"; is Connect -> "connect"
+            is Check -> "check"; is Play -> "play"; is Image -> "image"
         }
 
-    val readOnly: Boolean get() = this is Read || this is ListFiles || this is Grep || this is Search
+    val readOnly: Boolean get() = this is Read || this is ListFiles || this is Grep || this is Search || this is Check
 }
 
 data class SearchReplace(val search: String, val replace: String)
@@ -58,13 +62,17 @@ REMEMBER>>>                        사용자 스타일/선호/제약을 영구 �
 요구사항
 HARNESS>>>                         요구사항→테스트 하네스→구현→테스트 반복을 새 브랜치에서 자동 수행 (큰 기능 구현 시)
 <<<MODEL list|status|download <key>|start [key]|stop>>>   로컬 모델 관리
-<<<CONNECT 경로 또는 git URL>>>      다른 레포 연결 + 벡터화"""
+<<<CONNECT 경로 또는 git URL>>>      다른 레포 연결 + 벡터화
+""" + DebugKit.PLAY_DOC + "\n" + DebugKit.IMAGE_DOC
 
-    private val SIMPLE_RE = Regex("""^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT)[ \t]+([^\n]*?)>>>[ \t]*$""", RegexOption.MULTILINE)
+    private val SIMPLE_RE = Regex("""^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT|CHECK|PLAY)(?:[ \t]+([^\n]*?))?>>>[ \t]*$""", RegexOption.MULTILINE)
     private val FILE_RE = Regex("""^<<<FILE[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^FILE>>>""", RegexOption.MULTILINE)
     private val EDIT_RE = Regex("""^<<<EDIT[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^EDIT>>>""", RegexOption.MULTILINE)
     private val REMEMBER_RE = Regex("""^<<<REMEMBER[ \t]*([^\n]*)\n([\s\S]*?)\n?^REMEMBER>>>""", RegexOption.MULTILINE)
     private val HARNESS_RE = Regex("""^<<<HARNESS[ \t]*\n([\s\S]*?)\n?^HARNESS>>>""", RegexOption.MULTILINE)
+    private val IMAGE_RE = Regex("""^<<<IMAGE[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^IMAGE>>>""", RegexOption.MULTILINE)
+
+
     private val SR_RE = Regex("""<<<<<<< SEARCH\n([\s\S]*?)\n?=======\n([\s\S]*?)\n?>>>>>>> REPLACE""")
     private val RANGE_RE = Regex("""^(.*?):(\d+)-(\d+)$""")
 
@@ -73,14 +81,17 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
     /** 응답 텍스트에서 도구 호출을 등장 순서대로 추출한다. 본문 블록 안의 태그는 무시. */
     fun parseToolCalls(text: String): List<ToolCall> {
         val found = mutableListOf<Pair<Int, ToolCall>>()
-        val bodies = listOf(FILE_RE, EDIT_RE, REMEMBER_RE, HARNESS_RE)
+        val bodies = listOf(FILE_RE, EDIT_RE, REMEMBER_RE, HARNESS_RE, IMAGE_RE)
             .flatMap { re -> re.findAll(text).map { it.range.first to it.range.last } }
         fun insideOther(i: Int) = bodies.any { (s, e) -> i > s && i <= e }
 
         for (m in SIMPLE_RE.findAll(text)) {
-            val (tag, raw) = m.destructured
-            val arg = raw.trim()
+            val tag = m.groupValues[1]
+            val arg = m.groupValues[2].trim()
+            if (arg.isEmpty() && tag !in setOf("CHECK", "PLAY", "MODEL", "LIST")) continue
             val call: ToolCall = when (tag) {
+                "CHECK" -> ToolCall.Check
+                "PLAY" -> ToolCall.Play(DebugKit.parsePlay(arg))
                 "READ" -> RANGE_RE.find(arg)?.let {
                     ToolCall.Read(cleanPath(it.groupValues[1]), it.groupValues[2].toInt(), it.groupValues[3].toInt())
                 } ?: ToolCall.Read(cleanPath(arg))
@@ -110,6 +121,16 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
             found += m.range.first to ToolCall.Remember(kind, scope, scopeValue, m.groupValues[2].trim())
         }
         for (m in HARNESS_RE.findAll(text)) found += m.range.first to ToolCall.Harness(m.groupValues[1].trim())
+        for (m in IMAGE_RE.findAll(text)) {
+            val fields = LinkedHashMap<String, String>()
+            var last = ""
+            for (line in m.groupValues[2].split('\n')) {
+                val kv = Regex("""^\s*([a-zA-Z_]+)\s*:\s*(.*)$""").find(line)
+                if (kv != null) { last = kv.groupValues[1].lowercase(); fields[last] = kv.groupValues[2].trim() }
+                else if (last.isNotEmpty() && line.isNotBlank()) fields[last] = fields[last] + " " + line.trim()
+            }
+            found += m.range.first to ToolCall.Image(cleanPath(m.groupValues[1]), fields)
+        }
 
         return found.filter { !insideOther(it.first) }.sortedBy { it.first }.map { it.second }
     }
@@ -117,7 +138,7 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
     /** 채팅 표시용: 도구 블록 제거 + 스트리밍 중 미완성 블록 숨김. */
     fun stripToolBlocks(text: String): String {
         var out = text
-        for (re in listOf(FILE_RE, EDIT_RE, REMEMBER_RE, HARNESS_RE, SIMPLE_RE)) out = re.replace(out, "")
+        for (re in listOf(FILE_RE, EDIT_RE, REMEMBER_RE, HARNESS_RE, IMAGE_RE, SIMPLE_RE)) out = re.replace(out, "")
         Regex("^<<<[A-Z]*", RegexOption.MULTILINE).find(out)?.let { out = out.substring(0, it.range.first) }
         out = out.replace(Regex("<{1,3}$"), "")
         return out.replace(Regex("\n{3,}"), "\n\n").trim()
@@ -193,6 +214,9 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
             is ToolCall.Harness -> "HARNESS ${one(c.task)}"
             is ToolCall.Model -> "MODEL ${c.action}${if (c.arg.isNotEmpty()) " " + c.arg else ""}"
             is ToolCall.Connect -> "CONNECT ${c.location}"
+            is ToolCall.Image -> "IMAGE ${c.path}${c.fields["size"]?.let { " $it" } ?: ""}${(c.fields["prompt"] ?: c.fields["ops"])?.let { " — " + one(it, 60) } ?: ""}"
+            is ToolCall.Check -> "CHECK"
+            is ToolCall.Play -> "PLAY ${c.req.kind}${if (c.req.target.isNotEmpty()) " " + c.req.target else ""}${if (c.req.seconds > 0) " ${c.req.seconds}초" else ""}"
         }
     }
 }

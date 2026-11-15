@@ -70,7 +70,7 @@
         statusDot.className = 'dot off';
         statusText.textContent = `원격 연결 실패 · ${host || '주소 없음'}`;
         setup.hidden = false;
-        setup.innerHTML = `<p>원격 서버에 연결할 수 없습니다.<br><small>${esc(s.error || '')}</small></p><button data-act="configureRemote">원격 접속 설정</button>`;
+        setup.innerHTML = `<p>원격 서버에 연결할 수 없습니다.<br><small>${esc(s.error || '')}</small></p><button data-act="configureRemote">🔑 토큰 다시 입력</button>`;
         return;
       }
       setup.hidden = true;
@@ -87,7 +87,9 @@
       statusDot.className = 'dot off';
       statusText.textContent = '백엔드 꺼짐';
       setup.hidden = false;
-      setup.innerHTML = `<p>로컬 에이전트 백엔드가 실행되고 있지 않습니다.</p><button data-act="backend">백엔드 시작</button>`;
+      setup.innerHTML = s.defaultServer
+        ? `<p>Yang Coding 서버에 접속하려면 <b>접속 토큰</b>만 입력하세요.<br><small>서버: ${esc(s.defaultServer.replace(/^https?:\/\//, ''))}</small></p><button data-act="configureRemote">🔑 토큰 입력하고 접속</button> <button data-act="backend">이 PC에서 백엔드 시작</button>`
+        : `<p>로컬 에이전트 백엔드가 실행되고 있지 않습니다.</p><button data-act="backend">백엔드 시작</button>`;
       return;
     }
     const repo = s.repo ? ` · ${s.repo}` : s.workspace ? ` · ${s.workspace}` : '';
@@ -146,7 +148,10 @@
         <a href="#" data-open="${esc(ev.diff.path)}">열기</a>`;
     }
     const detail = ev.detail && !ev.diff ? `<details${ev.status === 'error' ? ' open' : ''}><summary></summary><pre>${esc(ev.detail)}</pre></details>` : '';
-    card.innerHTML = `<div class="tool-head"><span class="icon">${ICON[ev.status] || '•'}</span><span class="title">${esc(ev.title)}</span>${extra}</div>${detail}`;
+    // 생성한 이미지 미리보기 (data: URL 만 허용)
+    const imgs = (ev.images || []).filter((u) => /^data:image\/(png|webp|jpeg);base64,/.test(u))
+      .map((u) => `<img class="tool-img" src="${u}" alt="">`).join('');
+    card.innerHTML = `<div class="tool-head"><span class="icon">${ICON[ev.status] || '•'}</span><span class="title">${esc(ev.title)}</span>${extra}</div>${imgs ? `<div class="tool-imgs">${imgs}</div>` : ''}${detail}`;
   }
 
   log.addEventListener('click', (e) => {
@@ -166,7 +171,13 @@
   window.addEventListener('message', ({ data: m }) => {
     switch (m.type) {
       case 'status': return renderStatus(m);
-      case 'user': add(div('msg user', markdown(m.text))); log.scrollTop = log.scrollHeight; return;
+      case 'user': {
+        const files = (m.attachments || []).map((n) => `<span class="att-tag">📎 ${esc(n)}</span>`).join('');
+        add(div('msg user', markdown(m.text) + (files ? `<div class="att-tags">${files}</div>` : '')));
+        log.scrollTop = log.scrollHeight;
+        return;
+      }
+      case 'attachment': return renderAttachment(m);
       case 'assistant-start': {
         const el = add(div('msg assistant streaming', '<span class="typing">생각 중…</span>'));
         assistants.set(m.id, el);
@@ -214,11 +225,99 @@
     }
   });
 
+  // ---- 첨부 파일 (이미지 · PDF · MD) ------------------------------------------------
+  // 📎 버튼 → IDE 의 파일 선택 창 / 붙여넣기(이미지) / 끌어다 놓기 → IDE 가 서버로 올려 분석 → 칩으로 표시
+  /** @type {Map<string, {key:string,name:string,status:string,id?:string,kind?:string,detail?:string}>} */
+  const atts = new Map();
+  const attBar = document.createElement('div');
+  attBar.id = 'attachments';
+  attBar.hidden = true;
+  $('composer').insertBefore(attBar, input);
+  const attachBtn = document.createElement('button');
+  attachBtn.type = 'button';
+  attachBtn.id = 'attach';
+  attachBtn.className = 'secondary';
+  attachBtn.title = '파일 첨부 (이미지 · PDF · MD) — 붙여넣기·끌어다 놓기도 가능';
+  attachBtn.textContent = '📎';
+  $('composer').querySelector('.row')?.insertBefore(attachBtn, $('hint'));
+  attachBtn.addEventListener('click', () => vscode.postMessage({ type: 'pickFiles' }));
+
+  const KIND = { image: '이미지', pdf: 'PDF', text: '문서' };
+  function renderAttachments() {
+    attBar.hidden = atts.size === 0;
+    attBar.innerHTML = [...atts.values()].map((a) => {
+      const state = a.status === 'uploading' ? '<span class="spin"></span> 분석 중…'
+        : a.status === 'error' ? '⚠ 실패' : `${KIND[a.kind] || a.kind || ''} ✓`;
+      return `<span class="att ${a.status}" title="${esc(a.detail || '')}">📎 ${esc(a.name)} <small>${state}</small>` +
+        `<button type="button" class="link" data-att-remove="${esc(a.key)}" title="첨부 취소">✕</button></span>`;
+    }).join('');
+    const pending = [...atts.values()].some((a) => a.status === 'uploading');
+    if (!busy) $('hint').textContent = pending ? '첨부 분석 중… 끝나면 보낼 수 있습니다' : '';
+  }
+  function renderAttachment(m) {
+    atts.set(m.key, { ...(atts.get(m.key) || {}), ...m });
+    renderAttachments();
+  }
+  attBar.addEventListener('click', (e) => {
+    const t = /** @type {HTMLElement} */ (e.target);
+    const key = t.getAttribute('data-att-remove');
+    if (key) { atts.delete(key); renderAttachments(); }
+  });
+
+  let seq = 0;
+  /** 브라우저 쪽에서 받은 파일(붙여넣기·끌어다 놓기) → base64 로 IDE 에 넘김 */
+  function attachFile(file) {
+    if (file.size > 25 * 1024 * 1024) {
+      add(div('notice warn', `<p>${esc(file.name)}: 25MB 를 넘는 파일은 첨부할 수 없습니다.</p>`));
+      return;
+    }
+    const key = `w${Date.now()}-${seq++}`;
+    const name = file.name && file.name !== 'image.png' ? file.name : `붙여넣은-이미지-${new Date().toTimeString().slice(0, 8).replace(/:/g, '')}.png`;
+    renderAttachment({ key, name, status: 'uploading' });
+    const reader = new FileReader();
+    reader.onload = () => {
+      const data = String(reader.result).replace(/^data:[^,]*,/, '');
+      vscode.postMessage({ type: 'attachData', key, name, data });
+    };
+    reader.onerror = () => renderAttachment({ key, name, status: 'error', detail: '파일을 읽을 수 없습니다' });
+    reader.readAsDataURL(file);
+  }
+  input.addEventListener('paste', (e) => {
+    const files = [...(e.clipboardData?.files || [])];
+    if (files.length) { e.preventDefault(); files.forEach(attachFile); }
+  });
+  document.addEventListener('dragover', (e) => { e.preventDefault(); document.body.classList.add('dragging'); });
+  document.addEventListener('dragleave', (e) => { if (!e.relatedTarget) document.body.classList.remove('dragging'); });
+  document.addEventListener('drop', (e) => {
+    e.preventDefault();
+    document.body.classList.remove('dragging');
+    const files = [...(e.dataTransfer?.files || [])];
+    if (files.length) files.forEach(attachFile);
+    else {
+      // VS Code 탐색기에서 끌어온 경우: 파일 경로(uri 목록)만 넘어온다 → IDE 가 직접 읽음
+      const uris = (e.dataTransfer?.getData('text/uri-list') || e.dataTransfer?.getData('text/plain') || '')
+        .split(/\r?\n/).map((x) => x.trim()).filter((x) => /^(file|vscode-[\w-]+):/.test(x) || x.startsWith('/'));
+      if (uris.length) vscode.postMessage({ type: 'attachUris', uris });
+    }
+  });
+
   // ---- 입력 ---------------------------------------------------------------------
   function send() {
     const text = input.value.trim();
-    if (!text || busy) return;
-    vscode.postMessage({ type: 'send', text });
+    if (busy) return;
+    const ready = [...atts.values()].filter((a) => a.status === 'ready' && a.id);
+    if (!text && !ready.length) return;
+    if ([...atts.values()].some((a) => a.status === 'uploading')) {
+      $('hint').textContent = '첨부 분석이 끝나면 보낼 수 있습니다';
+      return;
+    }
+    vscode.postMessage({
+      type: 'send',
+      text: text || '첨부한 파일을 분석해서 무엇을 만들 수 있는지 정리해 주세요.',
+      attachments: ready.map((a) => a.id),
+    });
+    atts.clear();
+    renderAttachments();
     input.value = '';
     autosize();
   }
@@ -244,6 +343,7 @@
       <p>현재 워크스페이스에서 자연어로 코딩합니다. 처음 요청 시 레포가 자동으로 연결·벡터화됩니다.</p>
       <p class="li">• "회원가입 API 만들고 테스트 돌려줘"</p>
       <p class="li">• "앞으로 커밋 메시지는 한국어로 해줘" (선호 저장)</p>
+      <p class="li">• 📎 화면 캡처·디자인 시안·PDF·MD 를 첨부하고 "이대로 만들어줘" (붙여넣기·끌어다 놓기 가능)</p>
       <p class="li">• <code>/help</code> 명령 보기</p>`));
   }
   welcome();

@@ -1,10 +1,11 @@
 /** 사이드바 채팅 웹뷰 ↔ 에이전트 세션 연결. */
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AgentEvent, AgentLog, AgentSession, EditorContext } from './agent';
-import { backend, engine, isRemote, lastBackendError } from './clients';
+import { AgentEvent, AgentLog, AgentSession, Attachment, EditorContext } from './agent';
+import { backend, engine, isRemote, lastBackendError, serverUrl, getDefaultServer } from './clients';
 import { ensureRemoteIndex } from './remoteIndex';
 import { describeCall, parseToolCalls, ToolCall } from './protocol';
+import { debugPrompt, parsePlay } from './debugkit';
 import { Checkpoint, executeTool, OriginalContentProvider } from './tools';
 
 const HELP = `**사용법** — 자연어로 요청하면 됩니다. 예:
@@ -17,7 +18,19 @@ const HELP = `**사용법** — 자연어로 요청하면 됩니다. 예:
 - \`/new\` 새 대화 · \`/stop\` 중단 · \`/undo\` 마지막 턴의 파일 변경 되돌리기
 - \`/model [status|download <key>|start [key]|stop]\`
 - \`/remember <style|preference|constraint> <global|language:x|profile:x|project> 내용\`
-- \`/task 요구사항\` → 하네스(테스트 우선) 자동 구현 · \`/connect 경로|URL\` · \`/reindex\``;
+- \`/task 요구사항\` → 하네스(테스트 우선) 자동 구현 · \`/connect 경로|URL\` · \`/reindex\`
+
+**디버깅**
+- \`/debug 증상\` → 재현(실행) → 원인 위치 → 가설 → 임시 로그 → 수정 → 재검증 → 정리 순서로 버그 잡기
+  예) \`/debug 점프하면 캐릭터가 사라짐\` · \`/debug\` (증상 없이: 실행해서 문제 찾기)
+- \`/play [web|python|flutter|godot|unity|cmd] [대상] [초]\` → 게임·앱을 실행해 오류·콘솔·리소스 실패·프레임·화면 분석
+- \`/check\` → 프로젝트 전체 정적 검사 (문법·타입·IDE 오류·리소스 경로)
+- 파일을 고칠 때마다 자동 검사가 돌고, 오류가 남아 있으면 끝내지 않고 고칩니다 (설정에서 끌 수 있음)
+
+**그림 (다운로드하지 않고 생성)**
+- \`/image 설명\` → 맥의 이미지 모델(FLUX)로 생성해 프로젝트에 저장 · 예) \`/image 64x64 투명 배경 픽셀아트 슬라임\`
+- 대화로도 가능: "주인공 스프라이트 만들어서 assets 에 넣어줘", "이 첨부 그림 스타일로 배경 그려줘", "무료 이미지 참고해서 아이콘 만들어줘"
+- 가공: 배경 제거 · 픽셀아트 · 크기 · 자르기 · 뒤집기 · 색조 · 스프라이트 시트 나누기/합치기 · \`/undo\` 로 되돌리기`;
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly id = 'localAgent.chat';
@@ -26,6 +39,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private approvals = new Map<string, (a: 'allow' | 'always' | 'deny') => void>();
   private statusTimer?: NodeJS.Timeout;
   private pending: AgentEvent[] = [];
+  /** 이번 세션에서 올린 첨부 (id → 분석 결과) */
+  private attached = new Map<string, Attachment>();
 
   constructor(
     private readonly ctx: vscode.ExtensionContext,
@@ -72,7 +87,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         repo: this.session.repoName,
         workspace: vscode.workspace.workspaceFolders?.[0]?.name ?? '',
         remote: isRemote(),
-        server: isRemote() ? vscode.workspace.getConfiguration('localAgent').get<string>('serverUrl', '') : '',
+        server: isRemote() ? serverUrl() : '',
+        defaultServer: getDefaultServer(),
         error: backendUp ? '' : lastBackendError,
       });
     };
@@ -96,7 +112,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async onMessage(m: any) {
     switch (m.type) {
       case 'send':
-        return this.handleInput(String(m.text ?? ''));
+        return this.handleInput(String(m.text ?? ''), undefined, Array.isArray(m.attachments) ? m.attachments.map(String) : []);
+      case 'pickFiles':
+        return this.pickFiles();
+      case 'attachData':
+        return this.uploadAttachment(String(m.key), String(m.name), String(m.data ?? ''));
+      case 'attachUris':
+        return this.attachUris(Array.isArray(m.uris) ? m.uris.map(String) : []);
       case 'stop':
         return this.session.stop();
       case 'new':
@@ -162,10 +184,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'notice', level: result.includes('오류') ? 'error' : 'info', text: result.split('\n')[0] });
   }
 
-  async handleInput(text: string, extraEditor?: Partial<EditorContext>) {
+  async handleInput(text: string, extraEditor?: Partial<EditorContext>, attachmentIds: string[] = []) {
     text = text.trim();
     if (!text) return;
-    this.post({ type: 'user', text });
+    const atts = attachmentIds.map((id) => this.attached.get(id)).filter((a): a is Attachment => !!a);
+    this.post({ type: 'user', text, attachments: atts.map((a) => a.name) });
 
     if (text.startsWith('/')) {
       const [cmd, ...rest] = text.split(/\s+/);
@@ -186,6 +209,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         case '/connect': return this.runDirect({ kind: 'connect', location: arg });
         case '/task': return this.session.send(`다음 요구사항을 HARNESS 도구로 구현해줘:\n${arg}`, this.editorContext(extraEditor));
+        case '/debug': return this.session.send(debugPrompt(arg), this.editorContext(extraEditor), atts, { debug: true });
+        case '/check': return this.runDirect({ kind: 'check' });
+        case '/play': return this.runDirect({ kind: 'play', req: parsePlay(arg) });
+        case '/image': return this.session.send(`다음 그림을 IMAGE 도구로 만들어 프로젝트에 추가하고, 필요하면 코드에서 불러오도록 연결해줘 (prompt 는 영어로):\n${arg}`, this.editorContext(extraEditor), atts);
         case '/reindex':
           if (isRemote()) {
             const root = vscode.workspace.workspaceFolders?.[0]?.uri;
@@ -200,7 +227,60 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           return this.post({ type: 'notice', level: 'warn', text: `알 수 없는 명령: ${cmd} (/help)` });
       }
     }
-    await this.session.send(text, this.editorContext(extraEditor));
+    await this.session.send(text, this.editorContext(extraEditor), atts);
+  }
+
+  // ---- 첨부 파일 (이미지 · PDF · MD) → 서버에서 분석 ---------------------------------
+  private async pickFiles() {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectMany: true,
+      openLabel: '첨부',
+      title: 'Yang Coding: 파일 첨부 (이미지 · PDF · MD)',
+      filters: { '이미지 · PDF · 문서': ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'pdf', 'md', 'markdown', 'txt'], '모든 파일': ['*'] },
+    });
+    for (const uri of picked ?? []) await this.attachUri(uri);
+  }
+
+  private async attachUris(list: string[]) {
+    for (const raw of list) {
+      const uri = raw.startsWith('/') ? vscode.Uri.file(raw) : vscode.Uri.parse(raw);
+      await this.attachUri(uri);
+    }
+  }
+
+  private async attachUri(uri: vscode.Uri) {
+    const name = path.basename(uri.path);
+    const key = `h${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.size > 25 * 1024 * 1024) throw new Error('25MB 를 넘는 파일은 첨부할 수 없습니다');
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      await this.uploadAttachment(key, name, Buffer.from(bytes).toString('base64'));
+    } catch (e: any) {
+      this.post({ type: 'attachment', key, name, status: 'error', detail: e.message });
+    }
+  }
+
+  /** 첨부를 서버에 올려 분석 (이미지는 비전 모델 · PDF 는 텍스트 추출 + 스캔 페이지 분석) */
+  private async uploadAttachment(key: string, name: string, data: string) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+    this.post({ type: 'attachment', key, name, status: 'uploading' });
+    this.log.line(`[첨부] ${name} 업로드 · 분석 시작 (${Math.round((data.length * 3) / 4 / 1024).toLocaleString()}KB)`, 'info');
+    const started = Date.now();
+    try {
+      const r: any = await backend.post('/api/attachments', { name, data, project: root ? path.basename(root.fsPath) : '' }, 900_000);
+      const a: Attachment = r.attachment;
+      this.attached.set(a.id, a);
+      const secs = ((Date.now() - started) / 1000).toFixed(1);
+      const pages = a.kind === 'pdf' ? ` · ${a.pages}쪽${a.vision_pages ? ` (이미지 분석 ${a.vision_pages}쪽)` : ''}` : '';
+      const detail = `${a.chars.toLocaleString()}자${pages} · ${secs}초${a.notes?.length ? '\n' + a.notes.join('\n') : ''}`;
+      this.post({ type: 'attachment', key, name: a.name, status: 'ready', id: a.id, kind: a.kind, detail });
+      this.log.line(`[첨부] ${a.name} 분석 완료 · ${detail.replace(/\n/g, ' · ')}`, 'result');
+    } catch (e: any) {
+      this.post({ type: 'attachment', key, name, status: 'error', detail: e.message });
+      this.post({ type: 'notice', level: 'warn', text: `첨부 실패 (${name}): ${e.message}` });
+      this.log.line(`[첨부] ${name} 실패: ${e.message}`, 'error');
+    }
   }
 
   editorContext(extra?: Partial<EditorContext>): EditorContext {
@@ -226,7 +306,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; img-src data:; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="${css}">
 </head>

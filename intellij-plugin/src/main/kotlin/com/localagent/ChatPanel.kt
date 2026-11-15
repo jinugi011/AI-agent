@@ -18,6 +18,7 @@ import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
 import java.awt.Color
+import java.nio.file.Files
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -39,6 +40,18 @@ private val HELP = """**사용법** — 자연어로 요청하면 됩니다. 예
 - `/model [status|download <key>|start [key]|stop]`
 - `/remember <style|preference|constraint> <global|language:x|profile:x|project> 내용`
 - `/task 요구사항` → 하네스(테스트 우선) 자동 구현 · `/connect 경로|URL` · `/reindex`
+
+**디버깅**
+- `/debug 증상` → 재현(실행) → 원인 위치 → 가설 → 임시 로그 → 수정 → 재검증 → 정리 순서로 버그 잡기
+  예) `/debug 점프하면 캐릭터가 사라짐` · `/debug` (증상 없이: 실행해서 문제 찾기)
+- `/play [web|python|flutter|godot|unity|cmd] [대상] [초]` → 게임·앱을 실행해 오류·콘솔·리소스 실패·프레임·화면 분석
+- `/check` → 프로젝트 전체 정적 검사 (문법·타입·IDE 오류·리소스 경로)
+- 파일을 고칠 때마다 자동 검사가 돌고, 오류가 남아 있으면 끝내지 않고 고칩니다 (설정에서 끌 수 있음)
+
+**그림 (다운로드하지 않고 생성)**
+- `/image 설명` → 맥의 이미지 모델(FLUX)로 생성해 프로젝트에 저장 · 예) `/image 64x64 투명 배경 픽셀아트 슬라임`
+- 대화로도 가능: "주인공 스프라이트 만들어서 assets 에 넣어줘", "이 첨부 그림 스타일로 배경 그려줘", "무료 이미지 참고해서 아이콘 만들어줘"
+- 가공: 배경 제거 · 픽셀아트 · 크기 · 자르기 · 뒤집기 · 색조 · 스프라이트 시트 나누기/합치기 · `/undo` 로 되돌리기
 
 **원격 모드**에서는 하네스·레포 연결·모델 다운로드/시작이 서버 보안상 막혀 있습니다 (읽기·수정·명령 실행·선호 저장은 가능)."""
 
@@ -115,7 +128,8 @@ class ChatPanel(private val project: Project) : Disposable {
             "repo" to session.repoName,
             "workspace" to project.name,
             "remote" to Clients.remote,
-            "server" to if (Clients.remote) AgentSettings.current.serverUrl else "",
+            "server" to if (Clients.remote) DefaultServer.effective() else "",
+            "defaultServer" to DefaultServer.url,
             "error" to if (backendUp) "" else Clients.lastBackendError,
         )
         post(status)
@@ -214,9 +228,20 @@ class ChatPanel(private val project: Project) : Disposable {
             "ready" -> {
                 val queued = synchronized(pending) { ready = true; pending.toList().also { pending.clear() } }
                 queued.forEach { exec("window.dispatchEvent(new MessageEvent('message', {data: $it}));") }
-                pooled { BackendLauncher.ensureRunning(project.basePath)?.let { post(mapOf("type" to "notice", "level" to "warn", "text" to it)) } }
+                if (AgentSettings.current.autoStartBackend)
+                    pooled { BackendLauncher.ensureRunning(project.basePath)?.let { post(mapOf("type" to "notice", "level" to "warn", "text" to it)) } }
             }
-            "send" -> handleInput(s("text"))
+            "send" -> handleInput(s("text"), m.getAsJsonArray("attachments")?.map { it.asString } ?: emptyList())
+            "pickFiles" -> ApplicationManager.getApplication().invokeLater { pickFiles() }
+            "attachData" -> pooled { uploadAttachment(s("key"), s("name"), s("data")) }
+            "attachUris" -> m.getAsJsonArray("uris")?.map { it.asString }?.let { uris ->
+                pooled {
+                    uris.forEach { u ->
+                        runCatching { if (u.startsWith("/")) java.nio.file.Path.of(u) else java.nio.file.Path.of(java.net.URI.create(u)) }
+                            .getOrNull()?.let { attachPath(it) }
+                    }
+                }
+            }
             "stop" -> session.stop()
             "new" -> newChat()
             "approval" -> approvals[s("reqId")]?.complete(s("answer"))
@@ -229,9 +254,7 @@ class ChatPanel(private val project: Project) : Disposable {
             }
             "setup" -> pooled { notice(direct(ToolCall.Model(s("action"), s("model")))) }
             "startBackend" -> pooled { notice(BackendLauncher.ensureRunning(project.basePath) ?: "백엔드가 실행되었습니다.") }
-            "configureRemote" -> ApplicationManager.getApplication().invokeLater {
-                com.intellij.openapi.options.ShowSettingsUtil.getInstance().showSettingsDialog(project, AgentConfigurable::class.java)
-            }
+            "configureRemote" -> ApplicationManager.getApplication().invokeLater { askTokenAndConnect() }
         }
     }
 
@@ -241,6 +264,26 @@ class ChatPanel(private val project: Project) : Disposable {
         val result = session.runDirect(call)
         log.line(result.lines().joinToString("\n") { "    $it" }, if ("오류" in result) "error" else "result")
         return result
+    }
+
+    /** 원격 접속: 서버 주소는 설치 파일에 고정 → 토큰만 입력하면 바로 접속 (주소가 없으면 설정 화면) */
+    private fun askTokenAndConnect() {
+        val url = DefaultServer.effective()
+        if (url.isBlank()) {
+            com.intellij.openapi.options.ShowSettingsUtil.getInstance().showSettingsDialog(project, AgentConfigurable::class.java)
+            return
+        }
+        val token = com.intellij.openapi.ui.Messages.showPasswordDialog(project,
+            "서버: ${url.removePrefix("http://").removePrefix("https://")}\n관리 페이지(서버 주소를 브라우저로 열기) → 접속 토큰에서 발급한 값을 붙여 넣으세요.",
+            "Yang Coding 접속 토큰", null)?.trim()
+        if (token.isNullOrBlank()) return
+        AgentSecrets.set(AgentSecrets.TOKEN, token)
+        AgentSettings.current.mode = "remote"
+        pooled {
+            val ok = Clients.backendAlive()
+            notice(if (ok) "원격 서버 연결 성공: $url" else "연결 오류: ${Clients.lastBackendError}")
+            pushStatus()
+        }
     }
 
     private fun pooled(block: () -> Unit) = ApplicationManager.getApplication().executeOnPooledThread(block)
@@ -285,10 +328,57 @@ class ChatPanel(private val project: Project) : Disposable {
         return ctx
     }
 
-    fun handleInput(input: String) {
+    // ---- 첨부 파일 (이미지 · PDF · MD) → 서버에서 분석 --------------------------------------
+    /** 이번 세션에서 올린 첨부 (id → 분석 결과) */
+    private val attached = ConcurrentHashMap<String, Attachment>()
+
+    private fun pickFiles() {
+        val descriptor = com.intellij.openapi.fileChooser.FileChooserDescriptor(true, false, false, false, false, true)
+            .withTitle("Yang Coding: 파일 첨부 (이미지 · PDF · MD)")
+            .withDescription("화면 캡처·디자인 시안·PDF·MD 파일을 고르세요 (여러 개 가능, 파일당 25MB 까지)")
+        com.intellij.openapi.fileChooser.FileChooser.chooseFiles(descriptor, project, null) { files ->
+            pooled { files.forEach { f -> attachPath(f.toNioPath()) } }
+        }
+    }
+
+    private fun attachPath(path: java.nio.file.Path) {
+        val key = "h${System.nanoTime()}"
+        val name = path.fileName.toString()
+        try {
+            if (Files.size(path) > 25L * 1024 * 1024) error("25MB 를 넘는 파일은 첨부할 수 없습니다")
+            uploadAttachment(key, name, java.util.Base64.getEncoder().encodeToString(Files.readAllBytes(path)))
+        } catch (e: Exception) {
+            post(mapOf("type" to "attachment", "key" to key, "name" to name, "status" to "error", "detail" to (e.message ?: "읽기 실패")))
+        }
+    }
+
+    /** 첨부를 서버에 올려 분석 (이미지는 비전 모델 · PDF 는 텍스트 추출 + 스캔 페이지 분석) */
+    private fun uploadAttachment(key: String, name: String, data: String) {
+        post(mapOf("type" to "attachment", "key" to key, "name" to name, "status" to "uploading"))
+        log.line("[첨부] $name 업로드 · 분석 시작 (${"%,d".format(data.length * 3 / 4 / 1024)}KB)")
+        val started = System.currentTimeMillis()
+        try {
+            val project = projectRoot(project)?.let { RemoteIndex.projectName(it) } ?: ""
+            val res = Clients.post("/api/attachments", mapOf("name" to name, "data" to data, "project" to project), 900)
+            val a = Attachment.from(res.getAsJsonObject("attachment"))
+            attached[a.id] = a
+            val secs = "%.1f".format((System.currentTimeMillis() - started) / 1000.0)
+            val pages = if (a.kind == "pdf") " · ${a.pages}쪽" + (if (a.visionPages > 0) " (이미지 분석 ${a.visionPages}쪽)" else "") else ""
+            val detail = "${"%,d".format(a.chars)}자$pages · ${secs}초" + (if (a.notes.isNotEmpty()) "\n" + a.notes.joinToString("\n") else "")
+            post(mapOf("type" to "attachment", "key" to key, "name" to a.name, "status" to "ready", "id" to a.id, "kind" to a.kind, "detail" to detail))
+            log.line("[첨부] ${a.name} 분석 완료 · ${detail.replace("\n", " · ")}", "result")
+        } catch (e: Exception) {
+            post(mapOf("type" to "attachment", "key" to key, "name" to name, "status" to "error", "detail" to (e.message ?: "실패")))
+            post(mapOf("type" to "notice", "level" to "warn", "text" to "첨부 실패 ($name): ${e.message}"))
+            log.line("[첨부] $name 실패: ${e.message}", "error")
+        }
+    }
+
+    fun handleInput(input: String, attachmentIds: List<String> = emptyList()) {
         val text = input.trim()
         if (text.isEmpty()) return
-        post(mapOf("type" to "user", "text" to text))
+        val atts = attachmentIds.mapNotNull { attached[it] }
+        post(mapOf("type" to "user", "text" to text, "attachments" to atts.map { it.name }))
         if (text.startsWith("/")) {
             val parts = text.split(Regex("\\s+"))
             val arg = parts.drop(1).joinToString(" ")
@@ -303,6 +393,10 @@ class ChatPanel(private val project: Project) : Disposable {
                     .firstOrNull()?.let { call -> pooled { notice(direct(call)) } }
                 "/connect" -> pooled { notice(direct(ToolCall.Connect(arg))) }
                 "/task" -> { val ctx = editorContext(); pooled { session.send("다음 요구사항을 HARNESS 도구로 구현해줘:\n$arg", ctx) } }
+                "/debug" -> { val ctx = editorContext(); pooled { session.send(DebugKit.debugPrompt(arg), ctx, atts, debug = true) } }
+                "/check" -> pooled { notice(direct(ToolCall.Check)) }
+                "/image" -> { val ctx = editorContext(); pooled { session.send("다음 그림을 IMAGE 도구로 만들어 프로젝트에 추가하고, 필요하면 코드에서 불러오도록 연결해줘 (prompt 는 영어로):\n$arg", ctx, atts) } }
+                "/play" -> pooled { notice(direct(ToolCall.Play(DebugKit.parsePlay(arg)))) }
                 "/reindex" -> pooled {
                     if (Clients.remote) {
                         projectRoot(project)?.let { RemoteIndex.ensure(it, log, force = true) }
@@ -317,6 +411,6 @@ class ChatPanel(private val project: Project) : Disposable {
             return
         }
         val ctx = editorContext()
-        pooled { session.send(text, ctx) }
+        pooled { session.send(text, ctx, atts) }
     }
 }

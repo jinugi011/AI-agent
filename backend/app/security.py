@@ -46,6 +46,14 @@ REMOTE_ALLOW = [
     ("POST", r"/api/llm/generate"),
     ("POST", r"/api/remote/index"),
     ("GET", r"/api/remote/projects"),
+    ("POST", r"/api/attachments"),
+    ("POST", r"/api/vision/inspect"),
+    ("GET", r"/api/images/status"),
+    ("POST", r"/api/images/generate"),
+    ("GET", r"/api/images/search"),
+    ("GET", r"/api/attachments"),
+    ("GET", r"/api/attachments/[0-9a-f]{12}"),
+    ("DELETE", r"/api/attachments/[0-9a-f]{12}"),
 ]
 _ALLOW_RE = [(m, re.compile(f"^{p}$")) for m, p in REMOTE_ALLOW]
 

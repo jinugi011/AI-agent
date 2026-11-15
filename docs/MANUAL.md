@@ -399,6 +399,96 @@ gradle buildPlugin
 
 ---
 
+## 4.7-1 파일 첨부 — 이미지 · PDF · MD 를 올려서 코딩
+채팅 입력창의 **📎** 버튼(또는 **붙여넣기** `⌘V`, **끌어다 놓기**)으로 파일을 올리면 서버(맥)가 분석하고, 분석 결과를 근거로 코딩합니다.
+VS Code·IntelliJ 모두, 로컬·원격(Tailscale) 모두 동작합니다.
+
+| 파일 | 처리 방법 | 시간(M3 Max) |
+|---|---|---|
+| MD · 텍스트 · 코드 | 그대로 읽음 | 즉시 |
+| PDF (글자 있음) | 페이지별 텍스트 추출 (pypdfium2) | 수 초 |
+| PDF (스캔본·그림 페이지) | 페이지를 이미지로 바꿔 비전 모델 분석 (최대 10쪽) | 쪽당 10~20초 |
+| 이미지 (PNG·JPG·WebP·GIF) | 비전 모델이 종류(UI·다이어그램·오류·문서)를 먼저 판별 → 종류에 맞게 분석 | 10~20초 (첫 요청은 모델 로드 +5초) |
+
+- **UI 캡처·디자인 시안**: 모든 글자, 영역별 구성요소·위치·간격, 모양 + **픽셀에서 직접 뽑은 실제 색상표(#hex, 면적%)** — 색은 모델 추정이 아닌 정확한 값
+- **다이어그램**: 모든 노드와 연결(출발 → 도착, 라벨) · **오류 화면**: 메시지 전문과 원인 위치
+- 사용 예: 📎 `login.png` + "이 화면 React 로 만들어줘" · 📎 `api-spec.pdf` + "이 명세대로 FastAPI 엔드포인트 구현" · 📎 `erd.png` + "이 ERD 로 JPA 엔티티 만들어줘"
+- 분석 결과는 대화에 들어가고(파일당 1.2만 자), 전체 내용은 프로젝트의 `.yang/attachments/` 에 저장되어 에이전트가 READ 로 읽습니다 (`.yang/` 은 git 에 안 올라감)
+- 첨부는 벡터 DB 에도 저장되어, 나중 질문에서도 관련 부분이 자동으로 참고됩니다 (같은 프로젝트 폴더 이름 기준)
+- 파일당 최대 25MB
+
+**비전 모델** (Qwen2.5-VL 7B Q4_K_M + mmproj, 약 5.5GB, `models/`)
+- 설치: `./install.sh --vision yes` (메모리 24GB 이상이면 기본으로 설치됨)
+- 엔진이 `models/` 에서 `*-VL-*.gguf` + `mmproj*.gguf` 를 자동으로 찾습니다 (`--vision-model`, `--vision-mmproj` 로 지정 가능)
+- **메모리 관리**: 첫 이미지 때 로드 → 분석 끝나고 20초 뒤(또는 코딩 요청이 오면 즉시) 내림. 함께 올려 두면 36GB 맥에서 스왑이 생겨 코딩 속도가 60 → 7 tok/s 로 떨어지기 때문 (확인: 해제 후 57 tok/s 회복)
+- 비전 모델이 없으면 MD·텍스트 PDF 는 그대로 되고, 이미지·스캔 페이지는 "이미지 분석 실패" 로 표시됩니다
+
+## 4.7-2 디버깅 — 자동 검사 · 실행 확인(PLAY) · /debug
+코딩 후 오류를 놓치지 않도록 네 가지가 함께 동작합니다 (VS Code·IntelliJ 동일).
+
+**A. 수정 직후 자동 검사** (설정 `자동 검사`, 기본 켬 · 승인 없음 — 고정된 분석 명령만 실행)
+- IDE 오류(VS Code 진단 / IntelliJ 하이라이트) + 언어별 검사: Python 문법 + 정의되지 않은 이름(pyflakes 없으면 내장 검사), JS `node --check`(HTML 인라인 스크립트 포함), TypeScript `tsc --noEmit`, Dart/Flutter `flutter analyze`, Godot `--check-only`, JSON
+- **리소스 경로 검사**: 코드에 적힌 이미지·사운드 경로가 실제로 있는지 (오타로 "화면에 안 보임" 방지)
+- 결과(오류 줄 + 코드 발췌)를 에이전트에게 바로 돌려줘 다음 단계에서 고치게 함
+
+**B. PLAY — 게임·앱을 실제로 실행해 오류 수집** (사용자 승인 필요 · `/play` 로 직접 실행 가능)
+
+| 종류 | 방법 | 수집 |
+|---|---|---|
+| web | Chrome 헤드리스 + DevTools (정적 서버 또는 `npm run dev`) | 예외+스택, console.error, 404 리소스, requestAnimationFrame 프레임 수, 화면 |
+| python | 창 없이 실행(SDL dummy), pygame 자동 훅 | 트레이스백, 프레임 수, 화면(크래시 직전 포함) |
+| flutter | `flutter run` (안드로이드 > macOS > Chrome) | EXCEPTION CAUGHT 블록(내 코드 줄만), E/flutter, 안드로이드 화면 |
+| godot | `--headless --quit-after` | SCRIPT ERROR / Parse Error |
+| unity | 에디터 열려 있으면 Editor.log, 아니면 batchmode 컴파일 | error CS, 예외 |
+| cmd | 임의 명령 N초 (localhost 주소가 나오면 그 페이지도 web 검사) | 출력·오류 |
+
+- 실행 중 **키 입력 시나리오**(가운데 클릭 → Enter·Space·방향키)를 넣어 입력 처리 코드까지 실행
+- 오류의 파일:줄을 찾아 **코드 발췌를 자동 첨부** (Python·JS/TS·Dart·C#·GDScript·Kotlin/Java·Rust·Go)
+- **화면 분석**: 마지막 화면을 비전 모델이 확인(빈 화면·안 보이는 오브젝트·잘림·오류 표시). 단색 화면은 픽셀로 바로 판정
+- 예) `<<<PLAY web index.html 10 expect=플레이어와 적이 보임>>>`
+
+**C. 완료 관문** — 에이전트가 끝내려 할 때: 남은 오류(최대 2번 독촉), 남은 임시 로그 `YANG-DEBUG`, 코드를 바꾸고 실행 확인을 안 한 경우(설정 `끝내기 전 실행 확인`)
+
+**D. `/debug 증상`** — 재현 → 위치 → 가설 → 임시 로그(YANG-DEBUG) → 최소 수정 → 재검증 → 로그 정리 → 보고. 단계 한도 2배.
+
+검증(2026-11-15, 이 맥): 웹 게임(404 이미지 + 3초 뒤 undefined 접근) → 두 오류와 `game.js:9` 발췌, 59fps · pygame `score` 미정의 → 자동 검사 1초에 발견, PLAY 로 NameError+화면 · Flutter 타입 오류/오타 → analyze 2.9초, 런타임 StateError → `main.dart:8`. Godot·Unity 는 이 맥에 없어 단위 테스트로만 확인.
+
+## 4.7-3 그림 생성 — 다운로드하지 않고 만들기 (IMAGE · /image)
+프로젝트 그림(캐릭터·배경·아이콘·UI)은 맥의 **FLUX.1-schnell 4bit**(Apache-2.0, 상업적 이용 가능)로 생성합니다.
+- 채팅: "주인공 픽셀아트 스프라이트 64x64 투명 배경으로 만들어서 assets 에 넣고 코드에 연결해줘" 또는 `/image 설명`
+- 에이전트 도구:
+```
+<<<IMAGE assets/slime.png
+prompt: cute green slime monster with big eyes, game sprite   (영어)
+size: 64x64
+transparent: yes          배경 제거
+pixel: 32                 픽셀아트 (colors: 16)
+ref: search:pixel art character   참고 스타일 (프로젝트 파일 | attachment:첨부이름 | search:무료 이미지 검색)
+strength: 0.4             참고 이미지를 밑그림으로 (0 = 스타일만)
+from: assets/old.png      기존 그림 고쳐 그리기 / 가공만
+join: a.png, b.png        스프라이트 시트 합치기 (cols: 2)
+ops: flip-x; rotate 90; tint #ff8800 0.3; crop x,y,w,h; resize WxH; remove-bg; trim; pixelate 32; grayscale; sheet-split 4x1
+IMAGE>>>
+```
+- **참고 이미지**: 비전 모델이 스타일(화풍·색·선·원근)만 글로 뽑아 새로 그립니다 (그림을 베끼지 않음). 웹 검색은 Openverse 의 **CC0·퍼블릭 도메인만** 쓰고 `ASSET_CREDITS.md` 에 출처를 기록합니다 (검색어가 Openverse 로 전송됨)
+- 저장된 그림은 채팅에 미리보기로 표시되고 `/undo` 로 되돌릴 수 있습니다
+- 설치: `./install.sh --imagegen yes` (Apple Silicon · 메모리 32GB 이상이면 기본 설치, 모델 ~9.6GB, 가상환경 `imagegen/.venv`)
+
+## 4.7-4 속도와 메모리 (36GB 맥에서 큰 모델 3개 운영)
+| 모델 | 크기 | 언제 메모리에 |
+|---|---|---|
+| 코딩 Qwen3-Coder 30B (Q4) | ~22GB (KV 포함) | 항상. 이미지 생성 동안만 내림 → 다음 코딩 요청 때 자동으로 다시 올림(약 15초) |
+| 비전 Qwen2.5-VL 7B | ~6GB | 이미지 분석할 때만. 끝나고 20초 뒤(또는 코딩 요청 즉시) 내림 |
+| 이미지 FLUX.1-schnell 4bit | ~10GB | 생성할 때만 별도 프로세스. 3분 미사용 또는 코딩 재개 시 종료 |
+
+**큰 모델은 한 번에 하나**: 같이 올리면 스왑이 생겨 크게 느려집니다 (측정: 512px 생성 106초 → 분리 후 12초, 코딩 32 → 55~77 tok/s).
+
+측정값 (M3 Max 36GB, 2026-11-15)
+- 코딩: 프리필 ~650 tok/s · 생성 45 tok/s(1만 토큰 문맥) ~ 60+ tok/s(짧은 문맥). Flash Attention 자동(끄면 40% 느림), KV f16 이 q8_0 보다 빠름 → 현재 설정 유지
+- 이미지 분석: 첫 이미지 ~15~30초(모델 로드 포함), 이어지는 이미지 ~7~15초. 같은 이미지에 대한 두 번째 질문은 이미지 인코딩 재사용(0초)
+- 그림 생성: 512px 약 12~17초, 1024×576 약 30초, 배경 제거+픽셀아트 약 2초 (첫 배경 제거는 모델 받기 포함)
+- 엔진 옵션: `--kv-type f16|q8_0|q4_0`, `--flash auto|on|off`, `--vision-ctx`, `--vision-idle`, `--imagegen-port`
+
 ## 4.8 외부에서 사용하기 — Tailscale (권장 · 도메인 불필요)
 
 맥북을 덮개를 닫은 채(클램쉘) 서버로 두고, 밖에 있는 내 PC 의 VS Code / IntelliJ 에서 Yang Coding 으로 코딩합니다.
@@ -443,13 +533,27 @@ scripts/server-mode.sh status
 
 ### 4.8.3 외부 PC 설정
 1. Tailscale 설치 후 **맥과 같은 계정으로 로그인** (https://tailscale.com/download) — 회사 PC 라면 보안 정책을 먼저 확인하세요.
-2. 플러그인 설치 — VS Code `local-coding-agent-0.2.2.vsix`, IntelliJ `local-coding-agent-intellij-0.2.1.zip` (모델·백엔드·Docker 는 필요 없음)
-3. 연결
-   - **VS Code**: `Cmd+Shift+P` → **Yang Coding: 원격 접속 설정** → 주소 `https://<맥이름>.<tailnet>.ts.net` → API 토큰 → (Access 항목은 비워 두고 Enter)
-   - **IntelliJ**: Settings → Tools → **Yang Coding** → 접속 방식 `remote`, 주소, 토큰 → **원격 연결 테스트**
+2. 플러그인 설치 — 관리 페이지(§4.8.3-3) **플러그인** 메뉴에서 VS Code `local-coding-agent-0.5.0.vsix` / IntelliJ `local-coding-agent-intellij-0.5.0.zip` 받기 (모델·백엔드·Docker 는 필요 없음)
+3. 연결 — **토큰만 입력하면 끝** (서버 주소는 설치 파일에 들어 있음)
+   - 채팅 창을 열면 나오는 **🔑 토큰 입력하고 접속** 버튼 → 관리 페이지 → 접속 토큰에서 발급한 값 붙여 넣기 → 자동으로 `remote` 전환·연결 확인
+   - VS Code 는 채팅 창 위 🔑 아이콘, 또는 `Cmd+Shift+P` → **Yang Coding: 접속 토큰 입력** 으로도 가능
+   - 주소를 바꿔야 하면: VS Code `Yang Coding: 원격 서버 주소 변경` / IntelliJ 설정의 **원격 서버 주소** (비워 두면 기본 주소)
 4. 채팅 상태줄이 `🌐 Qwen3-Coder… @ 맥이름…ts.net` 이면 완료. 처음 요청할 때 그 PC 의 프로젝트가 맥으로 올라가 벡터화됩니다 (`[원격 색인]`).
 
 원격 모드에서 되는 것/안 되는 것은 4.9.3 표와 같습니다 (자연어 코딩·외부 PC 에서 명령 실행·선호 저장 ✅ / 하네스·레포 연결·엔진 제어 ❌).
+
+### 4.8.3-0 설정 화면 (자세한 설정)
+접속은 토큰 하나로 간단하게, 나머지는 설정 화면에서 자세히 조정합니다. 두 IDE 모두 같은 4개 묶음입니다.
+- **VS Code**: 채팅 창 위 ⚙ 아이콘 또는 `Yang Coding: 설정 열기` / **IntelliJ**: Settings → Tools → **Yang Coding**
+
+| 묶음 | 항목 |
+|---|---|
+| 접속 | 접속 방식(local/remote), 원격 서버 주소(비우면 기본 주소), 접속 토큰(키체인/비밀 저장소, 저장 여부 표시), 연결 테스트, 관리 페이지 열기, Cloudflare Access(선택) |
+| 이 맥에서 실행 (local) | AI-agent 폴더, 백엔드 자동 실행, 백엔드 주소, 엔진 주소 |
+| 에이전트 동작 | 파일 수정 승인(auto/ask), 명령 실행 승인(ask/auto), 최대 도구 반복(1~100), 작업 로그 자동 표시(VS Code) |
+| 생성 옵션 | 응답 최대 토큰(256~32768), 온도(0.0~1.0) |
+
+설치 파일에 넣는 기본 서버 주소는 빌드할 때 이 맥의 Tailscale 주소(`backend/data/agent_state/tailscale_url` → `http://…:18010`)로 자동으로 정해집니다. 다른 주소로 빌드하려면 `YANG_SERVER_URL=http://… npm run package` / `YANG_SERVER_URL=http://… ./gradlew buildPlugin`.
 
 ### 4.8.3-1 접속 주소 (이 맥)
 | 순서 | 주소 | 비고 |
@@ -623,8 +727,16 @@ scripts/tunnel.sh status                      # 외부 주소로 실제 접속·
 | GET/POST/DELETE | `/api/preferences` | 선호·제약 |
 | POST/GET | `/api/agent/run`, `/api/agent/jobs`, `/api/agent/jobs/{id}` | 하네스 작업 실행/조회 |
 | POST | `/api/style/search` | 벡터 검색 |
+| POST | `/api/attachments` | `{name, data(base64), project, prompt}` 첨부 업로드·분석 → `{attachment: {id, kind, content, …}}` |
+| GET/DELETE | `/api/attachments`, `/api/attachments/{id}` | 첨부 목록(`?project=`)/내용/삭제 |
+| POST | `/api/vision/inspect` | `{image, expect}` 실행 화면 점검 (PLAY) |
+| POST | `/api/images/generate` | IMAGE 도구: 생성·참고 스타일·가공 → `{images, sizes, credits, prompt_used, timings}` |
+| GET | `/api/images/search?q=`, `/api/images/status` | 무료(CC0·PD) 참고 이미지 검색 · 생성 환경 상태 |
 
-Rust 엔진: `GET /health`, `POST /generate` `{messages, max_tokens, temperature, top_p, grammar, stop, seed, stream}`.
+Rust 엔진: `GET /health`(코딩 모델 + `vision` 상태), `POST /generate` `{messages, max_tokens, temperature, top_p, grammar, stop, seed, stream}`,
+`POST /vision` `{image(base64), prompt, max_tokens}` 이미지 분석, `POST /vision/unload` `{if_idle_seconds}` 비전 모델 해제,
+`POST /sleep` 코딩·비전 모델 내림(다음 `/generate` 때 이미지 작업 프로세스를 끄고 자동 재로드). `/health` 에 `coder_loaded`.
+확인용: `engine/target/release/agent-engine --model models/<코딩모델>.gguf --image 그림.png`
 `stream: true`면 줄마다 `{"token": "…"}`, 마지막 줄에 `{"done": true, …통계}`.
 
 ---

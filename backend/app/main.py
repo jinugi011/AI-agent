@@ -19,7 +19,7 @@ from .preferences import PreferenceStore
 from .profiles import PROFILES, get_profile
 from .repo_manager import RepoManager
 from .vector_store import CodeVectorStore
-from . import remote, security
+from . import attachments, imagegen, remote, security
 
 app = FastAPI(title="Yang Coding", version="1.0.0")
 app.add_middleware(
@@ -133,6 +133,7 @@ class ContextRequest(BaseModel):
     repo: str = ""
     project: str = ""  # 원격 PC 프로젝트 이름 (/api/remote/index 로 색인한 것)
     top_k: int = 6
+    attachment_project: str = ""  # 첨부를 올릴 때 쓴 프로젝트 이름 (IDE 작업 폴더 이름)
 
 
 class LLMRequest(BaseModel):
@@ -203,6 +204,7 @@ def _repo_for(workspace_path: str, repo: str):
 
 @app.post("/api/context")
 def chat_context(request: ContextRequest):
+    attachments.unload_now_if_pending()  # 코딩 시작 → 비전 모델을 내려 코딩 모델 속도 확보
     if request.project:  # 원격 PC 프로젝트
         rp = remote.get_project(request.project)
         repo = {"name": rp["name"], "profile": rp.get("profile", ""), "language": rp.get("language", ""),
@@ -219,7 +221,121 @@ def chat_context(request: ContextRequest):
                                               profile=repo["profile"] if repo else ""),
         "methods": vector_store.project_methods(project) if project else None,
         "hits": vector_store.search(request.query, top_k=request.top_k, project=project or None) if request.query else [],
+        # 업로드한 첨부(이미지·PDF·MD) 중 질문과 관련된 부분
+        "attachments": attachments.search(vector_store, request.query, project=request.attachment_project or project, top_k=3)
+        if request.query else [],
     }
+
+
+# ---- 첨부 파일: 이미지 · PDF · MD 업로드 → 분석 → 코딩에 사용 ----------------------------
+class AttachmentUpload(BaseModel):
+    name: str
+    data: str            # 파일 바이트 base64
+    project: str = ""    # IDE 작업 폴더(프로젝트) 이름 — 같은 프로젝트의 질문에서 검색됨
+    prompt: str = ""     # 이미지 분석 지시 (비우면 개발자용 상세 분석)
+
+
+@app.post("/api/attachments")
+def upload_attachment(request: AttachmentUpload):
+    import base64 as _b64
+    import binascii
+
+    try:
+        data = _b64.b64decode(request.data, validate=False)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="data 는 base64 여야 합니다")
+    try:
+        meta = attachments.save(vector_store, request.project, request.name, data, request.prompt)
+    except attachments.AttachmentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"success": True, "attachment": attachments.get(meta["id"]) | {"indexed": meta["indexed"]}}
+
+
+# ---- 이미지 생성·가공 (FLUX.1-schnell + 배경 제거·픽셀아트·스프라이트 시트) ---------------------
+class ImageRequest(BaseModel):
+    prompt: str = ""              # 영어 (생성할 때)
+    width: int = 0
+    height: int = 0
+    steps: int = 4
+    seed: Optional[int] = None
+    refs: List[str] = []          # 참고 이미지 b64 (프로젝트 파일)
+    ref_search: str = ""          # 무료 이미지 검색어 (Openverse CC0·퍼블릭 도메인)
+    ref_attachment: str = ""      # 첨부한 이미지 이름/ID
+    strength: float = 0.0         # 참고 이미지를 밑그림으로 쓰는 정도 (0 = 스타일만)
+    use_style: bool = True
+    source: Optional[str] = None  # 고칠/가공할 기존 이미지 b64
+    join: List[str] = []          # 스프라이트 시트로 합칠 이미지들 b64
+    cols: int = 0
+    transparent: bool = False
+    pixel: int = 0
+    colors: int = 24
+    ops: str = ""
+
+
+@app.get("/api/images/status")
+def images_status():
+    return {"success": True, **imagegen.available()}
+
+
+@app.post("/api/images/generate")
+def images_generate(request: ImageRequest):
+    try:
+        return {"success": True, **imagegen.generate(request.model_dump())}
+    except imagegen.ImageGenError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except attachments.AttachmentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.get("/api/images/search")
+def images_search(q: str, n: int = 6):
+    try:
+        return {"success": True, "results": imagegen.search_refs(q, max(1, min(n, 20)))}
+    except imagegen.ImageGenError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+class VisionInspect(BaseModel):
+    image: str           # PNG/JPEG base64 (게임·앱 실행 화면)
+    expect: str = ""     # 화면에 보여야 하는 것
+    context: str = ""    # web | python | flutter …
+
+
+@app.post("/api/vision/inspect")
+def vision_inspect(request: VisionInspect):
+    import base64 as _b64
+
+    try:
+        data = _b64.b64decode(request.image)
+        return {"success": True, **attachments.inspect_screen(data, request.expect, request.context)}
+    except attachments.AttachmentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="image 는 base64 이미지여야 합니다")
+
+
+@app.get("/api/attachments")
+def list_attachments(project: str = ""):
+    return {"success": True, "attachments": attachments.list_all(project)}
+
+
+@app.get("/api/attachments/{att_id}")
+def get_attachment(att_id: str):
+    try:
+        return {"success": True, "attachment": attachments.get(att_id)}
+    except (FileNotFoundError, attachments.AttachmentError):
+        raise HTTPException(status_code=404, detail="첨부가 없습니다")
+
+
+@app.delete("/api/attachments/{att_id}")
+def delete_attachment(att_id: str):
+    try:
+        ok = attachments.delete(vector_store, att_id)
+    except attachments.AttachmentError:
+        ok = False
+    if not ok:
+        raise HTTPException(status_code=404, detail="첨부가 없습니다")
+    return {"success": True}
 
 
 # ---- 원격 PC 지원: LLM 중계 · 업로드 색인 -------------------------------------------

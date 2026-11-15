@@ -1,7 +1,7 @@
 /** FastAPI 백엔드 / Rust 엔진 HTTP 클라이언트.
  *
  * 로컬 모드: 백엔드(127.0.0.1:8010)·엔진(127.0.0.1:18091)에 직접 연결.
- * 원격 모드: Cloudflare Tunnel 주소(serverUrl) 하나로 백엔드에 연결하고, LLM 생성도 백엔드가 중계한다.
+ * 원격 모드: 서버 주소(serverUrl, 비어 있으면 설치 파일에 들어 있는 기본 주소) 하나로 백엔드에 연결하고, LLM 생성도 백엔드가 중계한다.
  *           API 토큰(+선택: Cloudflare Access 서비스 토큰)은 VS Code SecretStorage 에 보관.
  */
 import * as vscode from 'vscode';
@@ -39,6 +39,15 @@ export async function setSecret(key: string, value: string) {
   secretCache.set(key, value);
 }
 
+/** 설치 파일(server.json)에 들어 있는 고정 서버 주소 — 사용자는 토큰만 입력하면 된다 */
+let defaultServer = '';
+export function setDefaultServer(url: string) { defaultServer = (url || '').trim().replace(/\/$/, ''); }
+export function getDefaultServer(): string { return defaultServer; }
+/** 실제로 쓰는 원격 서버 주소: 설정값 > 기본 주소 */
+export function serverUrl(): string {
+  return (vscode.workspace.getConfiguration('localAgent').get<string>('serverUrl', '') || defaultServer).replace(/\/$/, '');
+}
+
 export function isRemote(): boolean {
   return vscode.workspace.getConfiguration('localAgent').get<string>('mode', 'local') === 'remote';
 }
@@ -48,7 +57,7 @@ function cfg() {
   const remote = isRemote();
   return {
     remote,
-    backend: (remote ? c.get<string>('serverUrl', '') : c.get<string>('backendUrl', 'http://127.0.0.1:8010')).replace(/\/$/, ''),
+    backend: (remote ? serverUrl() : c.get<string>('backendUrl', 'http://127.0.0.1:8010')).replace(/\/$/, ''),
     engine: c.get<string>('engineUrl', 'http://127.0.0.1:18091').replace(/\/$/, ''),
   };
 }

@@ -3,6 +3,8 @@ import * as vscode from 'vscode';
 import { backend, ChatMessage, engine, isRemote } from './clients';
 import { ensureRemoteIndex, remoteProjectName } from './remoteIndex';
 import { describeCall, parseToolCalls, stripToolBlocks, TOOL_DOCS } from './protocol';
+import { DEBUG_RULES } from './debugkit';
+import { runCheck } from './debugRunner';
 import { Checkpoint, executeTool, OriginalContentProvider, ToolHost, UiEvent } from './tools';
 
 export type AgentEvent =
@@ -20,7 +22,55 @@ export interface EditorContext {
   openFiles: string[];
 }
 
-const READ_ONLY = new Set(['read', 'list', 'grep', 'search']);
+/** 서버가 분석한 첨부 파일 (이미지 · PDF · MD) */
+export interface Attachment {
+  id: string;
+  name: string;
+  kind: 'image' | 'pdf' | 'text' | string;
+  content: string;
+  chars: number;
+  pages?: number;
+  vision_pages?: number;
+  notes?: string[];
+}
+
+const ATT_PER_FILE = 12_000;  // 첨부 하나를 대화에 넣는 최대 글자 수
+const ATT_TOTAL = 24_000;     // 한 요청의 첨부 합계 최대 글자 수 (나머지는 .yang/attachments 파일을 READ)
+const ATT_DIR = '.yang/attachments';
+
+/** 첨부 분석 결과를 프로젝트의 .yang/attachments/ 에 저장 (에이전트가 READ/GREP 로 전체를 볼 수 있게, git 에는 안 올라감) */
+async function saveAttachments(root: vscode.Uri, atts: Attachment[]): Promise<Map<string, string>> {
+  const paths = new Map<string, string>();
+  const dir = vscode.Uri.joinPath(root, ...ATT_DIR.split('/'));
+  try {
+    await vscode.workspace.fs.createDirectory(dir);
+    await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(root, '.yang', '.gitignore'), Buffer.from('*\n'));
+    for (const a of atts) {
+      const file = `${a.id}-${a.name.replace(/[^\w.가-힣-]/g, '_')}.md`;
+      await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(dir, file), Buffer.from(a.content, 'utf8'));
+      paths.set(a.id, `${ATT_DIR}/${file}`);
+    }
+  } catch { /* 저장 실패해도 대화에 넣은 내용으로 진행 */ }
+  return paths;
+}
+
+function attachmentBlock(atts: Attachment[], paths: Map<string, string>): string {
+  if (!atts.length) return '';
+  let budget = ATT_TOTAL;
+  const KIND: Record<string, string> = { image: '이미지 (비전 모델 분석 결과)', pdf: 'PDF', text: '문서' };
+  const parts = atts.map((a) => {
+    const limit = Math.max(1500, Math.min(ATT_PER_FILE, budget));
+    const body = a.content.length > limit ? a.content.slice(0, limit) + `\n…(이하 ${(a.content.length - limit).toLocaleString()}자 생략)` : a.content;
+    budget -= Math.min(a.content.length, limit);
+    const where = paths.get(a.id);
+    const full = where ? ` · 전체: ${where}${a.content.length > limit ? ' (READ 로 나머지 확인)' : ''}` : '';
+    return `### 📎 ${a.name} — ${KIND[a.kind] ?? a.kind}${full}\n${body}`;
+  });
+  return `\n\n[첨부 파일 ${atts.length}개] 사용자가 첨부한 자료입니다. 요청을 처리할 때 이 내용을 근거로 사용하세요.` +
+    ` 이미지는 비전 모델이 글로 풀어 쓴 것이므로 수치(색·간격)는 추정일 수 있습니다.\n\n${parts.join('\n\n')}`;
+}
+
+const READ_ONLY = new Set(['read', 'list', 'grep', 'search', 'check']);
 const CONTEXT_CHAR_BUDGET = 70_000; // 32k 토큰 컨텍스트 중 응답 여유를 남긴 대략치
 
 // 시스템 프롬프트는 대화 중 바뀌지 않는 내용만 담는다 → 엔진 KV 캐시 재사용으로 다음 요청이 빨라짐.
@@ -32,7 +82,8 @@ function systemPrompt(ctx: any, repoInfo: string, tree: string): string {
 ## 일하는 방식
 - 추측하지 말고 먼저 READ/GREP/SEARCH 로 확인한 뒤 수정한다.
 - 기존 코드의 스타일·구조·네이밍을 그대로 따른다. 아래 선호/제약은 반드시 지킨다.
-- 수정 후에는 가능하면 RUN 으로 테스트/빌드를 실행해 검증한다.
+- 파일을 고치면 [자동 검사] 결과(문법·타입·IDE 오류·리소스 경로)가 도구 결과에 붙는다. 오류가 있으면 먼저 고친다.
+- 수정 후에는 RUN(테스트·빌드) 또는 PLAY(게임·앱 실행)로 실제 동작을 확인한다. 확인하지 못했으면 그 사실을 답변에 적는다.
 - 사용자가 지정한 함수 이름·시그니처·동작은 절대 바꾸지 않는다 (예: total(prices) 를 total() 로 바꾸지 말 것).
 - 테스트가 실패하면 테스트를 구현에 맞추지 말고, 요구사항에 맞게 구현을 고친다. 테스트 자체가 요구사항과
   모순될 때만 테스트를 고치고, 그 이유를 답변에 명시한다. 테스트를 약화시켜 통과시키는 것은 금지.
@@ -40,8 +91,11 @@ function systemPrompt(ctx: any, repoInfo: string, tree: string): string {
 - 큰 기능(여러 파일, 명확한 요구사항)은 HARNESS 로 테스트 우선 구현을 수행해도 된다.
 - 사용자가 "기억해", "앞으로는", "항상" 같은 말로 스타일/선호/제약을 알려주면 REMEMBER 로 저장한다.
 - 사용자가 모델 다운로드/교체/엔진 관련 요청을 하면 MODEL 도구를 쓴다.
+- 프로젝트에 필요한 그림(캐릭터·배경·아이콘·UI)은 인터넷에서 받지 말고 IMAGE 로 생성한다. prompt 는 영어로 쓴다. 생성한 경로를 코드에서 정확히 불러온다.
 - 답변은 사용자의 언어(기본 한국어)로 간결하게. 완료 후에는 무엇을 바꿨는지 1~3줄로 요약한다.
 - 도구 결과를 기다려야 하면 그 응답에서는 도구 블록까지만 쓰고 멈춘다. 파일을 READ 하기 전에는 EDIT 하지 않는다.
+
+${DEBUG_RULES}
 
 ${TOOL_DOCS}
 
@@ -144,7 +198,7 @@ export class AgentSession {
     return messages;
   }
 
-  async send(userText: string, editor: EditorContext): Promise<void> {
+  async send(userText: string, editor: EditorContext, attachments: Attachment[] = [], opts: { debug?: boolean } = {}): Promise<void> {
     if (this.running) return;
     const root = this.root();
     const abort = (this.abort = new AbortController());
@@ -173,9 +227,9 @@ export class AgentSession {
         if (isRemote()) {
           // 원격: 이 PC 의 파일을 서버로 올려 벡터화(처음/6시간마다) 후 프로젝트 이름으로 컨텍스트 조회
           await ensureRemoteIndex(root, this.log).catch((e) => this.log.line(`[원격 색인] 실패: ${e.message}`, 'error'));
-          ctx = await backend.post('/api/context', { query: userText, project: remoteProjectName(root), top_k: 6 }, 60_000);
+          ctx = await backend.post('/api/context', { query: userText, project: remoteProjectName(root), attachment_project: remoteProjectName(root), top_k: 6 }, 60_000);
         } else {
-          ctx = await backend.post('/api/context', { query: userText, workspace_path: root.fsPath, top_k: 6 }, 600_000);
+          ctx = await backend.post('/api/context', { query: userText, workspace_path: root.fsPath, attachment_project: remoteProjectName(root), top_k: 6 }, 600_000);
         }
         this.repoName = ctx.repo?.name ?? '';
       } catch (e: any) {
@@ -187,9 +241,19 @@ export class AgentSession {
         : `${root.fsPath} (미연결)`;
       const related = (ctx?.hits ?? []).slice(0, 4).map((h: any) => `--- ${h.source} ---\n${h.content}`).join('\n');
 
+      // 이번에 첨부한 파일은 내용을 직접 넣고, 예전에 올린 첨부는 질문과 관련된 부분만 (벡터 검색)
+      const attPaths = await saveAttachments(root, attachments);
+      const thisTurn = new Set(attachments.map((a) => a.id));
+      const pastAtts = (ctx?.attachments ?? []).filter((h: any) => !thisTurn.has(h.attachment_id)).slice(0, 2)
+        .map((h: any) => `--- 📎 ${h.source} ---\n${h.content}`).join('\n');
+      if (attachments.length) {
+        this.log.line(`[첨부] ${attachments.map((a) => `${a.name}(${a.chars.toLocaleString()}자)`).join(', ')} → 대화에 포함 · 전체는 ${ATT_DIR}/`, 'info');
+      }
       this.history.push({
         role: 'user',
-        content: `${userText}\n\n${editorBlock(editor)}` + (related ? `\n\n(참고: 벡터 검색으로 찾은 관련 코드)\n${related}` : ''),
+        content: `${userText}\n\n${editorBlock(editor)}` + attachmentBlock(attachments, attPaths) +
+          (pastAtts ? `\n\n(참고: 이전에 첨부한 자료 중 관련 부분)\n${pastAtts}` : '') +
+          (related ? `\n\n(참고: 벡터 검색으로 찾은 관련 코드)\n${related}` : ''),
       });
       // 같은 대화에서 시스템 프롬프트가 그대로면 엔진이 앞부분을 재사용한다
       const system = systemPrompt(ctx, repoInfo, await this.fileTree(root));
@@ -211,7 +275,12 @@ export class AgentSession {
         },
       };
       const cfg = vscode.workspace.getConfiguration('localAgent');
-      const maxSteps = cfg.get<number>('maxSteps', 16);
+      // 디버그 모드는 재현 → 계측 → 수정 → 재검증으로 단계가 많아 두 배까지 허용
+      const maxSteps = opts.debug ? Math.max(24, cfg.get<number>('maxSteps', 16) * 2) : cfg.get<number>('maxSteps', 16);
+      const autoCheck = cfg.get<boolean>('autoCheck', true);
+      const verify = cfg.get<boolean>('verifyBeforeFinish', true);
+      // 완료 관문 상태: 남은 오류 · 실행 확인 여부 · 같은 독촉을 반복하지 않기 위한 횟수
+      const gate = { errors: 0, errorText: '', ran: false, codeChanged: false, nudges: { errors: 0, markers: 0, verify: 0 } };
 
       for (let step = 0; step < maxSteps && !abort.signal.aborted; step++) {
         steps = step + 1;
@@ -243,6 +312,12 @@ export class AgentSession {
 
         let calls = parseToolCalls(text);
         if (calls.length === 0) {
+          const nudge = step < maxSteps - 1 ? await this.finishGate(root, checkpoint, gate, verify, !!opts.debug) : '';
+          if (nudge) {
+            this.log.line(`[완료 관문] ${nudge.split('\n')[0]}`, 'info');
+            this.history.push({ role: 'user', content: nudge });
+            continue;
+          }
           this.log.line('[턴 종료] 도구 호출 없음 → 최종 답변', 'info');
           break;
         }
@@ -266,6 +341,28 @@ export class AgentSession {
         if (deferred) {
           results.push(`(주의: 같은 응답의 수정/실행 도구 ${deferred}개는 실행하지 않았습니다. 위 조회 결과를 확인한 뒤 필요한 수정만 다시 요청하세요.)`);
         }
+        // 실행으로 확인했는지 · CHECK 결과 기록
+        calls.forEach((c, i) => {
+          if (c.kind === 'run' || c.kind === 'play' || c.kind === 'harness') gate.ran = true;
+          if (c.kind === 'check') {
+            gate.errors = Number(/오류 (\d+)개/.exec(results[i] ?? '')?.[1] ?? 0);
+            gate.errorText = gate.errors ? results[i] : '';
+          }
+        });
+        // 수정 직후 자동 검사: 문법·타입·IDE 오류·리소스 경로를 바로 돌려줘 다음 단계에서 고치게 한다
+        const changed = [...new Set(calls.filter((c) => c.kind === 'write' || c.kind === 'edit').map((c) => (c as any).path as string))];
+        if (changed.length) {
+          gate.codeChanged ||= changed.some((f) => /\.(py|m?jsx?|cjs|tsx?|dart|gd|cs|html?|kt|java|rs|go|lua|vue|svelte)$/i.test(f));
+          if (autoCheck && !abort.signal.aborted) {
+            const t0 = Date.now();
+            const rep = await runCheck(root, changed).catch((e) => ({ errors: 0, warnings: 0, problems: [], text: `[자동 검사] 실패: ${e.message}` }));
+            gate.errors = rep.errors;
+            gate.errorText = rep.errors ? rep.text : '';
+            results.push(rep.text);
+            this.log.line(`${indent(rep.text, 30)}\n    (${((Date.now() - t0) / 1000).toFixed(1)}s)`, rep.errors ? 'error' : 'result');
+            if (rep.errors || rep.warnings) this.emit({ type: 'tool', id: `chk${Date.now()}`, title: `자동 검사: 오류 ${rep.errors} · 경고 ${rep.warnings}`, status: rep.errors ? 'error' : 'done', detail: rep.text.slice(0, 3000) });
+          }
+        }
         this.history.push({ role: 'user', content: `[도구 결과]\n${results.join('\n\n')}` });
         if (step === maxSteps - 1) {
           this.emit({ type: 'notice', level: 'warn', text: `최대 단계(${maxSteps})에 도달해 멈췄습니다. "계속"이라고 입력하면 이어서 진행합니다.` });
@@ -287,6 +384,37 @@ export class AgentSession {
       this.emit({ type: 'turn-end', changedFiles: checkpoint.originals.size });
       this.emit({ type: 'busy', busy: false });
     }
+  }
+
+  /**
+   * 완료 관문: 모델이 끝내려 할 때 남은 오류·임시 로그·미검증을 확인해 한 번 더 일하게 한다.
+   * 같은 독촉은 정해진 횟수까지만 (무한 반복 방지). 돌려줄 말이 없으면 '' → 정상 종료.
+   */
+  private async finishGate(root: vscode.Uri, checkpoint: Checkpoint, gate: { errors: number; errorText: string; ran: boolean; codeChanged: boolean;
+    nudges: { errors: number; markers: number; verify: number } }, verify: boolean, debug: boolean): Promise<string> {
+    if (gate.errors > 0 && gate.nudges.errors < 2) {
+      gate.nudges.errors++;
+      return `[완료 관문] 아직 오류 ${gate.errors}개가 남아 있습니다. 고친 뒤 끝내세요. 고칠 수 없거나 의도된 것이면 이유를 설명하고 끝내세요.\n\n${gate.errorText.slice(0, 3000)}`;
+    }
+    if (gate.nudges.markers < 1) {
+      const left: string[] = [];
+      for (const fsPath of checkpoint.originals.keys()) {
+        try {
+          const text = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(fsPath))).toString('utf8');
+          text.split('\n').forEach((l, i) => { if (l.includes('YANG-DEBUG')) left.push(`${vscode.workspace.asRelativePath(fsPath)}:${i + 1}: ${l.trim()}`); });
+        } catch { /* 삭제된 파일 */ }
+      }
+      if (left.length) {
+        gate.nudges.markers++;
+        return `[완료 관문] 임시 디버그 로그(YANG-DEBUG)가 남아 있습니다. 모두 지운 뒤 끝내세요:\n${left.slice(0, 15).join('\n')}`;
+      }
+    }
+    if ((verify || debug) && gate.codeChanged && !gate.ran && gate.nudges.verify < 1) {
+      gate.nudges.verify++;
+      return '[완료 관문] 코드를 바꿨지만 실행으로 확인하지 않았습니다. 테스트가 있으면 RUN, 게임·앱이면 PLAY 로 실제 동작을 확인하세요. ' +
+        '실행할 수 없는 상황이면(필요한 도구·기기 없음 등) 그 이유를 한 줄로 말하고 끝내세요.';
+    }
+    return '';
   }
 
   /** 엔진이 꺼져 있을 때: 모델 다운로드/시작 같은 설정 요청은 규칙 기반으로 처리한다. */

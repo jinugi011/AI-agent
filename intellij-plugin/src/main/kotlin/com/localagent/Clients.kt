@@ -24,7 +24,7 @@ object Clients {
     @Volatile var lastBackendError: String = ""
 
     val remote: Boolean get() = AgentSettings.current.mode == "remote"
-    private val backendBase: String get() = (if (remote) AgentSettings.current.serverUrl else AgentSettings.current.backendUrl).trimEnd('/')
+    private val backendBase: String get() = (if (remote) DefaultServer.effective() else AgentSettings.current.backendUrl).trimEnd('/')
 
     /** 원격 모드 인증 헤더 (토큰은 IntelliJ PasswordSafe = macOS 키체인에 보관) */
     private fun authHeaders(): Map<String, String> {

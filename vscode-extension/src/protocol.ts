@@ -3,6 +3,7 @@
  * 로컬 모델은 JSON 이스케이프에 약하므로 코드가 그대로 들어가는 블록 형식을 쓴다.
  * vscode 의존성이 없어 단위 테스트 가능.
  */
+import { parsePlay, PlayRequest, PLAY_DOC } from './debugkit';
 
 export type ToolCall =
   | { kind: 'read'; path: string; start?: number; end?: number }
@@ -15,7 +16,10 @@ export type ToolCall =
   | { kind: 'remember'; memKind: string; scope: string; scopeValue: string; text: string }
   | { kind: 'harness'; task: string }
   | { kind: 'model'; action: string; arg: string }
-  | { kind: 'connect'; location: string };
+  | { kind: 'connect'; location: string }
+  | { kind: 'check' }
+  | { kind: 'play'; req: PlayRequest }
+  | { kind: 'image'; path: string; fields: Record<string, string> };
 
 export const TOOL_DOCS = `## 도구 (필요할 때만, 한 응답에 여러 개 가능)
 도구 블록은 줄 맨 앞에서 시작한다. 결과는 다음 메시지로 돌려준다. 도구 없이 답하면 대화 턴이 끝난다.
@@ -43,13 +47,27 @@ REMEMBER>>>                        사용자 스타일/선호/제약을 영구 �
 요구사항
 HARNESS>>>                         요구사항→테스트 하네스→구현→테스트 반복을 새 브랜치에서 자동 수행 (큰 기능 구현 시)
 <<<MODEL list|status|download <key>|start [key]|stop>>>   로컬 모델 관리
-<<<CONNECT 경로 또는 git URL>>>      다른 레포 연결 + 벡터화`;
+<<<CONNECT 경로 또는 git URL>>>      다른 레포 연결 + 벡터화
+${PLAY_DOC}
+<<<IMAGE 저장경로.png
+prompt: 영어로 그림 설명 (예: cute pixel art knight, front view, full body)
+size: 64x64                        최종 크기 (작은 스프라이트도 크게 그린 뒤 줄여 깨끗하게)
+transparent: yes                   배경 제거 (캐릭터·아이템·아이콘)
+pixel: 32                          픽셀아트로 변환 (가로 32칸, colors: 16 으로 색 수 제한)
+ref: assets/concept.png            참고 이미지의 '스타일'을 따라 그림 (프로젝트 파일 | attachment:첨부이름 | search:무료 이미지 검색어)
+strength: 0.4                      참고 이미지를 밑그림으로도 쓰는 정도 0~0.9 (기본 0 = 스타일만)
+from: assets/old.png               기존 이미지를 고쳐 그리기 (prompt 와 함께) 또는 가공만 (prompt 없이)
+join: a.png, b.png, c.png          여러 이미지를 스프라이트 시트로 합치기 (cols: 3)
+ops: flip-x; rotate 90; tint #ff8800 0.3; crop x,y,w,h; resize WxH; remove-bg; trim; pixelate 32; grayscale; sheet-split 4x1
+IMAGE>>>                           프로젝트용 그림을 맥의 이미지 모델(FLUX)로 생성·가공해 저장. 한 장에 15~40초.
+                                   sheet-split 은 경로_0.png, 경로_1.png … 로 저장. 웹 참고 이미지는 CC0·퍼블릭 도메인만 쓰고 ASSET_CREDITS.md 에 기록.`;
 
-const SIMPLE_RE = /^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT)[ \t]+([^\n]*?)>>>[ \t]*$/gm;
+const SIMPLE_RE = /^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT|CHECK|PLAY)(?:[ \t]+([^\n]*?))?>>>[ \t]*$/gm;
 const FILE_RE = /^<<<FILE[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^FILE>>>/gm;
 const EDIT_RE = /^<<<EDIT[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^EDIT>>>/gm;
 const REMEMBER_RE = /^<<<REMEMBER[ \t]*([^\n]*)\n([\s\S]*?)\n?^REMEMBER>>>/gm;
 const HARNESS_RE = /^<<<HARNESS[ \t]*\n([\s\S]*?)\n?^HARNESS>>>/gm;
+const IMAGE_RE = /^<<<IMAGE[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^IMAGE>>>/gm;
 const SR_RE = /<<<<<<< SEARCH\n([\s\S]*?)\n?=======\n([\s\S]*?)\n?>>>>>>> REPLACE/g;
 
 function cleanPath(p: string): string {
@@ -62,14 +80,15 @@ export function parseToolCalls(text: string): ToolCall[] {
   const push = (index: number, call: ToolCall) => found.push({ index, call });
   // 본문을 가지는 블록(FILE/EDIT/REMEMBER/HARNESS) 범위. 이 안의 텍스트는 도구 호출로 해석하지 않는다.
   const bodies: [number, number][] = [];
-  for (const re of [FILE_RE, EDIT_RE, REMEMBER_RE, HARNESS_RE]) {
+  for (const re of [FILE_RE, EDIT_RE, REMEMBER_RE, HARNESS_RE, IMAGE_RE]) {
     for (const m of text.matchAll(re)) bodies.push([m.index!, m.index! + m[0].length]);
   }
   const insideOther = (i: number) => bodies.some(([s, e]) => i > s && i < e);
 
   for (const m of text.matchAll(SIMPLE_RE)) {
-    const [, tag, raw] = m;
+    const [, tag, raw = ''] = m;
     const arg = raw.trim();
+    if (!arg && !['CHECK', 'PLAY', 'MODEL', 'LIST'].includes(tag)) continue;
     switch (tag) {
       case 'READ': {
         const range = /^(.*?):(\d+)-(\d+)$/.exec(arg);
@@ -83,6 +102,8 @@ export function parseToolCalls(text: string): ToolCall[] {
       case 'SEARCH': push(m.index!, { kind: 'search', query: arg }); break;
       case 'RUN': push(m.index!, { kind: 'run', command: arg }); break;
       case 'CONNECT': push(m.index!, { kind: 'connect', location: arg }); break;
+      case 'CHECK': push(m.index!, { kind: 'check' }); break;
+      case 'PLAY': push(m.index!, { kind: 'play', req: parsePlay(arg) }); break;
       case 'MODEL': {
         const [action = 'status', ...rest] = arg.split(/\s+/);
         push(m.index!, { kind: 'model', action: action.toLowerCase(), arg: rest.join(' ') });
@@ -105,6 +126,16 @@ export function parseToolCalls(text: string): ToolCall[] {
   for (const m of text.matchAll(HARNESS_RE)) {
     push(m.index!, { kind: 'harness', task: m[1].trim() });
   }
+  for (const m of text.matchAll(IMAGE_RE)) {
+    const fields: Record<string, string> = {};
+    let last = '';
+    for (const line of m[2].split('\n')) {
+      const kv = /^\s*([a-z_]+)\s*:\s*(.*)$/i.exec(line);
+      if (kv) { last = kv[1].toLowerCase(); fields[last] = kv[2].trim(); }
+      else if (last && line.trim()) fields[last] += ' ' + line.trim(); // 여러 줄 prompt
+    }
+    push(m.index!, { kind: 'image', path: cleanPath(m[1]), fields });
+  }
   return found
     .filter((f) => !insideOther(f.index))
     .sort((a, b) => a.index - b.index)
@@ -120,6 +151,7 @@ export function stripToolBlocks(text: string): string {
     .replace(EDIT_RE, '')
     .replace(REMEMBER_RE, '')
     .replace(HARNESS_RE, '')
+    .replace(IMAGE_RE, '')
     .replace(SIMPLE_RE, '');
   const open = out.search(/^<<<[A-Z]*/m);
   if (open !== -1) out = out.slice(0, open);
@@ -207,5 +239,8 @@ export function describeCall(c: ToolCall): string {
     case 'harness': return `HARNESS ${one(c.task)}`;
     case 'model': return `MODEL ${c.action}${c.arg ? ' ' + c.arg : ''}`;
     case 'connect': return `CONNECT ${c.location}`;
+    case 'check': return 'CHECK';
+    case 'image': return `IMAGE ${c.path}${c.fields.size ? ' ' + c.fields.size : ''}${c.fields.prompt ? ' — ' + one(c.fields.prompt, 60) : c.fields.ops ? ' — ' + one(c.fields.ops, 60) : ''}`;
+    case 'play': return `PLAY ${c.req.kind}${c.req.target ? ' ' + c.req.target : ''}${c.req.seconds ? ' ' + c.req.seconds + '초' : ''}`;
   }
 }

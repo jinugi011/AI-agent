@@ -1,5 +1,5 @@
-# 동작 검증된 정확한 버전 (Python 3.13, macOS arm64). install.sh 가 사용.
 # 갱신: backend/.venv/bin/pip freeze > backend/requirements.lock.txt
+# 동작 검증된 정확한 버전 (Python 3.13, macOS arm64). install.sh 가 사용.
 annotated-types==0.8.0
 anyio==4.16.0
 certifi==2026.10.23
@@ -10,8 +10,8 @@ faiss-cpu==1.15.1
 fastapi==0.115.0
 filelock==4.2.9
 fsspec==2026.9.0
-grpcio==1.85.1
 grpcio-tools==1.85.1
+grpcio==1.85.1
 h11==0.16.0
 h2==4.4.1
 hf-xet==1.8.0
@@ -39,6 +39,7 @@ protobuf==7.36.2
 pydantic==2.9.2
 pydantic_core==2.23.4
 Pygments==2.21.0
+pypdfium2==5.15.2
 pytest==9.2.0
 python-dotenv==1.0.1
 PyYAML==6.0.3

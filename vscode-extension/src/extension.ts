@@ -5,7 +5,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { OutputAgentLog } from './agentLog';
 import { ChatViewProvider } from './chatView';
-import { backend, initClients, isRemote, SECRET_CF_ID, SECRET_CF_SECRET, SECRET_TOKEN, setSecret } from './clients';
+import { backend, getDefaultServer, initClients, isRemote, SECRET_CF_ID, SECRET_CF_SECRET, SECRET_TOKEN, serverUrl, setDefaultServer, setSecret } from './clients';
 import { OriginalContentProvider } from './tools';
 
 let backendProc: ChildProcess | undefined;
@@ -69,48 +69,86 @@ async function startBackend(ctx: vscode.ExtensionContext, interactive: boolean):
   return false;
 }
 
-async function configureRemote() {
-  const c = vscode.workspace.getConfiguration('localAgent');
+const isTailscale = (u: string) =>
+  /^https?:\/\/([\w-]+\.)+ts\.net(:\d+)?\/?$/.test(u) || /^https?:\/\/100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+(:\d+)?\/?$/.test(u);
+
+/** 서버 주소 입력 (기본 주소가 없거나, 주소를 바꾸고 싶을 때만) */
+async function askServerUrl(current: string): Promise<string | undefined> {
   const url = await vscode.window.showInputBox({
-    title: '원격 접속 (1/3) 서버 주소',
-    prompt: 'Tailscale 주소 (예: https://맥이름.tailnet.ts.net 또는 http://맥이름.tailnet.ts.net:18010) 또는 Cloudflare 주소',
-    value: c.get<string>('serverUrl', ''),
-    ignoreFocusOut: true,
+    title: 'Yang Coding 서버 주소',
+    prompt: 'Tailscale 주소 (예: http://맥이름.tailnet.ts.net:18010) 또는 Cloudflare https 주소',
+    value: current, ignoreFocusOut: true,
     // https 필수. 단 Tailscale 사설망 주소(*.ts.net, 100.64.0.0/10)는 WireGuard 로 암호화되므로 http 도 허용
     validateInput: (v) => {
       const u = v.trim();
-      if (/^https:\/\/[^\s/]+/.test(u)) return undefined;
-      if (/^http:\/\/([\w-]+\.)+ts\.net(:\d+)?\/?$/.test(u) || /^http:\/\/100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+(:\d+)?\/?$/.test(u)) return undefined;
+      if (/^https:\/\/[^\s/]+/.test(u) || isTailscale(u)) return undefined;
       return 'https:// 주소를 입력하세요 (Tailscale 주소 *.ts.net 은 http:// 도 가능)';
     },
   });
-  if (!url) return;
-  const token = await vscode.window.showInputBox({
-    title: '원격 접속 (2/3) API 토큰', prompt: '서버(맥)에서 scripts/tunnel.sh token 으로 확인한 값',
-    password: true, ignoreFocusOut: true,
-  });
-  if (token === undefined) return;
-  const cfId = await vscode.window.showInputBox({
-    title: '원격 접속 (3/3) Cloudflare Access 서비스 토큰 (선택)',
-    prompt: 'Cloudflare Access 를 켰다면 Client ID 입력, 아니면 비워 두고 Enter', ignoreFocusOut: true,
-  });
-  let cfSecret = '';
-  if (cfId) cfSecret = (await vscode.window.showInputBox({ title: 'Cloudflare Access Client Secret', password: true, ignoreFocusOut: true })) ?? '';
+  return url?.trim().replace(/\/$/, '');
+}
 
-  await c.update('serverUrl', url.trim().replace(/\/$/, ''), vscode.ConfigurationTarget.Global);
-  if (token) await setSecret(SECRET_TOKEN, token.trim());
-  await setSecret(SECRET_CF_ID, (cfId ?? '').trim());
-  await setSecret(SECRET_CF_SECRET, cfSecret.trim());
+/** 원격 접속: 서버 주소는 설치 파일에 고정 → 토큰만 입력하면 바로 접속 */
+async function configureRemote() {
+  const c = vscode.workspace.getConfiguration('localAgent');
+  let url = serverUrl();
+  if (!url) {
+    url = (await askServerUrl('')) ?? '';
+    if (!url) return;
+    await c.update('serverUrl', url, vscode.ConfigurationTarget.Global);
+  }
+  const token = await vscode.window.showInputBox({
+    title: 'Yang Coding 접속 토큰',
+    prompt: `서버: ${url.replace(/^https?:\/\//, '')}  ·  관리 페이지(서버 주소를 브라우저로 열기) → 접속 토큰에서 발급한 값을 붙여 넣으세요`,
+    placeHolder: '접속 토큰', password: true, ignoreFocusOut: true,
+  });
+  if (!token?.trim()) return;
+  await setSecret(SECRET_TOKEN, token.trim());
+
+  // Cloudflare Access 는 Cloudflare 주소일 때만 묻는다 (Tailscale 은 불필요)
+  if (!isTailscale(url)) {
+    const cfId = await vscode.window.showInputBox({
+      title: 'Cloudflare Access 서비스 토큰 (선택)',
+      prompt: 'Cloudflare Access 를 켰다면 Client ID 입력, 아니면 비워 두고 Enter', ignoreFocusOut: true,
+    });
+    let cfSecret = '';
+    if (cfId) cfSecret = (await vscode.window.showInputBox({ title: 'Cloudflare Access Client Secret', password: true, ignoreFocusOut: true })) ?? '';
+    await setSecret(SECRET_CF_ID, (cfId ?? '').trim());
+    await setSecret(SECRET_CF_SECRET, cfSecret.trim());
+  }
   await c.update('mode', 'remote', vscode.ConfigurationTarget.Global);
 
   const ok = await backend.alive();
   const { lastBackendError } = await import('./clients');
-  vscode.window.showInformationMessage(ok ? `원격 서버 연결 성공: ${url}` : `원격 서버 연결 실패: ${lastBackendError}`);
+  if (ok) vscode.window.showInformationMessage(`Yang Coding 서버 연결 성공: ${url}`);
+  else vscode.window.showErrorMessage(`연결 실패: ${lastBackendError}`, '토큰 다시 입력', '서버 주소 변경').then((pick) => {
+    if (pick === '토큰 다시 입력') configureRemote();
+    else if (pick === '서버 주소 변경') changeServer();
+  });
+}
+
+async function changeServer() {
+  const c = vscode.workspace.getConfiguration('localAgent');
+  const url = await askServerUrl(serverUrl());
+  if (url === undefined) return;
+  // 기본 주소와 같거나 비우면 설정을 지워 기본 주소를 따른다
+  await c.update('serverUrl', url && url !== getDefaultServer() ? url : undefined, vscode.ConfigurationTarget.Global);
+  vscode.window.showInformationMessage(`서버 주소: ${serverUrl() || '(없음)'}`);
+}
+
+/** 설치 파일에 들어 있는 고정 서버 주소 (vsix 의 server.json, 패키징 때 생성) */
+function loadDefaultServer(ctx: vscode.ExtensionContext) {
+  try {
+    const fs = require('fs') as typeof import('fs');
+    const raw = fs.readFileSync(require('path').join(ctx.extensionPath, 'server.json'), 'utf8');
+    setDefaultServer(JSON.parse(raw).url ?? '');
+  } catch { /* 없으면 직접 입력 */ }
 }
 
 export async function activate(ctx: vscode.ExtensionContext) {
   output = vscode.window.createOutputChannel('Yang Coding');
   await initClients(ctx.secrets);
+  loadDefaultServer(ctx);
   const diffProvider = new OriginalContentProvider();
   const agentLog = new OutputAgentLog();
   const chat = new ChatViewProvider(ctx, diffProvider, agentLog);
@@ -126,6 +164,13 @@ export async function activate(ctx: vscode.ExtensionContext) {
     vscode.commands.registerCommand('localAgent.startBackend', () =>
       isRemote() ? vscode.window.showWarningMessage('원격 모드입니다. 백엔드는 서버(맥)에서 실행됩니다.') : startBackend(ctx, true)),
     vscode.commands.registerCommand('localAgent.configureRemote', configureRemote),
+    vscode.commands.registerCommand('localAgent.changeServer', changeServer),
+    vscode.commands.registerCommand('localAgent.openAdmin', () => {
+      const u = serverUrl() || vscode.workspace.getConfiguration('localAgent').get<string>('backendUrl', 'http://127.0.0.1:8010');
+      return vscode.env.openExternal(vscode.Uri.parse(u));
+    }),
+    vscode.commands.registerCommand('localAgent.openSettings', () =>
+      vscode.commands.executeCommand('workbench.action.openSettings', '@ext:local.local-coding-agent')),
     vscode.commands.registerCommand('localAgent.useLocal', async () => {
       await vscode.workspace.getConfiguration('localAgent').update('mode', 'local', vscode.ConfigurationTarget.Global);
       vscode.window.showInformationMessage('로컬 모드로 전환했습니다 (이 PC 의 백엔드·엔진 사용).');

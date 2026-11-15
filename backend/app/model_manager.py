@@ -119,6 +119,7 @@ class ModelManager:
             "online": health is not None,
             "managed": managed,
             "model": (health or {}).get("model"),
+            "vision": (health or {}).get("vision") or {"available": False, "loaded": False},
             "url": settings.engine_url,
             "binary": str(ENGINE_BIN),
             "binary_exists": ENGINE_BIN.exists(),

@@ -81,6 +81,29 @@ pub struct EngineConfig {
     pub n_ubatch: u32,
     pub n_gpu_layers: u32,
     pub n_threads: i32,
+    /// KV 캐시 형식: f16 | q8_0 | q4_0 (양자화하면 메모리 절반·1/4, Flash Attention 필요)
+    pub kv_type: String,
+    /// Flash Attention: auto | on | off
+    pub flash: String,
+}
+
+pub fn kv_cache_type(name: &str) -> Result<llama_cpp_2::context::params::KvCacheType> {
+    use llama_cpp_2::context::params::KvCacheType as K;
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "f16" => K::F16,
+        "q8_0" | "q8" => K::Q8_0,
+        "q4_0" | "q4" => K::Q4_0,
+        other => bail!("알 수 없는 KV 캐시 형식: {other} (f16|q8_0|q4_0)"),
+    })
+}
+
+pub fn flash_policy(name: &str) -> Result<llama_cpp_sys_2::llama_flash_attn_type> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "auto" => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO,
+        "on" | "1" | "true" => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED,
+        "off" | "0" | "false" => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED,
+        other => bail!("알 수 없는 flash 값: {other} (auto|on|off)"),
+    })
 }
 
 pub struct Engine<'m> {
@@ -92,22 +115,46 @@ pub struct Engine<'m> {
     pub info: ModelInfo,
 }
 
-/// 백엔드와 모델을 소유값으로 반환한다. 호출자는 Engine(컨텍스트) → 모델 → 백엔드 순으로 해제해야 한다
-/// (역순으로 해제하면 Metal 디바이스 정리 시 assert 로 종료된다).
-pub fn load_model(cfg: &EngineConfig) -> Result<(LlamaBackend, LlamaModel)> {
+/// llama 백엔드를 한 번만 만들고 프로그램이 끝날 때까지 쓴다 (모델을 내렸다 다시 올려도 같은 백엔드).
+pub fn init_backend() -> Result<&'static LlamaBackend> {
     let mut backend = LlamaBackend::init().context("llama backend init 실패")?;
     if std::env::var("ENGINE_VERBOSE").is_err() {
         backend.void_logs();
     }
+    Ok(Box::leak(Box::new(backend)))
+}
 
-    let path = Path::new(&cfg.model_path);
-    if !path.exists() {
-        bail!("모델 파일을 찾을 수 없습니다: {}", cfg.model_path);
+/// 코딩 모델 + 컨텍스트 묶음. 이미지 생성처럼 메모리가 많이 필요한 작업 동안 통째로 내렸다가 다시 올린다.
+/// 해제 순서: 컨텍스트(Engine) → 모델 (Drop 에서 보장).
+pub struct Coder {
+    engine: Option<Engine<'static>>,
+    model: Option<Box<LlamaModel>>,
+}
+
+impl Coder {
+    pub fn load(backend: &'static LlamaBackend, cfg: &EngineConfig) -> Result<Self> {
+        let path = Path::new(&cfg.model_path);
+        if !path.exists() {
+            bail!("모델 파일을 찾을 수 없습니다: {}", cfg.model_path);
+        }
+        let params = LlamaModelParams::default().with_n_gpu_layers(cfg.n_gpu_layers);
+        let model = Box::new(LlamaModel::load_from_file(backend, path, &params).map_err(|e| anyhow!("모델 로드 실패: {e}"))?);
+        // SAFETY: model 은 Box 안에 있어 주소가 고정되고, Drop 에서 engine 을 먼저 해제한 뒤 model 을 해제한다.
+        let model_ref: &'static LlamaModel = unsafe { &*(model.as_ref() as *const LlamaModel) };
+        let engine = Engine::new(backend, model_ref, cfg)?;
+        Ok(Self { engine: Some(engine), model: Some(model) })
     }
-    let params = LlamaModelParams::default().with_n_gpu_layers(cfg.n_gpu_layers);
-    let model = LlamaModel::load_from_file(&backend, path, &params)
-        .map_err(|e| anyhow!("모델 로드 실패: {e}"))?;
-    Ok((backend, model))
+
+    pub fn engine(&mut self) -> &mut Engine<'static> {
+        self.engine.as_mut().unwrap()
+    }
+}
+
+impl Drop for Coder {
+    fn drop(&mut self) {
+        self.engine.take();
+        self.model.take();
+    }
 }
 
 impl<'m> Engine<'m> {
@@ -118,7 +165,10 @@ impl<'m> Engine<'m> {
             .with_n_batch(cfg.n_batch)
             .with_n_ubatch(cfg.n_ubatch.min(cfg.n_batch))
             .with_n_threads(cfg.n_threads)
-            .with_n_threads_batch(cfg.n_threads);
+            .with_n_threads_batch(cfg.n_threads)
+            .with_flash_attention_policy(flash_policy(&cfg.flash)?)
+            .with_type_k(kv_cache_type(&cfg.kv_type)?)
+            .with_type_v(kv_cache_type(&cfg.kv_type)?);
         let ctx = model
             .new_context(backend, ctx_params)
             .map_err(|e| anyhow!("컨텍스트 생성 실패: {e}"))?;

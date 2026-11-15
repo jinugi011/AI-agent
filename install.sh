@@ -12,6 +12,8 @@
 #    --repo <URL>        git 레포 주소 (기본: https://github.com/jinugi011/AI-agent.git)
 #    --branch <이름>     브랜치 (기본: main)
 #    --model <키>        auto | 30b | 14b | 7b | none   (기본: auto = 메모리에 맞게 선택)
+#    --imagegen <값>     auto | yes | no  그림 생성 FLUX.1-schnell 4bit(~9.6GB, Apple Silicon) + 배경 제거 (기본: auto = 메모리 32GB 이상)
+#    --vision <값>       auto | yes | no  이미지 분석용 비전 모델(Qwen2.5-VL 7B, ~5.5GB) (기본: auto = 메모리 24GB 이상이면 받음)
 #    --skip-vscode       VS Code 확장 설치 생략
 #    --skip-intellij     IntelliJ 플러그인 설치 생략
 #    --skip-docker       Qdrant(Docker) 생략 → 벡터 DB 는 메모리 모드(재시작 시 초기화)
@@ -25,6 +27,8 @@ REPO_URL="https://github.com/jinugi011/AI-agent.git"
 BRANCH="main"
 INSTALL_DIR=""
 MODEL="auto"
+VISION="auto"
+IMAGEGEN="auto"
 SKIP_VSCODE=0
 SKIP_INTELLIJ=0
 SKIP_DOCKER=0
@@ -36,6 +40,8 @@ while [[ $# -gt 0 ]]; do
     --repo) REPO_URL="$2"; shift 2 ;;
     --branch) BRANCH="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
+    --vision) VISION="$2"; shift 2 ;;
+    --imagegen) IMAGEGEN="$2"; shift 2 ;;
     --skip-vscode) SKIP_VSCODE=1; shift ;;
     --skip-intellij) SKIP_INTELLIJ=1; shift ;;
     --skip-docker) SKIP_DOCKER=1; shift ;;
@@ -174,6 +180,52 @@ if [[ -n "$M_FILE" ]]; then
 else
   warn "모델을 받지 않았습니다. 나중에 채팅에서 \"30B 모델 받아줘\" 또는 ./install.sh --model 30b"
 fi
+
+# ---- 5-1. 비전 모델 (첨부 이미지·스캔 PDF 분석) -------------------------------------------
+# 엔진이 models/ 의 *-VL-*.gguf + mmproj*.gguf 를 자동으로 찾아 첫 이미지 요청 때 띄우고, 분석이 끝나면 내린다.
+step "비전 모델 (이미지 분석)"
+if [[ "$VISION" == "auto" ]]; then
+  if (( MEM_GB >= 24 )); then VISION=yes; else VISION=no; echo "  메모리 ${MEM_GB}GB → 비전 모델 생략 (--vision yes 로 강제 설치 가능)"; fi
+fi
+case "$VISION" in
+  yes)
+    V_REPO="ggml-org/Qwen2.5-VL-7B-Instruct-GGUF"
+    mkdir -p models
+    for V_FILE in "mmproj-Qwen2.5-VL-7B-Instruct-Q8_0.gguf" "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"; do
+      if [[ -f "models/$V_FILE" ]]; then ok "이미 있음: models/$V_FILE"; continue; fi
+      (( FREE_GB > 10 )) || die "디스크 공간 부족: 비전 모델에 여유 10GB 이상 필요 (현재 ${FREE_GB}GB)"
+      echo "  다운로드: $V_REPO/$V_FILE"
+      backend/.venv/bin/hf download "$V_REPO" "$V_FILE" --local-dir models || die "비전 모델 다운로드 실패 — 다시 실행하면 이어받습니다."
+      ok "models/$V_FILE"
+    done ;;
+  no) warn "비전 모델 없음 — 이미지·스캔 PDF 첨부는 분석되지 않습니다 (MD·텍스트 PDF 는 가능). 나중에: ./install.sh --vision yes" ;;
+  *) die "--vision 은 auto|yes|no 중 하나여야 합니다" ;;
+esac
+
+# ---- 5-2. 이미지 생성 (FLUX.1-schnell 4bit · Apache-2.0) ------------------------------------
+# 프로젝트용 그림을 다운로드하지 않고 생성. 생성할 때만 작업 프로세스가 뜨고, 그동안 엔진이 코딩 모델을 잠시 내린다.
+step "이미지 생성 (FLUX.1-schnell)"
+if [[ "$IMAGEGEN" == "auto" ]]; then
+  if [[ "$(uname -m)" == "arm64" ]] && (( MEM_GB >= 32 )); then IMAGEGEN=yes; else IMAGEGEN=no; echo "  메모리 ${MEM_GB}GB / $(uname -m) → 이미지 생성 생략 (--imagegen yes 로 강제 설치)"; fi
+fi
+case "$IMAGEGEN" in
+  yes)
+    [[ "$(uname -m)" == "arm64" ]] || die "이미지 생성(MLX)은 Apple Silicon 맥에서만 동작합니다"
+    if [[ ! -x imagegen/.venv/bin/python ]]; then "$PY" -m venv imagegen/.venv || die "imagegen 가상환경 생성 실패"; fi
+    imagegen/.venv/bin/pip install -q --upgrade pip && imagegen/.venv/bin/pip install -q -r imagegen/requirements.txt || die "이미지 생성 패키지 설치 실패"
+    ok "mflux · rembg 설치"
+    if [[ -d models/flux-schnell-4bit/transformer ]]; then ok "이미 있음: models/flux-schnell-4bit"
+    else
+      (( FREE_GB > 15 )) || die "디스크 공간 부족: 이미지 모델에 여유 15GB 이상 필요 (현재 ${FREE_GB}GB)"
+      echo "  다운로드: dhairyashil/FLUX.1-schnell-mflux-4bit (~9.6GB, Apache-2.0)"
+      backend/.venv/bin/hf download dhairyashil/FLUX.1-schnell-mflux-4bit --local-dir models/flux-schnell-4bit || die "이미지 모델 다운로드 실패 — 다시 실행하면 이어받습니다."
+      ok "models/flux-schnell-4bit"
+    fi
+    # 배경 제거 모델(~180MB)을 미리 받아 첫 사용 때 기다리지 않게
+    imagegen/.venv/bin/python -c "from rembg import new_session; new_session('isnet-general-use')" >/dev/null 2>&1 && ok "배경 제거 모델 준비" || warn "배경 제거 모델을 미리 받지 못함 (첫 사용 때 자동으로 받음)" ;;
+  no) warn "이미지 생성 없음 — IMAGE 도구는 가공(크기·자르기 등)도 쓸 수 없습니다. 나중에: ./install.sh --imagegen yes" ;;
+  *) die "--imagegen 은 auto|yes|no 중 하나여야 합니다" ;;
+esac
 
 # ---- 6. 벡터 DB (Qdrant) ------------------------------------------------------------
 step "벡터 DB (Qdrant)"

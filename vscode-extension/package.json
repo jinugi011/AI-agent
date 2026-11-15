@@ -2,7 +2,7 @@
   "name": "local-coding-agent",
   "displayName": "Yang Coding",
   "description": "Yang Coding — 로컬 코딩 모델(Rust + llama.cpp)로 자연어 채팅을 통해 코딩하는 에이전트",
-  "version": "0.2.2",
+  "version": "0.5.1",
   "publisher": "local",
   "license": "UNLICENSED",
   "private": true,
@@ -66,15 +66,34 @@
       },
       {
         "command": "localAgent.configureRemote",
-        "title": "Yang Coding: 원격 접속 설정 (Tailscale / Cloudflare)"
+        "title": "Yang Coding: 접속 토큰 입력 (원격 접속)",
+        "icon": "$(key)"
       },
       {
         "command": "localAgent.useLocal",
         "title": "Yang Coding: 로컬 모드로 전환"
+      },
+      {
+        "command": "localAgent.changeServer",
+        "title": "Yang Coding: 원격 서버 주소 변경"
+      },
+      {
+        "command": "localAgent.openAdmin",
+        "title": "Yang Coding: 관리 페이지 열기 (토큰 발급·플러그인)"
+      },
+      {
+        "command": "localAgent.openSettings",
+        "title": "Yang Coding: 설정 열기",
+        "icon": "$(gear)"
       }
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "localAgent.configureRemote",
+          "when": "view == localAgent.chat",
+          "group": "navigation@0"
+        },
         {
           "command": "localAgent.showLog",
           "when": "view == localAgent.chat",
@@ -84,6 +103,11 @@
           "command": "localAgent.newChat",
           "when": "view == localAgent.chat",
           "group": "navigation@2"
+        },
+        {
+          "command": "localAgent.openSettings",
+          "when": "view == localAgent.chat",
+          "group": "navigation@3"
         }
       ],
       "editor/context": [
@@ -102,92 +126,152 @@
         "win": "ctrl+shift+l"
       }
     ],
-    "configuration": {
-      "title": "Yang Coding",
-      "properties": {
-        "localAgent.mode": {
-          "type": "string",
-          "enum": [
-            "local",
-            "remote"
-          ],
-          "default": "local",
-          "enumDescriptions": [
-            "이 PC 의 백엔드·엔진 사용",
-            "Cloudflare Tunnel 로 원격 서버(맥)에 접속"
-          ],
-          "description": "접속 방식"
-        },
-        "localAgent.serverUrl": {
-          "type": "string",
-          "default": "",
-          "description": "원격 모드 서버 주소 (예: https://agent.example.com). 토큰은 'Yang Coding: 원격 접속 설정' 명령으로 안전하게 저장"
-        },
-        "localAgent.backendUrl": {
-          "type": "string",
-          "default": "http://127.0.0.1:8010",
-          "description": "FastAPI 백엔드 주소"
-        },
-        "localAgent.engineUrl": {
-          "type": "string",
-          "default": "http://127.0.0.1:18091",
-          "description": "Rust 추론 엔진 주소"
-        },
-        "localAgent.agentRoot": {
-          "type": "string",
-          "default": "",
-          "description": "AI-agent 프로젝트 폴더 (백엔드 자동 실행에 사용)"
-        },
-        "localAgent.autoStartBackend": {
-          "type": "boolean",
-          "default": true,
-          "description": "백엔드가 꺼져 있으면 자동 실행"
-        },
-        "localAgent.approveEdits": {
-          "type": "string",
-          "enum": [
-            "auto",
-            "ask"
-          ],
-          "default": "auto",
-          "description": "파일 수정 승인 방식 (auto 여도 대화별 되돌리기 가능)"
-        },
-        "localAgent.approveCommands": {
-          "type": "string",
-          "enum": [
-            "ask",
-            "auto"
-          ],
-          "default": "ask",
-          "description": "터미널 명령 실행 승인 방식"
-        },
-        "localAgent.maxSteps": {
-          "type": "number",
-          "default": 16,
-          "description": "한 요청에서 도구 호출 최대 반복 수"
-        },
-        "localAgent.maxTokens": {
-          "type": "number",
-          "default": 4096,
-          "description": "응답 1회 최대 토큰"
-        },
-        "localAgent.temperature": {
-          "type": "number",
-          "default": 0.2
-        },
-        "localAgent.showLogOnRequest": {
-          "type": "boolean",
-          "default": true,
-          "description": "요청을 보낼 때 작업 로그 콘솔(출력 패널)을 자동으로 표시"
+    "configuration": [
+      {
+        "title": "Yang Coding: 접속",
+        "order": 1,
+        "properties": {
+          "localAgent.mode": {
+            "type": "string",
+            "enum": [
+              "local",
+              "remote"
+            ],
+            "default": "local",
+            "enumDescriptions": [
+              "이 맥에서 직접 실행 (백엔드·엔진이 이 컴퓨터에 있음)",
+              "다른 PC에서 내 맥(서버)에 접속 (Tailscale 또는 Cloudflare)"
+            ],
+            "markdownDescription": "**접속 방식**\n\n- `local` — 이 맥에서 직접 실행 (백엔드·엔진이 이 컴퓨터에 있음)\n- `remote` — 다른 PC에서 내 맥(서버)에 접속\n\n다른 PC에서는 [🔑 접속 토큰 입력](command:localAgent.configureRemote)만 하면 자동으로 `remote` 로 바뀝니다.",
+            "order": 1
+          },
+          "localAgent.serverUrl": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "**원격 서버 주소.** 비워 두면 설치 파일에 들어 있는 기본 주소를 사용합니다.\n\n예: `http://내맥이름.tailXXXX.ts.net:18010` (Tailscale) 또는 `https://…` (Cloudflare)\n\n- 접속 토큰은 보안을 위해 이 화면이 아닌 **VS Code 비밀 저장소**에 저장됩니다 → [🔑 접속 토큰 입력](command:localAgent.configureRemote)\n- 토큰 발급: [관리 페이지 열기](command:localAgent.openAdmin) → 접속 토큰\n- 주소 바꾸기: [서버 주소 변경](command:localAgent.changeServer)",
+            "order": 2
+          }
+        }
+      },
+      {
+        "title": "Yang Coding: 이 맥에서 실행 (local)",
+        "order": 2,
+        "properties": {
+          "localAgent.agentRoot": {
+            "type": "string",
+            "default": "",
+            "markdownDescription": "**AI-agent 프로젝트 폴더** (예: `~/AI-agent`). 백엔드를 자동 실행할 때 사용합니다. `remote` 모드에서는 쓰지 않습니다.",
+            "order": 10
+          },
+          "localAgent.autoStartBackend": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "채팅을 열 때 **백엔드가 꺼져 있으면 자동으로 실행**합니다 (`local` 모드에서만).",
+            "order": 11
+          },
+          "localAgent.backendUrl": {
+            "type": "string",
+            "default": "http://127.0.0.1:8010",
+            "markdownDescription": "FastAPI **백엔드 주소**. 기본 `http://127.0.0.1:8010`",
+            "order": 12
+          },
+          "localAgent.engineUrl": {
+            "type": "string",
+            "default": "http://127.0.0.1:18091",
+            "markdownDescription": "Rust **추론 엔진(llama.cpp) 주소**. 기본 `http://127.0.0.1:18091`",
+            "order": 13
+          }
+        }
+      },
+      {
+        "title": "Yang Coding: 에이전트 동작",
+        "order": 3,
+        "properties": {
+          "localAgent.approveEdits": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "ask"
+            ],
+            "default": "auto",
+            "markdownDescription": "**파일 수정 승인 방식**",
+            "order": 20,
+            "enumDescriptions": [
+              "바로 수정 (대화별 되돌리기 가능)",
+              "수정할 때마다 차이(diff)를 보여 주고 승인 받기"
+            ]
+          },
+          "localAgent.approveCommands": {
+            "type": "string",
+            "enum": [
+              "ask",
+              "auto"
+            ],
+            "default": "ask",
+            "markdownDescription": "**터미널 명령 실행 승인 방식**",
+            "order": 21,
+            "enumDescriptions": [
+              "명령마다 승인 받기 (권장)",
+              "승인 없이 바로 실행"
+            ]
+          },
+          "localAgent.maxSteps": {
+            "type": "number",
+            "default": 16,
+            "markdownDescription": "요청 한 번에 파일 읽기·수정·실행 같은 **도구를 최대 몇 번까지** 쓸지 (1~100, 기본 16). 크면 큰 작업도 끝까지 하지만 오래 걸립니다.",
+            "order": 22,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "localAgent.showLogOnRequest": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "요청을 보낼 때 **작업 로그 콘솔**(출력 패널)을 자동으로 표시합니다.",
+            "order": 23
+          },
+          "localAgent.autoCheck": {
+            "type": "boolean",
+            "default": true,
+            "order": 24,
+            "markdownDescription": "**파일을 고칠 때마다 자동 검사** (IDE 오류 + 문법·타입 검사 + 이미지·사운드 경로 확인). 결과를 에이전트에게 바로 돌려줘 오류를 스스로 고치게 합니다. 고정된 분석 명령만 실행하므로 승인을 묻지 않습니다."
+          },
+          "localAgent.verifyBeforeFinish": {
+            "type": "boolean",
+            "default": true,
+            "order": 25,
+            "markdownDescription": "**끝내기 전에 실행으로 확인**하도록 한 번 요청합니다 (코드를 바꿨는데 RUN/PLAY 를 안 했을 때). 남은 오류·임시 디버그 로그(YANG-DEBUG)는 이 설정과 관계없이 확인합니다."
+          }
+        }
+      },
+      {
+        "title": "Yang Coding: 생성 옵션",
+        "order": 4,
+        "properties": {
+          "localAgent.maxTokens": {
+            "type": "number",
+            "default": 4096,
+            "markdownDescription": "모델이 한 번에 쓰는 **최대 길이** (256~32768, 기본 4096). 긴 파일을 한 번에 쓰려면 늘리세요.",
+            "order": 30,
+            "minimum": 256,
+            "maximum": 32768
+          },
+          "localAgent.temperature": {
+            "type": "number",
+            "default": 0.2,
+            "markdownDescription": "**온도** (0.0~1.0, 기본 0.2). 낮을수록 일관된 코드, 높을수록 다양한 답.",
+            "order": 31,
+            "minimum": 0,
+            "maximum": 1
+          }
         }
       }
-    }
+    ]
   },
   "scripts": {
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
     "test": "npm run compile && node --test out/test/*.test.js",
-    "package": "npm run compile && vsce package --no-dependencies --allow-missing-repository"
+    "package": "npm run compile && node scripts/write-server.js && vsce package --no-dependencies --allow-missing-repository"
   },
   "devDependencies": {
     "@types/node": "^20.17.0",

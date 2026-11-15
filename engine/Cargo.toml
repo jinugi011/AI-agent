@@ -5,12 +5,14 @@ edition = "2021"
 description = "Local LLM inference engine (llama.cpp via Rust FFI) for the AI coding agent"
 
 [dependencies]
-llama-cpp-2 = { version = "=0.1.160", features = ["metal"] }
+llama-cpp-2 = { version = "=0.1.160", features = ["metal", "mtmd"] }
+llama-cpp-sys-2 = "=0.1.161"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tiny_http = "0.12"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

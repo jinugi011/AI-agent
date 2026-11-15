@@ -1,0 +1,6 @@
+# 이미지 생성 작업 프로세스 (imagegen/worker.py) 전용 — 백엔드와 별도 가상환경
+mflux==0.24.0
+mlx==0.32.4
+rembg[cpu]==2.0.87
+onnxruntime==1.32.0
+pillow==13.0.0
