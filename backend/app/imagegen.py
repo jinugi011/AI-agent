@@ -184,6 +184,31 @@ def _gen_size(w: int, h: int) -> Tuple[int, int]:
 HANGUL = re.compile(r"[가-힣]")
 
 
+def translate(text: str) -> str:
+    from . import llm_client
+
+    try:
+        res = llm_client.chat([
+            {"role": "system", "content": "Translate the user's image description into one concise English prompt for an image generation model. "
+                                          "Keep every visual detail (subject, style, colors, view, background). Output only the English prompt."},
+            {"role": "user", "content": text}], max_tokens=200, temperature=0.1)
+    except llm_client.LLMError as exc:
+        raise ImageGenError(f"한글 설명을 영어로 바꾸지 못했습니다 (코딩 엔진 확인): {exc}") from exc
+    out = res.text.strip().strip('"').splitlines()[0].strip() if res.text.strip() else ""
+    if not out or HANGUL.search(out):
+        raise ImageGenError("한글 설명을 영어로 바꾸지 못했습니다. 영어로 입력해 주세요.")
+    return out
+
+
+def remove_bg_image(img):
+    """배경 제거(rembg)만 작업 프로세스에서 (FLUX 는 로드하지 않음)"""
+    from . import imageops
+
+    ensure_worker()
+    res = _worker("/process", {"image": imageops.to_b64(img), "ops": [{"op": "remove_bg"}]}, timeout=300)
+    return imageops.load(res["images"][0])
+
+
 def generate(req: Dict) -> Dict:
     """IMAGE 도구 한 번: 생성(또는 기존 이미지 가공) → 가공 → 결과 이미지(들)"""
     timings: Dict[str, float] = {}
@@ -194,6 +219,8 @@ def generate(req: Dict) -> Dict:
     joins = req.get("join") or []
     if not prompt and not source and not joins:
         raise ImageGenError("prompt(생성) 또는 from/join(가공할 이미지)이 필요합니다")
+    if HANGUL.search(prompt) and req.get("translate"):
+        prompt = translate(prompt)  # 웹 스튜디오: 한글 입력 → 영어 (코딩 모델을 내리기 전에)
     if HANGUL.search(prompt):
         raise ImageGenError("prompt 는 영어로 써야 합니다 (이미지 모델이 영어만 잘 이해함). 같은 내용을 영어로 바꿔 IMAGE 를 다시 호출하세요.")
     ops = parse_ops(req.get("ops") or "")
@@ -262,10 +289,7 @@ def generate(req: Dict) -> Dict:
     sizes: List[List[int]] = []
     if pipeline:
         if not prompt:
-            engine_sleep_needed = any(o["op"] == "remove_bg" for o in pipeline)
-            if engine_sleep_needed:
-                engine_sleep()
-            ensure_worker()
+            ensure_worker()  # 가공만: 배경 제거 모델(rembg)은 작아서 코딩 모델을 내릴 필요 없음
         t = time.time()
         res = _worker("/process", {"image": images[0] if images else None, "ops": pipeline})
         timings["process"] = round(time.time() - t, 1)

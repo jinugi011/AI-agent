@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import AgentWorkbench from './AgentWorkbench';
 import TokenManager from './TokenManager';
 import Downloads from './Downloads';
+import ImageStudio from './ImageStudio';
 
 // 같은 주소(origin)로 API 호출: 백엔드가 이 페이지를 직접 서비스하므로 localhost·Tailscale 주소 어디서 열어도 동작
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
@@ -17,6 +18,7 @@ const promptTemplates = [
 
 const menuItems = [
   { id: 'agent', label: 'Yang Coding' },
+  { id: 'images', label: '이미지 스튜디오' },
   { id: 'tokens', label: '접속 토큰' },
   { id: 'downloads', label: '플러그인' },
   { id: 'overview', label: 'Overview' },
@@ -535,6 +537,7 @@ function App() {
         </div>
 
         {selectedView === 'agent' && <AgentWorkbench apiBase={API_BASE_URL} />}
+        {selectedView === 'images' && <ImageStudio apiBase={API_BASE_URL} />}
         {selectedView === 'tokens' && <TokenManager apiBase={API_BASE_URL} />}
         {selectedView === 'downloads' && <Downloads apiBase={API_BASE_URL} onOpenTokens={() => setSelectedView('tokens')} />}
         {selectedView === 'overview' && renderOverview()}

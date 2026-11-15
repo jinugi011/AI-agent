@@ -474,6 +474,21 @@ IMAGE>>>
 - 저장된 그림은 채팅에 미리보기로 표시되고 `/undo` 로 되돌릴 수 있습니다
 - 설치: `./install.sh --imagegen yes` (Apple Silicon · 메모리 32GB 이상이면 기본 설치, 모델 ~9.6GB, 가상환경 `imagegen/.venv`)
 
+## 4.7-3-1 이미지 스튜디오 (웹 관리 페이지 → 이미지 스튜디오)
+브라우저로 관리 페이지(`http://127.0.0.1:8010/` 또는 Tailscale 주소)를 열고 **이미지 스튜디오** 메뉴.
+- **올리기**: 끌어다 놓기 · 올리기 버튼 · 붙여넣기(⌘V), 여러 장 가능
+- **나누기**
+  - 자동: 한 장에 여러 그림이 들어 있는 이미지 → 배경(투명 또는 가장자리 색)으로 떨어진 그림마다 잘라 낱장으로. 병합 간격(눈·그림자 같이 떨어진 조각 합치기)·최소 크기·여백·배경 허용 오차·단색 배경 투명 처리. 바깥 배경만 투명해지고 그림 안의 같은 색(흰 눈 등)은 남음
+  - 격자: 가로×세로 칸 (빈 칸 건너뛰기 · 칸마다 여백 정리) — 스프라이트 시트·타일셋
+- **가공** (단계마다 ↶ 되돌리기 · ↷ 다시하기)
+  - 드래그로 영역 선택 → 이 영역만 남기기 / 새 이미지로 복사
+  - 버튼: 배경 제거(AI) · 여백 정리 · 정사각형 · 좌우/상하 반전 · 회전 · 흑백 · 색 반전 · 2배(픽셀) · ½ 축소
+  - 설정: 크기(비율 유지/꽉 채움/늘림/픽셀 그대로) · 픽셀아트(칸·색 수) · 색조 · 밝기/대비/채도 · 외곽선 · 바깥쪽 특정 색 투명하게
+  - **말로 가공**: "배경 지우고 48칸 픽셀아트로 만든 다음 96x96 으로 키우고, 검은 외곽선 1px, 좌우 반전" → 코딩 모델이 가공 단계로 바꿔 적용 (적용한 단계를 화면에 표시)
+- **AI 생성**: 한글 설명 가능(영어로 자동 번역) · 크기 프리셋 · 투명 배경 · 픽셀아트 · 무료 참고 이미지 검색 · 1~4장
+- **내려받기**: 선택한 이미지 PNG · 체크한 이미지 ZIP (이름은 목록에서 바로 수정)
+- 배경 제거만 AI(rembg)를 쓰고 나머지 가공은 즉시 처리됩니다. 2026-11-15 확인: 그림 5개가 흩어진 900×520 시트 → 5장으로 정확히 분리, 화면 자동 조작 테스트에서 오류 없음
+
 ## 4.7-4 속도와 메모리 (36GB 맥에서 큰 모델 3개 운영)
 | 모델 | 크기 | 언제 메모리에 |
 |---|---|---|
@@ -732,6 +747,9 @@ scripts/tunnel.sh status                      # 외부 주소로 실제 접속·
 | POST | `/api/vision/inspect` | `{image, expect}` 실행 화면 점검 (PLAY) |
 | POST | `/api/images/generate` | IMAGE 도구: 생성·참고 스타일·가공 → `{images, sizes, credits, prompt_used, timings}` |
 | GET | `/api/images/search?q=`, `/api/images/status` | 무료(CC0·PD) 참고 이미지 검색 · 생성 환경 상태 |
+| POST | `/api/images/split` | 이미지 스튜디오 나누기 `{image, mode:auto|grid, cols, rows, gap, min_size, padding, tolerance, transparent}` |
+| POST | `/api/images/edit` | 가공 `{image, ops:[{op,…}] 또는 instruction:"말로"}` → `{image, size, ops}` |
+| POST | `/api/images/zip` | `{files:[{name,data}]}` → images.zip |
 
 Rust 엔진: `GET /health`(코딩 모델 + `vision` 상태), `POST /generate` `{messages, max_tokens, temperature, top_p, grammar, stop, seed, stream}`,
 `POST /vision` `{image(base64), prompt, max_tokens}` 이미지 분석, `POST /vision/unload` `{if_idle_seconds}` 비전 모델 해제,

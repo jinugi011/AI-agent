@@ -19,7 +19,7 @@ from .preferences import PreferenceStore
 from .profiles import PROFILES, get_profile
 from .repo_manager import RepoManager
 from .vector_store import CodeVectorStore
-from . import attachments, imagegen, remote, security
+from . import attachments, imagegen, imageops, remote, security
 
 app = FastAPI(title="Yang Coding", version="1.0.0")
 app.add_middleware(
@@ -270,6 +270,7 @@ class ImageRequest(BaseModel):
     pixel: int = 0
     colors: int = 24
     ops: str = ""
+    translate: bool = False       # 한글 prompt 를 영어로 바꿔서 생성 (웹 스튜디오)
 
 
 @app.get("/api/images/status")
@@ -285,6 +286,118 @@ def images_generate(request: ImageRequest):
         raise HTTPException(status_code=422, detail=str(exc))
     except attachments.AttachmentError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+# ---- 이미지 스튜디오 (웹): 나누기 · 가공 · 말로 가공 · ZIP --------------------------------------
+class SplitRequest(BaseModel):
+    image: str
+    mode: str = "auto"         # auto | grid
+    cols: int = 4
+    rows: int = 4
+    gap: int = 6               # auto: 이 거리(px) 안의 조각은 하나로
+    min_size: int = 8          # auto: 이보다 작은 조각은 버림
+    padding: int = 2
+    tolerance: int = 24        # 배경색과의 차이 허용치
+    transparent: bool = True   # 단색 배경을 투명하게
+    skip_empty: bool = True    # grid: 빈 칸 건너뛰기
+    trim_cells: bool = False   # grid: 칸마다 여백 정리
+
+
+@app.post("/api/images/split")
+def images_split(request: SplitRequest):
+    try:
+        img = imageops.load(request.image)
+        if request.mode == "grid":
+            return {"success": True, **imageops.split_grid(img, request.cols, request.rows, request.skip_empty, request.tolerance, request.trim_cells)}
+        return {"success": True, **imageops.split_auto(img, request.gap, request.min_size, request.padding, request.tolerance, request.transparent)}
+    except imageops.ImageOpError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+class EditRequest(BaseModel):
+    image: str
+    ops: List[Dict] = []
+    instruction: str = ""      # 자연어 ("배경 지우고 64px 픽셀아트로, 좌우 반전")
+
+
+_EDIT_SYSTEM = ("You convert an image-editing request (often Korean) into a JSON array of operations, applied in order. "
+                "Available operations (JSON objects with an 'op' key): " + imageops.OPS_HELP + ". "
+                "Use remove_bg for background removal (then usually trim). For 'NNpx pixel art' use pixelate{cells:NN} then resize to the "
+                "requested display size with mode nearest if asked. Colors are #rrggbb. Output ONLY the JSON array, no explanation. "
+                'Example: [{"op":"remove_bg"},{"op":"trim"},{"op":"pixelate","cells":32},{"op":"resize","w":64,"h":64,"mode":"nearest"},'
+                '{"op":"flip","axis":"x"}]')
+
+
+def _coerce_op(o) -> Optional[Dict]:
+    """모델이 JSON 대신 약식('pixelate{cells:48}', 'flip{axis=x}', 'remove_bg')으로 답해도 받아들인다."""
+    import re as _re
+
+    if isinstance(o, dict):
+        return o if o.get("op") else None
+    if not isinstance(o, str):
+        return None
+    m = _re.fullmatch(r"\s*([a-z_]+)\s*(?:\{(.*)\})?\s*", o)
+    if not m:
+        return None
+    op: Dict = {"op": m.group(1)}
+    for part in filter(None, (m.group(2) or "").split(",")):
+        if not _re.search(r"[:=]", part):
+            continue
+        k, v = _re.split(r"[:=]", part, maxsplit=1)
+        v = v.strip().strip("'\"")
+        try:
+            op[k.strip()] = float(v) if "." in v else int(v)
+        except ValueError:
+            op[k.strip()] = v
+    return op
+
+
+def _ops_from_instruction(text: str, size) -> List[Dict]:
+    try:
+        res = llm_client.chat([{"role": "system", "content": _EDIT_SYSTEM},
+                               {"role": "user", "content": f"Image size: {size[0]}x{size[1]}. Request: {text}"}], max_tokens=300, temperature=0)
+    except llm_client.LLMError as exc:
+        raise HTTPException(status_code=503, detail=f"말로 가공하려면 코딩 엔진이 필요합니다: {exc}")
+    ops = llm_client.extract_json(res.text)
+    if isinstance(ops, dict):
+        ops = ops.get("ops") or [ops]
+    ops = [_coerce_op(o) for o in ops] if isinstance(ops, list) else None
+    if not ops or not all(ops):
+        raise HTTPException(status_code=422, detail=f"가공 지시를 이해하지 못했습니다: {res.text[:200]}")
+    return ops
+
+
+@app.post("/api/images/edit")
+def images_edit(request: EditRequest):
+    try:
+        img = imageops.load(request.image)
+        ops = _ops_from_instruction(request.instruction, img.size) if request.instruction.strip() else request.ops
+        if not ops:
+            raise HTTPException(status_code=400, detail="가공할 내용이 없습니다")
+        for op in ops[:20]:
+            img = imageops.apply_op(img, op, remove_bg=imagegen.remove_bg_image)
+        return {"success": True, "image": imageops.to_b64(img), "size": list(img.size), "ops": ops}
+    except (imageops.ImageOpError, imagegen.ImageGenError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+class ZipEntry(BaseModel):
+    name: str = ""
+    data: str
+
+
+class ZipRequest(BaseModel):
+    files: List[ZipEntry]
+
+
+@app.post("/api/images/zip")
+def images_zip(request: ZipRequest):
+    from fastapi.responses import Response
+
+    if not request.files:
+        raise HTTPException(status_code=400, detail="파일이 없습니다")
+    data = imageops.make_zip([f.model_dump() for f in request.files[:500]])
+    return Response(data, media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="images.zip"'})
 
 
 @app.get("/api/images/search")
