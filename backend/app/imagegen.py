@@ -28,7 +28,20 @@ WORKER_PORT = 18093
 WORKER_URL = f"http://127.0.0.1:{WORKER_PORT}"
 PYTHON = ROOT / "imagegen" / ".venv" / "bin" / "python"
 WORKER = ROOT / "imagegen" / "worker.py"
-MODEL_DIR = ROOT / "models" / "flux-schnell-4bit"
+MODEL_DIRS = {"zimage": ROOT / "models" / "z-image-turbo-q4", "flux": ROOT / "models" / "flux-schnell-4bit"}
+
+
+def family() -> str:
+    """기본: Z-Image-Turbo (지시를 더 잘 따름, 비교 시험 결과). 없으면 FLUX.1-schnell. IMAGEGEN_FAMILY 로 고정 가능."""
+    import os
+
+    want = os.getenv("IMAGEGEN_FAMILY", "")
+    if want in MODEL_DIRS and (MODEL_DIRS[want] / "transformer").exists():
+        return want
+    return "zimage" if (MODEL_DIRS["zimage"] / "transformer").exists() else "flux"
+
+
+MODEL_DIR = MODEL_DIRS["flux"]
 LOG = Path(settings.state_dir) / "imagegen.log"
 OPENVERSE = "https://api.openverse.org/v1/images/"
 USER_AGENT = "YangCoding-ImageRef/1.0"
@@ -39,8 +52,11 @@ class ImageGenError(ValueError):
 
 
 def available() -> Dict:
-    return {"python": PYTHON.exists(), "worker": WORKER.exists(), "model": (MODEL_DIR / "transformer").exists(),
-            "ready": PYTHON.exists() and WORKER.exists() and (MODEL_DIR / "transformer").exists()}
+    fam = family()
+    has = (MODEL_DIRS[fam] / "transformer").exists()
+    return {"python": PYTHON.exists(), "worker": WORKER.exists(), "model": has, "family": fam,
+            "models": {k: (v / "transformer").exists() for k, v in MODEL_DIRS.items()},
+            "ready": PYTHON.exists() and WORKER.exists() and has}
 
 
 # ---- 작업 프로세스 ------------------------------------------------------------------------
@@ -60,15 +76,23 @@ def _worker(path: str, body: dict, timeout: float = 900) -> dict:
 
 
 def ensure_worker() -> None:
-    if _get(f"{WORKER_URL}/health"):
+    h = _get(f"{WORKER_URL}/health")
+    if h and h.get("family", "flux") == family():
         return
+    if h:  # 다른 모델로 떠 있으면 끄고 다시
+        try:
+            _post_json(f"{WORKER_URL}/shutdown", {}, timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(1.5)
     st = available()
     if not st["ready"]:
         raise ImageGenError("이미지 생성 환경이 없습니다. 맥에서 ./install.sh --imagegen yes 를 실행하세요 "
                             f"(python={st['python']}, model={st['model']})")
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG, "ab") as log:
-        subprocess.Popen([str(PYTHON), str(WORKER), "--model", str(MODEL_DIR), "--port", str(WORKER_PORT), "--idle", "180",
+        fam = family()
+        subprocess.Popen([str(PYTHON), str(WORKER), "--model", str(MODEL_DIRS[fam]), "--family", fam, "--port", str(WORKER_PORT), "--idle", "180",
                           "--tmp", str(Path(settings.state_dir))],
                          stdout=log, stderr=log, start_new_session=True, env={"PATH": "/usr/bin:/bin", "TQDM_DISABLE": "1",
                                                                                "HOME": str(Path.home())})
@@ -224,6 +248,19 @@ def generate(req: Dict) -> Dict:
     if HANGUL.search(prompt):
         raise ImageGenError("prompt 는 영어로 써야 합니다 (이미지 모델이 영어만 잘 이해함). 같은 내용을 영어로 바꿔 IMAGE 를 다시 호출하세요.")
     ops = parse_ops(req.get("ops") or "")
+    from . import artstyle
+
+    project = (req.get("project") or "").strip()
+    kind = (req.get("kind") or "").strip().lower()
+    bible = artstyle.get(project) if project and req.get("use_art", True) else None
+    if prompt and not (width and height):
+        size = artstyle.default_size(kind, bible)
+        if size:
+            width, height = (int(x) for x in size.split("x"))
+    transparent = req.get("transparent")
+    if transparent is None:
+        transparent = kind in artstyle.TRANSPARENT_KINDS
+    pixel_style = bool(bible and "pixel" in (bible.get("style") or "").lower())
     credits: List[Dict] = []
     style = ""
     used_prompt = ""
@@ -253,11 +290,12 @@ def generate(req: Dict) -> Dict:
         timings["style"] = round(time.time() - t, 1)
 
     images: List[str] = []
+    verify_info = None
     if prompt:
-        parts = [prompt]
+        parts = [artstyle.compose(prompt, kind, bible)]
         if style:
-            parts.append(f"in this style: {style}")
-        if req.get("transparent"):
+            parts.append(f"reference style: {style}")
+        if transparent:
             parts.append("single subject, centered, full view, isolated on a plain solid white background, no shadow, no text")
         used_prompt = ", ".join(parts)
         gw, gh = _gen_size(width or 1024, height or 1024)
@@ -268,22 +306,46 @@ def generate(req: Dict) -> Dict:
         ensure_worker()
         timings["worker"] = round(time.time() - t, 1)
         t = time.time()
-        res = _worker("/generate", {"prompt": used_prompt, "width": gw, "height": gh, "steps": int(req.get("steps") or 4),
-                                    "seed": req.get("seed"), "init_image": init, "strength": strength or (0.55 if source else 0)})
+        gen_body = {"prompt": used_prompt, "width": gw, "height": gh, "steps": req.get("steps") or None,
+                    "seed": req.get("seed"), "init_image": init, "strength": strength or (0.55 if source else 0)}
+        res = _worker("/generate", gen_body)
         timings["generate"] = round(time.time() - t, 1)
         images = [res["image"]]
+        # 자기 검사: 비전 모델이 요청·아트 컨셉과 대조 → 낮으면 문제점을 반영해 한 번 더 그려 더 나은 쪽을 쓴다
+        if req.get("verify", True):
+            t = time.time()
+            try:
+                check = artstyle.verify(base64.b64decode(images[0]), prompt, kind, bible)
+                verify_log = [check]
+                if check["score"] < float(req.get("min_score") or 7):
+                    retry = dict(gen_body, seed=(res.get("seed") or 0) + 1,
+                                 prompt=used_prompt + (f", must fix: {check['problems']}" if check["problems"] else ""))
+                    res2 = _worker("/generate", retry)
+                    check2 = artstyle.verify(base64.b64decode(res2["image"]), prompt, kind, bible)
+                    verify_log.append(check2)
+                    if check2["score"] >= check["score"]:
+                        images, used_prompt = [res2["image"]], retry["prompt"]
+                timings["verify"] = round(time.time() - t, 1)
+                verify_info = {"scores": [v["score"] for v in verify_log], "problems": verify_log[-1]["problems"]}
+            except Exception as exc:  # noqa: BLE001 — 검사 실패해도 그림은 돌려준다
+                verify_info = {"error": str(exc)[:200]}
+        else:
+            verify_info = None
     else:
         images = [source] if source else []
 
     # 2) 가공: 배경 제거 → 픽셀아트 → 사용자 지시 → 최종 크기
     pipeline: List[Dict] = []
-    if req.get("transparent"):
+    if transparent:
         pipeline += [{"op": "remove_bg"}, {"op": "trim"}, {"op": "pad_square"} if width == height and width else {"op": "trim"}]
     if req.get("pixel"):
         pipeline.append({"op": "pixelate", "cells": int(req["pixel"]), "colors": int(req.get("colors") or 24)})
+    elif prompt and pixel_style and width and width <= 128:
+        # 아트 컨셉이 픽셀아트면 목표 크기의 칸 수로 깔끔하게 (최근접 축소보다 덜 깨짐)
+        pipeline.append({"op": "pixelate", "cells": width, "colors": int(req.get("colors") or 32)})
     pipeline += ops
     if width and height and not any(o["op"] in ("resize", "sheet_split") for o in ops):
-        pipeline.append({"op": "resize", "w": width, "h": height, "mode": "nearest" if req.get("pixel") else "fit"})
+        pipeline.append({"op": "resize", "w": width, "h": height, "mode": "nearest" if (req.get("pixel") or pixel_style) else "fit"})
     if joins:
         pipeline.insert(0, {"op": "sheet_join", "images": joins, "cols": int(req.get("cols") or len(joins) + len(images))})
     sizes: List[List[int]] = []
@@ -298,4 +360,5 @@ def generate(req: Dict) -> Dict:
         from PIL import Image
         sizes = [list(Image.open(io.BytesIO(base64.b64decode(images[0]))).size)]
     timings["total"] = round(time.time() - t0, 1)
-    return {"images": images, "sizes": sizes, "credits": credits, "prompt_used": used_prompt, "style": style, "timings": timings}
+    return {"images": images, "sizes": sizes, "credits": credits, "prompt_used": used_prompt, "style": style, "timings": timings,
+            "verify": verify_info, "kind": kind, "art": bool(bible), "model": family()}

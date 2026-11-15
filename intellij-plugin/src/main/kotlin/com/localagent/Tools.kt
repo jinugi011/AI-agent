@@ -24,7 +24,7 @@ private val EXCLUDED_DIRS = setOf(
     "node_modules", ".git", "dist", "build", "target", ".venv", "venv", "__pycache__", ".next",
     "Pods", ".dart_tool", ".gradle", "models", "out", ".idea",
 )
-private const val MAX_READ = 60_000
+private const val MAX_READ = 24_000 // 큰 파일 하나가 대화 예산을 다 쓰지 않게
 private const val MAX_OUT = 8_000
 
 /** 도구 실행 환경 (세션이 제공). */
@@ -44,6 +44,7 @@ interface ToolHost {
 class Checkpoint {
     val originals = LinkedHashMap<String, String?>() // 절대경로 → 원본(null = 새 파일)
     val binaries = HashMap<String, ByteArray>()       // 이미지 등 바이너리 원본
+    val moves = mutableListOf<Pair<String, String>>() // 이동 기록 (원래 → 새), 되돌릴 때 역순
 
     fun record(path: Path, before: String?) {
         originals.putIfAbsent(path.toString(), before)
@@ -57,7 +58,9 @@ class Checkpoint {
     }
 
     fun revert(project: Project): Int {
-        val n = originals.size
+        val n = originals.size + moves.size
+        for ((from, to) in moves.reversed()) try { FileOps.move(project, Path.of(to), Path.of(from)) } catch (e: Exception) { }
+        moves.clear()
         for ((p, before) in originals) {
             when {
                 before == null -> FileOps.delete(project, Path.of(p))
@@ -92,6 +95,26 @@ object FileOps {
     }
 
     /** IntelliJ 문서 편집으로 기록 → 에디터에서 Cmd+Z 로 되돌릴 수 있다. */
+    /** IDE 파일 시스템으로 이동/이름 바꾸기 (에디터·인덱스가 따라감) */
+    fun move(project: Project, from: Path, to: Path) {
+        ApplicationManager.getApplication().invokeAndWait {
+            WriteCommandAction.runWriteCommandAction(project, "Yang Coding 이동", "local-agent", {
+                val vf = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(from) ?: throw IllegalStateException("파일이 없습니다: $from")
+                val parent = VfsUtil.createDirectoryIfMissing(to.parent.toString()) ?: throw IllegalStateException("폴더를 만들 수 없습니다: ${to.parent}")
+                if (vf.parent != parent) vf.move(this, parent)
+                if (vf.name != to.fileName.toString()) vf.rename(this, to.fileName.toString())
+            })
+        }
+    }
+
+    fun mkdirs(project: Project, path: Path) {
+        ApplicationManager.getApplication().invokeAndWait {
+            WriteCommandAction.runWriteCommandAction(project, "Yang Coding 폴더", "local-agent", {
+                VfsUtil.createDirectoryIfMissing(path.toString()) ?: throw IllegalStateException("폴더를 만들 수 없습니다: $path")
+            })
+        }
+    }
+
     fun writeBytes(project: Project, path: Path, bytes: ByteArray) {
         ApplicationManager.getApplication().invokeAndWait {
             WriteCommandAction.runWriteCommandAction(project, "Yang Coding 이미지", "local-agent", {
@@ -146,6 +169,15 @@ object FileOps {
 
 private fun truncate(s: String, max: Int = MAX_OUT) =
     if (s.length <= max) s else s.take(max / 2) + "\n…(${s.length - max}자 생략)…\n" + s.takeLast(max / 2)
+
+/** 운영체제에 맞는 셸: Windows → PowerShell(UTF-8 출력), macOS/Linux → 로그인 셸 */
+object Shell {
+    val isWindows = System.getProperty("os.name").lowercase().contains("win")
+    fun command(cmd: String): List<String> = if (isWindows)
+        listOf("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \$OutputEncoding=[System.Text.Encoding]::UTF8; $cmd")
+    else listOf(if (File("/bin/zsh").exists()) "/bin/zsh" else System.getenv("SHELL") ?: "/bin/bash", "-lc", cmd)
+}
 
 /** 셸 명령 실행 (취소 시 프로세스 종료). */
 fun runProcess(cmd: List<String>, cwd: Path, host: ToolHost, timeoutSec: Long = 300): Pair<Int, String> {
@@ -212,7 +244,7 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
                     stream.filter { p -> p.relativeTo(host.root).none { it.name in EXCLUDED_DIRS } && !p.isDirectory() }
                         .map { it.relativeTo(host.root) }
                         .filter { rel -> patterns.any { it.matches(rel) } }
-                        .limit(400).map { it.toString() }.sorted().toList()
+                        .limit(400).map { it.toString().replace('\\', '/') }.sorted().toList()
                 }
                 emit("List ${call.pattern}", "done", "${files.size}개")
                 "[LIST ${call.pattern}] ${files.size}개\n${files.joinToString("\n")}"
@@ -220,16 +252,12 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
 
             is ToolCall.Grep -> {
                 emit("Grep ${call.pattern}", "running")
-                var (code, out) = runProcess(listOf("git", "grep", "-n", "-I", "-E", call.pattern), host.root, host, 30)
-                if (code > 1) {
-                    val excludes = EXCLUDED_DIRS.map { "--exclude-dir=$it" }
-                    val r = runProcess(listOf("grep", "-rnIE") + excludes + listOf(call.pattern, "."), host.root, host, 30)
-                    code = r.first; out = r.second
-                }
-                val lines = out.lines().filter { it.isNotBlank() }
+                val lines = grepFiles(host.root, call.pattern) { host.isCancelled() }
                 emit("Grep ${call.pattern}", "done", "${lines.size}건")
-                "[GREP ${call.pattern}] ${lines.size}건\n${truncate(lines.take(200).joinToString("\n"))}"
+                "[GREP ${call.pattern}] ${lines.size}건${if (lines.size >= 200) " (200건까지만)" else ""}\n${truncate(lines.joinToString("\n"))}"
             }
+
+            is ToolCall.Delete, is ToolCall.Move, is ToolCall.Mkdir -> fileOp(call, host) { t, st, d -> emit(t, st, d) }
 
             is ToolCall.Search -> {
                 val res = Clients.post("/api/style/search", mapOf("query" to call.query, "top_k" to 6, "project" to host.repoName.ifBlank { null }))
@@ -282,7 +310,7 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
                     return "[RUN ${call.command}] 사용자가 실행을 거부했습니다. 다른 방법을 제안하거나 이유를 물어보세요."
                 }
                 emit(title, "running")
-                val (code, out) = runProcess(listOf("/bin/zsh", "-lc", call.command), host.root, host)
+                val (code, out) = runProcess(Shell.command(call.command), host.root, host)
                 val t = truncate(out.trim())
                 emit(title, if (code == 0) "done" else "error", "exit $code\n${t.takeLast(3000)}")
                 "[RUN ${call.command}] exit code $code\n$t"
@@ -400,10 +428,17 @@ private fun runImage(call: ToolCall.Image, host: ToolHost, emit: (String, String
     val f = call.fields
     val title = "Image: ${call.path}${f["size"]?.let { " ($it)" } ?: ""}"
     if (!Regex("""\.(png|webp)$""", RegexOption.IGNORE_CASE).containsMatchIn(call.path)) return "[IMAGE ${call.path}] 오류: 저장 경로는 .png (또는 .webp) 여야 합니다"
+    // 이미 있는 그림은 다시 만들지 않는다 (요청마다 같은 그림 세트를 또 만드는 것 방지)
+    val overwrite = Regex("^(yes|true|y|1|예|네)$", RegexOption.IGNORE_CASE).matches(f["overwrite"]?.trim() ?: "")
+    if (f["prompt"] != null && f["from"] == null && !overwrite && Files.exists(FileOps.resolveInRoot(host.root, call.path))) {
+        emit(title, "done", "이미 있음 → 다시 만들지 않음", null)
+        return "[IMAGE ${call.path}] 이미 있어서 다시 만들지 않았습니다. 그대로 쓰세요 (꼭 새로 그려야 하면 overwrite: yes)."
+    }
     if (!host.approve("edit", title, f["prompt"]?.let { "생성: $it" } ?: "가공: ${f["ops"] ?: ""}")) {
         emit(title, "denied", null, null)
         return "[IMAGE ${call.path}] 사용자가 거부했습니다"
     }
+    if (f["prompt"] != null) Art.ensure(host.root) { emit(title, "running", it, null) } // 프로젝트 아트 컨셉이 없으면 먼저 분석
     emit(title, "running", if (f["prompt"] != null) "이미지 생성 중 (15~40초)…" else "이미지 가공 중…", null)
     val size = Regex("""^(\d+)\s*[x×*]\s*(\d+)$""", RegexOption.IGNORE_CASE).find(f["size"]?.trim() ?: "")
     fun yes(v: String?) = Regex("^(yes|true|y|1|예|네)$", RegexOption.IGNORE_CASE).matches(v?.trim() ?: "")
@@ -413,7 +448,10 @@ private fun runImage(call: ToolCall.Image, host: ToolHost, emit: (String, String
     body["prompt"] = f["prompt"] ?: ""
     body["width"] = size?.groupValues?.get(1)?.toInt() ?: 0
     body["height"] = size?.groupValues?.get(2)?.toInt() ?: 0
-    body["transparent"] = yes(f["transparent"])
+    body["transparent"] = f["transparent"]?.let { yes(it) }
+    body["project"] = Art.projectName(host.root)
+    body["kind"] = f["kind"]?.trim()?.lowercase() ?: ""
+    body["verify"] = !Regex("^(no|false|n|0|아니오|아니)$", RegexOption.IGNORE_CASE).matches(f["verify"]?.trim() ?: "")
     body["pixel"] = f["pixel"]?.toIntOrNull() ?: 0
     body["colors"] = f["colors"]?.toIntOrNull() ?: 24
     body["strength"] = f["strength"]?.toDoubleOrNull() ?: 0.0
@@ -460,7 +498,10 @@ private fun runImage(call: ToolCall.Image, host: ToolHost, emit: (String, String
     val t = res.getAsJsonObject("timings")
     fun tm(k: String) = t?.get(k)?.asString
     val sizes = res.getAsJsonArray("sizes")?.joinToString(", ") { s -> s.asJsonArray.joinToString("x") { it.asString } } ?: ""
-    val summary = "${targets.joinToString(", ")} 저장 ($sizes) · ${tm("total") ?: "?"}초" +
+    val v = res.getAsJsonObject("verify")
+    val scores = v?.getAsJsonArray("scores")?.map { it.asDouble.toInt() }
+    val verifyText = scores?.let { sc -> " · 컨셉 일치 ${sc.joinToString("→")}/10${if (sc.size > 1) " (다시 그림)" else ""}${v.get("problems")?.asString?.takeIf { it.isNotBlank() }?.let { " · 남은 문제: $it" } ?: ""}" } ?: ""
+    val summary = "${targets.joinToString(", ")} 저장 ($sizes) · ${tm("total") ?: "?"}초$verifyText" +
         (tm("generate")?.let { g -> " (생성 ${g}s${tm("style")?.let { " · 스타일 분석 ${it}s" } ?: ""}${tm("process")?.let { " · 가공 ${it}s" } ?: ""})" } ?: "")
     val prompt = res.get("prompt_used")?.asString ?: ""
     emit(title, "done", summary + if (prompt.isNotEmpty()) "\n프롬프트: $prompt" else "", images.take(4).map { "data:image/png;base64,$it" })
@@ -469,4 +510,69 @@ private fun runImage(call: ToolCall.Image, host: ToolHost, emit: (String, String
         (res.get("style")?.asString?.takeIf { it.isNotEmpty() }?.let { "\n참고 이미지 스타일: $it" } ?: "") +
         (if (credits.isNotEmpty()) "\n참고 출처를 ASSET_CREDITS.md 에 기록함" else "") +
         "\n(코드에서 이 경로로 불러오세요. 확인이 필요하면 PLAY 로 화면을 보세요.)"
+}
+
+
+// ---- GREP (셸 없이: Windows 에서도 동작) ------------------------------------------------------------
+private fun grepFiles(root: Path, pattern: String, cancelled: () -> Boolean): List<String> {
+    val re = try { Regex(pattern) } catch (e: Exception) { Regex(Regex.escape(pattern)) }
+    val out = mutableListOf<String>()
+    Files.walk(root).use { stream ->
+        val it = stream.filter { p -> p.relativeTo(root).none { seg -> seg.name in EXCLUDED_DIRS } && Files.isRegularFile(p) }.iterator()
+        while (it.hasNext() && out.size < 200 && !cancelled()) {
+            val p = it.next()
+            val bytes = try { if (Files.size(p) > 1_000_000) continue else Files.readAllBytes(p) } catch (e: Exception) { continue }
+            if (bytes.take(4000).any { b -> b == 0.toByte() }) continue // 바이너리 제외
+            val rel = root.relativize(p).toString().replace('\\', '/')
+            bytes.toString(Charsets.UTF_8).split(Regex("\r?\n")).forEachIndexed { i, line ->
+                if (out.size < 200 && re.containsMatchIn(line)) out += "$rel:${i + 1}:${if (line.length > 300) line.take(300) + "…" else line}"
+            }
+        }
+    }
+    return out
+}
+
+// ---- DELETE · MOVE · MKDIR (IDE 파일 API: Windows·macOS·Linux, 승인 필요, /undo 지원) -----------------------
+private fun fileOp(call: ToolCall, host: ToolHost, emit: (String, String, String?) -> Unit): String {
+    val (tag, label, title) = when (call) {
+        is ToolCall.Delete -> Triple("DELETE", call.path, "Delete: ${call.path}")
+        is ToolCall.Move -> Triple("MOVE", "${call.from} -> ${call.to}", "Move: ${call.from} -> ${call.to}")
+        is ToolCall.Mkdir -> Triple("MKDIR", call.path, "Mkdir: ${call.path}")
+        else -> return "지원하지 않는 작업"
+    }
+    return try {
+        if (call is ToolCall.Mkdir) {
+            FileOps.mkdirs(host.project, FileOps.resolveInRoot(host.root, call.path))
+            emit(title, "done", null)
+            return "[MKDIR ${call.path}] 완료"
+        }
+        val src = FileOps.resolveInRoot(host.root, if (call is ToolCall.Move) call.from else (call as ToolCall.Delete).path)
+        if (src.normalize() == host.root.normalize()) error("프로젝트 폴더 자체는 삭제·이동할 수 없습니다")
+        if (!Files.exists(src)) return "[$tag $label] 오류: 파일이 없습니다"
+        val isDir = Files.isDirectory(src)
+        if (!host.approve("edit", title, if (isDir) "폴더 전체 (되돌리기 대신 휴지통/로컬 기록에서 복구)" else "파일")) {
+            emit(title, "denied", null)
+            return "[$tag $label] 사용자가 거부했습니다"
+        }
+        if (call is ToolCall.Delete) {
+            if (!isDir) {
+                val bytes = Files.readAllBytes(src)
+                if (bytes.take(4000).any { it == 0.toByte() }) host.checkpoint.recordBinary(src, bytes)
+                else host.checkpoint.record(src, bytes.toString(Charsets.UTF_8))
+            }
+            FileOps.delete(host.project, src)
+            emit(title, "done", if (isDir) "폴더 삭제" else "파일 삭제 (/undo 로 복구)")
+            "[DELETE $label] 완료"
+        } else {
+            val dst = FileOps.resolveInRoot(host.root, (call as ToolCall.Move).to)
+            if (Files.exists(dst)) return "[MOVE $label] 오류: 대상이 이미 있습니다 (${call.to})"
+            FileOps.move(host.project, src, dst)
+            host.checkpoint.moves += src.toString() to dst.toString()
+            emit(title, "done", null)
+            "[MOVE $label] 완료 (코드에서 옛 경로를 쓰는 곳이 있으면 GREP 으로 찾아 고치세요)"
+        }
+    } catch (e: Exception) {
+        emit(title, "error", e.message)
+        "[$tag $label] 오류: ${e.message}"
+    }
 }

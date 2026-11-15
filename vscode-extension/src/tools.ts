@@ -5,9 +5,10 @@ import * as vscode from 'vscode';
 import { backend, isRemote } from './clients';
 import { applySearchReplace, lineDiffStats, ToolCall } from './protocol';
 import { runCheck, runPlay } from './debugRunner';
+import * as art from './art';
 
 const EXCLUDE = '**/{node_modules,.git,dist,build,target,.venv,venv,__pycache__,.next,Pods,.dart_tool,.gradle,models}/**';
-const MAX_READ = 60_000;
+const MAX_READ = 24_000; // 큰 파일 하나가 대화 예산을 다 쓰지 않게 (나머지는 줄 범위로)
 const MAX_OUT = 8_000;
 
 export type UiEvent =
@@ -27,6 +28,7 @@ export interface ToolHost {
 export class Checkpoint {
   readonly originals = new Map<string, string | null>(); // fsPath → 원본(null = 새 파일)
   readonly binaries = new Map<string, Uint8Array>();     // 이미지 등 바이너리 원본
+  readonly moves: [string, string][] = [];               // 이동 기록 [원래, 새] (되돌릴 때 역순으로)
 
   record(uri: vscode.Uri, before: string | null) {
     if (!this.originals.has(uri.fsPath)) this.originals.set(uri.fsPath, before);
@@ -41,6 +43,11 @@ export class Checkpoint {
 
   async revert(): Promise<string[]> {
     const reverted: string[] = [];
+    for (const [from, to] of [...this.moves].reverse()) {
+      await vscode.workspace.fs.rename(vscode.Uri.file(to), vscode.Uri.file(from), { overwrite: false }).then(undefined, () => undefined);
+      reverted.push(from);
+    }
+    this.moves.length = 0;
     for (const [fsPath, before] of this.originals) {
       const uri = vscode.Uri.file(fsPath);
       if (before === null) {
@@ -109,9 +116,20 @@ function truncate(s: string, max = MAX_OUT): string {
   return s.length <= max ? s : `${s.slice(0, max / 2)}\n…(${s.length - max}자 생략)…\n${s.slice(-max / 2)}`;
 }
 
+/** 운영체제에 맞는 셸: Windows → PowerShell(UTF-8 출력), macOS/Linux → 로그인 셸 (PATH 를 제대로 잡기 위해) */
+export function shellCommand(command: string): [string, string[]] {
+  if (process.platform === 'win32') {
+    return ['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+      `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8; ${command}`]];
+  }
+  const sh = require('fs').existsSync('/bin/zsh') ? '/bin/zsh' : process.env.SHELL || '/bin/bash';
+  return [sh, ['-lc', command]];
+}
+
 function runShell(command: string, cwd: string, signal: AbortSignal, timeoutMs = 300_000): Promise<{ code: number | null; output: string }> {
   return new Promise((resolve) => {
-    const child = spawn('/bin/zsh', ['-lc', command], { cwd, env: { ...process.env, CI: '1', FORCE_COLOR: '0' } });
+    const [sh, args] = shellCommand(command);
+    const child = spawn(sh, args, { cwd, env: { ...process.env, CI: '1', FORCE_COLOR: '0' }, windowsHide: true });
     let output = '';
     const onData = (d: Buffer) => {
       output += d.toString();
@@ -169,22 +187,20 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
 
       case 'list': {
         const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(host.root, call.pattern), EXCLUDE, 400);
-        const files = uris.map((u) => path.relative(host.root.fsPath, u.fsPath)).sort();
+        const files = uris.map((u) => path.relative(host.root.fsPath, u.fsPath).replace(/\\/g, '/')).sort();
         emit(`List ${call.pattern}`, 'done', { detail: `${files.length}개` });
         return `[LIST ${call.pattern}] ${files.length}개\n${files.join('\n')}`;
       }
 
       case 'grep': {
         emit(`Grep ${call.pattern}`, 'running');
-        const quoted = `'${call.pattern.replace(/'/g, `'\\''`)}'`;
-        const res = await runShell(
-          `git grep -n -I -E ${quoted} 2>/dev/null || grep -rnIE --exclude-dir={node_modules,.git,dist,build,target,.venv} ${quoted} .`,
-          host.root.fsPath, host.signal, 30_000,
-        );
-        const lines = res.output.split('\n').filter(Boolean);
+        const lines = await grepFiles(host.root, call.pattern, host.signal);
         emit(`Grep ${call.pattern}`, 'done', { detail: `${lines.length}건` });
-        return `[GREP ${call.pattern}] ${lines.length}건\n${truncate(lines.slice(0, 200).join('\n'))}`;
+        return `[GREP ${call.pattern}] ${lines.length}건${lines.length >= 200 ? ' (200건까지만)' : ''}\n${truncate(lines.join('\n'))}`;
       }
+
+      case 'delete': case 'move': case 'mkdir':
+        return await fileOp(call, host, emit);
 
       case 'search': {
         const res = await backend.post('/api/style/search', { query: call.query, top_k: 6, project: host.repoName || null });
@@ -354,6 +370,15 @@ async function runImage(call: Extract<ToolCall, { kind: 'image' }>, host: ToolHo
   const f = call.fields;
   const title = `Image: ${call.path}${f.size ? ` (${f.size})` : ''}`;
   if (!/\.(png|webp)$/i.test(call.path)) return `[IMAGE ${call.path}] 오류: 저장 경로는 .png (또는 .webp) 여야 합니다`;
+  // 이미 있는 그림은 다시 만들지 않는다 (에이전트가 요청마다 같은 그림 세트를 또 만드는 것 방지)
+  const yesOverwrite = /^(yes|true|y|1|예|네)$/i.test((f.overwrite ?? '').trim());
+  if (f.prompt && !f.from && !yesOverwrite) {
+    const exists = await vscode.workspace.fs.stat(resolveIn(host.root, call.path)).then(() => true, () => false);
+    if (exists) {
+      emit(title, 'done', { detail: '이미 있음 → 다시 만들지 않음' });
+      return `[IMAGE ${call.path}] 이미 있어서 다시 만들지 않았습니다. 그대로 쓰세요 (꼭 새로 그려야 하면 overwrite: yes).`;
+    }
+  }
   if (!(await host.approve('edit', title, `${f.prompt ? '생성: ' + f.prompt : '가공: ' + (f.ops ?? '')}`))) {
     emit(title, 'denied');
     return `[IMAGE ${call.path}] 사용자가 거부했습니다`;
@@ -361,9 +386,12 @@ async function runImage(call: Extract<ToolCall, { kind: 'image' }>, host: ToolHo
   emit(title, 'running', { detail: f.prompt ? '이미지 생성 중 (15~40초)…' : '이미지 가공 중…' });
   const size = /^(\d+)\s*[x×*]\s*(\d+)$/i.exec(f.size ?? '');
   const yes = (v?: string) => /^(yes|true|y|1|예|네)$/i.test((v ?? '').trim());
+  if (f.prompt) await art.ensure(host.root, (m) => emit(title, 'running', { detail: m })); // 프로젝트 아트 컨셉이 없으면 먼저 분석
+  const no = (v?: string) => /^(no|false|n|0|아니오|아니)$/i.test((v ?? '').trim());
   const body: any = {
     prompt: f.prompt ?? '', width: size ? +size[1] : 0, height: size ? +size[2] : 0,
-    transparent: yes(f.transparent), pixel: Number(f.pixel ?? 0) || 0, colors: Number(f.colors ?? 24) || 24,
+    project: art.projectName(host.root), kind: (f.kind ?? '').trim().toLowerCase(), verify: !no(f.verify),
+    transparent: f.transparent === undefined ? undefined : yes(f.transparent), pixel: Number(f.pixel ?? 0) || 0, colors: Number(f.colors ?? 24) || 24,
     strength: Number(f.strength ?? 0) || 0, ops: f.ops ?? '', cols: Number(f.cols ?? 0) || 0, seed: f.seed ? Number(f.seed) : undefined,
   };
   try {
@@ -404,7 +432,9 @@ async function runImage(call: Extract<ToolCall, { kind: 'image' }>, host: ToolHo
   }
   const t = res.timings ?? {};
   const sizes = (res.sizes ?? []).map((s: number[]) => s.join('x')).join(', ');
-  const summary = `${targets.join(', ')} 저장 (${sizes}) · ${t.total ?? '?'}초` +
+  const v = res.verify;
+  const verifyText = v?.scores ? ` · 컨셉 일치 ${v.scores.join('→')}/10${v.scores.length > 1 ? ' (다시 그림)' : ''}${v.problems ? ` · 남은 문제: ${v.problems}` : ''}` : '';
+  const summary = `${targets.join(', ')} 저장 (${sizes}) · ${t.total ?? '?'}초${verifyText}` +
     (t.generate ? ` (생성 ${t.generate}s${t.style ? ` · 스타일 분석 ${t.style}s` : ''}${t.process ? ` · 가공 ${t.process}s` : ''})` : '');
   emit(title, 'done', { detail: summary + (res.prompt_used ? `\n프롬프트: ${res.prompt_used}` : ''), images: images.slice(0, 4).map((b) => `data:image/png;base64,${b}`) });
   return `[IMAGE ${call.path}] 완료: ${summary}` +
@@ -412,4 +442,71 @@ async function runImage(call: Extract<ToolCall, { kind: 'image' }>, host: ToolHo
     (res.style ? `\n참고 이미지 스타일: ${res.style}` : '') +
     (res.credits?.length ? `\n참고 출처를 ASSET_CREDITS.md 에 기록함` : '') +
     '\n(코드에서 이 경로로 불러오세요. 확인이 필요하면 PLAY 로 화면을 보세요.)';
+}
+
+
+// ---- GREP (셸 없이: Windows 에서도 동작) ---------------------------------------------------------
+async function grepFiles(root: vscode.Uri, pattern: string, signal: AbortSignal): Promise<string[]> {
+  let re: RegExp;
+  try { re = new RegExp(pattern); } catch { re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')); }
+  const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(root, '**/*'), EXCLUDE, 6000);
+  const out: string[] = [];
+  for (const u of uris) {
+    if (signal.aborted || out.length >= 200) break;
+    let bytes: Uint8Array;
+    try { bytes = await vscode.workspace.fs.readFile(u); } catch { continue; }
+    if (bytes.length > 1_000_000 || bytes.subarray(0, 4000).includes(0)) continue; // 큰 파일·바이너리 제외
+    const rel = path.relative(root.fsPath, u.fsPath).replace(/\\/g, '/');
+    const lines = Buffer.from(bytes).toString('utf8').split(/\r?\n/);
+    for (let i = 0; i < lines.length && out.length < 200; i++) {
+      if (re.test(lines[i])) out.push(`${rel}:${i + 1}:${lines[i].length > 300 ? lines[i].slice(0, 300) + '…' : lines[i]}`);
+    }
+  }
+  return out;
+}
+
+// ---- DELETE · MOVE · MKDIR (IDE 파일 API: Windows·macOS·Linux 모두 동작, 승인 필요, /undo 지원) -------------
+async function fileOp(call: Extract<ToolCall, { kind: 'delete' | 'move' | 'mkdir' }>, host: ToolHost,
+  emit: (title: string, status: 'running' | 'done' | 'error' | 'denied', extra?: Partial<Extract<UiEvent, { type: 'tool' }>>) => void): Promise<string> {
+  const tag = call.kind.toUpperCase();
+  const label = call.kind === 'move' ? `${call.from} -> ${call.to}` : call.path;
+  const title = `${call.kind === 'delete' ? 'Delete' : call.kind === 'move' ? 'Move' : 'Mkdir'}: ${label}`;
+  try {
+    if (call.kind === 'mkdir') {
+      const uri = resolveInRoot(host.root, call.path);
+      await vscode.workspace.fs.createDirectory(uri);
+      emit(title, 'done');
+      return `[MKDIR ${call.path}] 완료`;
+    }
+    const src = resolveInRoot(host.root, call.kind === 'move' ? call.from : call.path);
+    if (src.fsPath === host.root.fsPath) throw new Error('워크스페이스 폴더 자체는 삭제·이동할 수 없습니다');
+    const stat = await vscode.workspace.fs.stat(src).then((st) => st, () => null);
+    if (!stat) return `[${tag} ${label}] 오류: 파일이 없습니다`;
+    const isDir = (stat.type & vscode.FileType.Directory) !== 0;
+    if (!(await host.approve('edit', title, isDir ? '폴더 전체 (되돌리기 대신 휴지통에서 복구)' : '파일'))) {
+      emit(title, 'denied');
+      return `[${tag} ${label}] 사용자가 거부했습니다`;
+    }
+    if (call.kind === 'delete') {
+      if (!isDir) {
+        const bytes = await vscode.workspace.fs.readFile(src);
+        const isText = !bytes.subarray(0, 4000).includes(0);
+        if (isText) host.checkpoint.record(src, Buffer.from(bytes).toString('utf8'));
+        else host.checkpoint.recordBinary(src, bytes);
+      }
+      await vscode.workspace.fs.delete(src, { recursive: true, useTrash: true });
+      emit(title, 'done', { detail: isDir ? '폴더 → 휴지통' : '파일 삭제 (/undo 로 복구)' });
+      return `[DELETE ${label}] 완료${isDir ? ' (폴더는 휴지통으로)' : ''}`;
+    }
+    const dst = resolveInRoot(host.root, call.to);
+    if (await vscode.workspace.fs.stat(dst).then(() => true, () => false)) return `[MOVE ${label}] 오류: 대상이 이미 있습니다 (${call.to})`;
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(dst.fsPath)));
+    await vscode.workspace.fs.rename(src, dst, { overwrite: false });
+    host.checkpoint.moves.push([src.fsPath, dst.fsPath]);
+    emit(title, 'done');
+    return `[MOVE ${label}] 완료 (코드에서 옛 경로를 쓰는 곳이 있으면 GREP 으로 찾아 고치세요)`;
+  } catch (e: any) {
+    emit(title, 'error', { detail: e.message });
+    return `[${tag} ${label}] 오류: ${e.message}`;
+  }
 }

@@ -27,7 +27,7 @@ class AgentSettings : PersistentStateComponent<AgentSettings.Data> {
         var maxTokens: Int = 4096,
         var temperature: Double = 0.2,
         var autoCheck: Boolean = true,
-        var verifyBeforeFinish: Boolean = true,
+        var verifyBeforeFinish: Boolean = false, // 기본 끔 (매 턴 모델 호출 +1 → 느림). /debug 에서는 항상 켬
     )
 
     private var data = Data()

@@ -57,4 +57,9 @@ class DebugKitTest {
         assertEquals("64x64", c.fields["size"])
         assertEquals("search:pixel art", c.fields["ref"])
     }
+
+    @Test fun `DELETE MOVE MKDIR 파싱`() {
+        val calls = Protocol.parseToolCalls("<<<DELETE assets/old.png>>>\n<<<MOVE src/a.js -> src/game/a.js>>>\n<<<MKDIR src/game>>>\n<<<DELETE>>>")
+        assertEquals(listOf(ToolCall.Delete("assets/old.png"), ToolCall.Move("src/a.js", "src/game/a.js"), ToolCall.Mkdir("src/game")), calls)
+    }
 }

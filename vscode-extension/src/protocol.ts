@@ -19,7 +19,10 @@ export type ToolCall =
   | { kind: 'connect'; location: string }
   | { kind: 'check' }
   | { kind: 'play'; req: PlayRequest }
-  | { kind: 'image'; path: string; fields: Record<string, string> };
+  | { kind: 'image'; path: string; fields: Record<string, string> }
+  | { kind: 'delete'; path: string }
+  | { kind: 'move'; from: string; to: string }
+  | { kind: 'mkdir'; path: string };
 
 export const TOOL_DOCS = `## 도구 (필요할 때만, 한 응답에 여러 개 가능)
 도구 블록은 줄 맨 앞에서 시작한다. 결과는 다음 메시지로 돌려준다. 도구 없이 답하면 대화 턴이 끝난다.
@@ -38,7 +41,11 @@ FILE>>>                            파일 생성/전체 교체 (새 파일 또�
 바꿀 코드
 >>>>>>> REPLACE
 EDIT>>>                            부분 수정 (큰 파일은 반드시 EDIT 사용, SEARCH/REPLACE 쌍 여러 개 가능)
-<<<RUN 셸 명령>>>                    터미널 명령 실행 (테스트, 빌드, git 등. 사용자 승인 필요)
+<<<RUN 셸 명령>>>                    터미널 명령 실행 (테스트, 빌드, git 등. 사용자 승인 필요. Windows 는 PowerShell)
+<<<DELETE path>>>                   파일·폴더 삭제 (승인 필요 · 파일은 /undo 로 복구, 폴더는 휴지통)
+<<<MOVE 원래경로 -> 새경로>>>         파일·폴더 이동/이름 바꾸기 (승인 필요 · /undo 가능)
+<<<MKDIR path>>>                    폴더 만들기
+(파일 삭제·이동·폴더 생성은 RUN 의 rm/mv/mkdir 대신 위 도구를 쓴다: Windows·macOS 모두 동작)
 <<<REMEMBER 종류 범위
 내용
 REMEMBER>>>                        사용자 스타일/선호/제약을 영구 저장. 종류: style|preference|constraint,
@@ -50,19 +57,22 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
 <<<CONNECT 경로 또는 git URL>>>      다른 레포 연결 + 벡터화
 ${PLAY_DOC}
 <<<IMAGE 저장경로.png
-prompt: 영어로 그림 설명 (예: cute pixel art knight, front view, full body)
-size: 64x64                        최종 크기 (작은 스프라이트도 크게 그린 뒤 줄여 깨끗하게)
-transparent: yes                   배경 제거 (캐릭터·아이템·아이콘)
+prompt: 영어로 '무엇을' 그릴지 구체적으로 (대상·자세·방향·특징·색 등). 화풍은 프로젝트 아트 컨셉이 자동으로 붙음
+kind: character                    종류: character|enemy|item|icon|tile|background|ui|effect|portrait (종류별 구도·투명 배경·기본 크기 자동)
+size: 64x64                        최종 크기 (비우면 아트 컨셉의 종류별 크기)
+transparent: yes                   배경 제거 (비우면 종류에 따라 자동)
+verify: no                         생성 후 비전 모델이 컨셉과 대조해 낮으면 한 번 다시 그림 (기본 켬, 끄면 빠름)
 pixel: 32                          픽셀아트로 변환 (가로 32칸, colors: 16 으로 색 수 제한)
 ref: assets/concept.png            참고 이미지의 '스타일'을 따라 그림 (프로젝트 파일 | attachment:첨부이름 | search:무료 이미지 검색어)
 strength: 0.4                      참고 이미지를 밑그림으로도 쓰는 정도 0~0.9 (기본 0 = 스타일만)
 from: assets/old.png               기존 이미지를 고쳐 그리기 (prompt 와 함께) 또는 가공만 (prompt 없이)
 join: a.png, b.png, c.png          여러 이미지를 스프라이트 시트로 합치기 (cols: 3)
 ops: flip-x; rotate 90; tint #ff8800 0.3; crop x,y,w,h; resize WxH; remove-bg; trim; pixelate 32; grayscale; sheet-split 4x1
+overwrite: yes                     같은 경로에 그림이 이미 있으면 기본은 다시 만들지 않음 (새로 그릴 때만 yes)
 IMAGE>>>                           프로젝트용 그림을 맥의 이미지 모델(FLUX)로 생성·가공해 저장. 한 장에 15~40초.
                                    sheet-split 은 경로_0.png, 경로_1.png … 로 저장. 웹 참고 이미지는 CC0·퍼블릭 도메인만 쓰고 ASSET_CREDITS.md 에 기록.`;
 
-const SIMPLE_RE = /^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT|CHECK|PLAY)(?:[ \t]+([^\n]*?))?>>>[ \t]*$/gm;
+const SIMPLE_RE = /^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT|CHECK|PLAY|DELETE|MOVE|MKDIR)(?:[ \t]+([^\n]*?))?>>>[ \t]*$/gm;
 const FILE_RE = /^<<<FILE[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^FILE>>>/gm;
 const EDIT_RE = /^<<<EDIT[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^EDIT>>>/gm;
 const REMEMBER_RE = /^<<<REMEMBER[ \t]*([^\n]*)\n([\s\S]*?)\n?^REMEMBER>>>/gm;
@@ -103,6 +113,13 @@ export function parseToolCalls(text: string): ToolCall[] {
       case 'RUN': push(m.index!, { kind: 'run', command: arg }); break;
       case 'CONNECT': push(m.index!, { kind: 'connect', location: arg }); break;
       case 'CHECK': push(m.index!, { kind: 'check' }); break;
+      case 'DELETE': push(m.index!, { kind: 'delete', path: cleanPath(arg) }); break;
+      case 'MKDIR': push(m.index!, { kind: 'mkdir', path: cleanPath(arg) }); break;
+      case 'MOVE': {
+        const mv = /^(.+?)\s*(?:->|→|=>)\s*(.+)$/.exec(arg) ?? /^(\S+)\s+(\S+)$/.exec(arg);
+        if (mv) push(m.index!, { kind: 'move', from: cleanPath(mv[1]), to: cleanPath(mv[2]) });
+        break;
+      }
       case 'PLAY': push(m.index!, { kind: 'play', req: parsePlay(arg) }); break;
       case 'MODEL': {
         const [action = 'status', ...rest] = arg.split(/\s+/);
@@ -240,6 +257,9 @@ export function describeCall(c: ToolCall): string {
     case 'model': return `MODEL ${c.action}${c.arg ? ' ' + c.arg : ''}`;
     case 'connect': return `CONNECT ${c.location}`;
     case 'check': return 'CHECK';
+    case 'delete': return `DELETE ${c.path}`;
+    case 'move': return `MOVE ${c.from} -> ${c.to}`;
+    case 'mkdir': return `MKDIR ${c.path}`;
     case 'image': return `IMAGE ${c.path}${c.fields.size ? ' ' + c.fields.size : ''}${c.fields.prompt ? ' — ' + one(c.fields.prompt, 60) : c.fields.ops ? ' — ' + one(c.fields.ops, 60) : ''}`;
     case 'play': return `PLAY ${c.req.kind}${c.req.target ? ' ' + c.req.target : ''}${c.req.seconds ? ' ' + c.req.seconds + '초' : ''}`;
   }

@@ -47,8 +47,11 @@ object Clients {
         val builder = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(timeoutSec))
             .header("Content-Type", "application/json")
         if (auth) authHeaders().forEach { (k, v) -> builder.header(k, v) }
-        val req = if (method == "POST") builder.POST(HttpRequest.BodyPublishers.ofString(gson.toJson(body ?: emptyMap<String, Any>())))
-        else builder.GET()
+        val req = when (method) {
+            "POST" -> builder.POST(HttpRequest.BodyPublishers.ofString(gson.toJson(body ?: emptyMap<String, Any>())))
+            "PUT" -> builder.PUT(HttpRequest.BodyPublishers.ofString(gson.toJson(body ?: emptyMap<String, Any>())))
+            else -> builder.GET()
+        }
         val res = http.send(req.build(), HttpResponse.BodyHandlers.ofString())
         val json = try {
             if (res.body().isNullOrBlank()) JsonObject() else JsonParser.parseString(res.body()).asJsonObject
@@ -67,6 +70,7 @@ object Clients {
     // ---- 백엔드 ----
     fun get(path: String, timeoutSec: Long = 30) = call(backendBase + path, "GET", null, timeoutSec)
     fun post(path: String, body: Any, timeoutSec: Long = 30) = call(backendBase + path, "POST", body, timeoutSec)
+    fun put(path: String, body: Any, timeoutSec: Long = 30) = call(backendBase + path, "PUT", body, timeoutSec)
     fun backendAlive(): Boolean = runCatching { get("/api/health", if (remote) 8 else 2) }
         .onSuccess { lastBackendError = "" }
         .onFailure { lastBackendError = if ((it as? HttpError)?.status == 401) "API 토큰이 없거나 틀립니다" else (it.message ?: it.toString()) }

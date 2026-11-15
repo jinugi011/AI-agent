@@ -18,7 +18,9 @@ data class EditorContext(
     val openFiles: List<String> = emptyList(),
 )
 
-private const val CONTEXT_CHAR_BUDGET = 70_000
+private const val CONTEXT_CHAR_BUDGET = 45_000 // ~13k 토큰 (문맥이 길면 생성이 느려짐: 1만→2만 토큰 49→25 tok/s)
+private const val COMPACT_TARGET = 0.6         // 넘치면 예산의 60% 까지 한 번에 (자주 조금씩 줄이면 엔진 KV 재사용이 깨짐)
+private const val MAX_IMAGES_PER_STEP = 4      // 한 응답에서 그림은 최대 4장
 
 private fun indent(s: String, max: Int = 40): String {
     val lines = s.trim().lines()
@@ -151,6 +153,7 @@ class AgentSession(
     private fun systemPrompt(ctx: JsonObject?, repoInfo: String, tree: String): String {
         fun s(key: String) = ctx?.get(key)?.takeIf { !it.isJsonNull }?.asString
         return """당신은 "Yang Coding" — 사용자의 IntelliJ IDE 안에서 동작하는 로컬 코딩 에이전트입니다 (Claude Code 와 유사). 이름을 물으면 Yang Coding 이라고 답한다.
+사용자 PC 운영체제: ${if (Shell.isWindows) "Windows (RUN 은 PowerShell 로 실행됨: rm/mv 대신 DELETE/MOVE 도구, 경로 구분은 / 로 써도 됨)" else System.getProperty("os.name")}
 사용자의 자연어 요청을 이해해 코드를 읽고, 수정하고, 명령을 실행해 작업을 끝까지 완료합니다.
 
 ## 일하는 방식
@@ -166,6 +169,8 @@ class AgentSession(
 - 사용자가 "기억해", "앞으로는", "항상" 같은 말로 스타일/선호/제약을 알려주면 REMEMBER 로 저장한다.
 - 사용자가 모델 다운로드/교체/엔진 관련 요청을 하면 MODEL 도구를 쓴다.
 - 프로젝트에 필요한 그림(캐릭터·배경·아이콘·UI)은 인터넷에서 받지 말고 IMAGE 로 생성한다. prompt 는 영어로 쓴다. 생성한 경로를 코드에서 정확히 불러온다.
+- 이미 있는 그림은 다시 만들지 않는다 (LIST 로 먼저 확인). 한 응답에 IMAGE 는 최대 4개, 꼭 필요한 그림만.
+- IMAGE 에는 kind 를 꼭 쓰고, prompt 는 프로젝트 아트 컨셉·캐릭터 설명에 맞춰 무엇을 그릴지 구체적으로 쓴다.
 - 답변은 사용자의 언어(기본 한국어)로 간결하게. 완료 후에는 무엇을 바꿨는지 1~3줄로 요약한다.
 - 도구 결과를 기다려야 하면 그 응답에서는 도구 블록까지만 쓰고 멈춘다. 파일을 READ 하기 전에는 EDIT 하지 않는다.
 
@@ -176,7 +181,7 @@ ${Protocol.TOOL_DOCS}
 ## 레포
 $repoInfo
 
-## 사용자 선호 · 스타일 · 제약 (항상 준수)
+${ctx?.get("art")?.takeIf { !it.isJsonNull && it.asString.isNotBlank() }?.let { "## 프로젝트 아트 컨셉 (그림을 만들 때 이 컨셉에 맞게 · IMAGE 에 자동 적용됨)\n${it.asString}\n\n" } ?: ""}## 사용자 선호 · 스타일 · 제약 (항상 준수)
 ${s("preferences")?.ifBlank { null } ?: "- (없음)"}
 
 ## 이 레포의 코딩 방법 (자동 추출)
@@ -186,20 +191,23 @@ ${s("methods") ?: "(색인 전)"}
 $tree"""
     }
 
-    private fun compact(messages: MutableList<ChatMessage>): List<ChatMessage> {
-        fun size() = messages.sumOf { it.content.length }
-        var i = 1
-        while (i < messages.size - 2 && size() > CONTEXT_CHAR_BUDGET) {
-            val m = messages[i]
+    /** 대화 기록 압축: 예산을 넘었을 때만 기록 자체를 60% 까지 한 번에 줄인다 (프리픽스 KV 재사용 유지). */
+    private fun compactHistory(systemLen: Int): Boolean = synchronized(history) {
+        fun size() = systemLen + history.sumOf { it.content.length }
+        if (size() <= CONTEXT_CHAR_BUDGET) return@synchronized false
+        val target = CONTEXT_CHAR_BUDGET * COMPACT_TARGET
+        var i = 0
+        while (i < history.size - 2 && size() > target) {
+            val m = history[i]
             if (m.role == "user" && m.content.startsWith("[도구 결과]") && m.content.length > 600) {
-                messages[i] = m.copy(content = m.content.take(500) + "\n…(이전 도구 결과 생략: 필요하면 다시 READ)")
+                history[i] = m.copy(content = m.content.take(500) + "\n…(이전 도구 결과 생략: 필요하면 다시 READ)")
             } else if (m.role == "assistant" && m.content.length > 1500) {
-                messages[i] = m.copy(content = Protocol.stripToolBlocks(m.content).take(800) + "\n(이전 응답의 코드 블록 생략)")
+                history[i] = m.copy(content = Protocol.stripToolBlocks(m.content).take(800) + "\n(이전 응답의 코드 블록 생략)")
             }
             i++
         }
-        while (size() > CONTEXT_CHAR_BUDGET && messages.size > 3) messages.removeAt(1)
-        return messages
+        while (size() > target && history.size > 2) history.removeAt(0)
+        true
     }
 
     /** 승인 없이 도구 하나를 바로 실행 (슬래시 명령·설정 카드용). */
@@ -286,7 +294,8 @@ $tree"""
                 emit(mapOf("type" to "assistant-start", "id" to id))
                 val raw = StringBuilder()
                 var lastShown = ""
-                val messages = compact((listOf(ChatMessage("system", system)) + synchronized(history) { history.toList() }).toMutableList())
+                if (compactHistory(system.length)) log.line("[대화 압축] 기록이 길어 오래된 도구 결과·코드를 줄였습니다 (이번 단계만 전체 다시 계산)")
+                val messages = listOf(ChatMessage("system", system)) + synchronized(history) { history.toList() }
                 val stepStart = System.currentTimeMillis()
                 log.line("[모델 #$steps] 생성 시작 · 메시지 ${messages.size}개 · ${"%,d".format(messages.sumOf { it.content.length })}자", "head")
                 val (text, stats) = Clients.stream(messages, s.maxTokens, s.temperature, streamHandle, { cancelled.get() }) { tok ->
@@ -317,6 +326,13 @@ $tree"""
                     break
                 }
                 // 결과를 보기 전에 수정·실행을 몰아서 호출하지 못하게: 앞쪽 조회 도구만 실행
+                // 그림은 한 응답에 최대 MAX_IMAGES_PER_STEP 장
+                val imgCount = calls.count { it is ToolCall.Image }
+                val imgDeferred = maxOf(0, imgCount - MAX_IMAGES_PER_STEP)
+                if (imgDeferred > 0) {
+                    var kept = 0
+                    calls = calls.filter { c -> c !is ToolCall.Image || kept++ < MAX_IMAGES_PER_STEP }
+                }
                 val firstAction = calls.indexOfFirst { !it.readOnly }
                 val deferred = if (firstAction > 0) calls.size - firstAction else 0
                 if (deferred > 0) calls = calls.subList(0, firstAction)
@@ -333,6 +349,7 @@ $tree"""
                     log.line(indent(result, if (call is ToolCall.Read) 3 else 40) + "\n    (${"%.1f".format((System.currentTimeMillis() - t0) / 1000.0)}s)", if (failed) "error" else "result")
                 }
                 if (deferred > 0) results += "(주의: 같은 응답의 수정/실행 도구 ${deferred}개는 실행하지 않았습니다. 위 조회 결과를 확인한 뒤 필요한 수정만 다시 요청하세요.)"
+                if (imgDeferred > 0) results += "(주의: 그림은 한 번에 최대 ${MAX_IMAGES_PER_STEP}장만 만듭니다. 남은 IMAGE ${imgDeferred}개는 실행하지 않았습니다. 필요한 것만 다음 응답에서 다시 요청하세요.)"
                 // 실행으로 확인했는지 · CHECK 결과 기록
                 calls.forEachIndexed { i, c ->
                     if (c is ToolCall.Run || c is ToolCall.Play || c is ToolCall.Harness) gate.ran = true

@@ -49,7 +49,9 @@ private val HELP = """**사용법** — 자연어로 요청하면 됩니다. 예
 - 파일을 고칠 때마다 자동 검사가 돌고, 오류가 남아 있으면 끝내지 않고 고칩니다 (설정에서 끌 수 있음)
 
 **그림 (다운로드하지 않고 생성)**
-- `/image 설명` → 맥의 이미지 모델(FLUX)로 생성해 프로젝트에 저장 · 예) `/image 64x64 투명 배경 픽셀아트 슬라임`
+- `/image 설명` → 맥의 이미지 모델(Z-Image)로 생성해 프로젝트에 저장 · 예) `/image 64x64 투명 배경 픽셀아트 슬라임`
+- `/art` → 프로젝트(문서·코드·기존 그림·벡터 DB)를 분석해 **아트 컨셉** 만들기 → 모든 그림에 자동 적용 · `/art 어두운 판타지 16비트 픽셀아트` (직접 컨셉 지정) · `/art 수정 …` · `/art 보기`
+- `/assets` → 코드가 쓰는데 파일이 없는 그림을 찾아 컨셉에 맞게 생성 (그림 하네스)
 - 대화로도 가능: "주인공 스프라이트 만들어서 assets 에 넣어줘", "이 첨부 그림 스타일로 배경 그려줘", "무료 이미지 참고해서 아이콘 만들어줘"
 - 가공: 배경 제거 · 픽셀아트 · 크기 · 자르기 · 뒤집기 · 색조 · 스프라이트 시트 나누기/합치기 · `/undo` 로 되돌리기
 
@@ -395,6 +397,33 @@ class ChatPanel(private val project: Project) : Disposable {
                 "/task" -> { val ctx = editorContext(); pooled { session.send("다음 요구사항을 HARNESS 도구로 구현해줘:\n$arg", ctx) } }
                 "/debug" -> { val ctx = editorContext(); pooled { session.send(DebugKit.debugPrompt(arg), ctx, atts, debug = true) } }
                 "/check" -> pooled { notice(direct(ToolCall.Check)) }
+                "/art" -> pooled {
+                    val root = projectRoot(project) ?: return@pooled notice("프로젝트 폴더를 먼저 여세요.")
+                    val parts = arg.split(Regex("\\s+"), limit = 2)
+                    try {
+                        post(mapOf("type" to "notice", "level" to "info", "text" to when (parts[0]) { "수정" -> "아트 컨셉 수정 중…"; "보기" -> "아트 컨셉 불러오는 중…"; else -> "프로젝트를 분석해 아트 컨셉을 만드는 중… (문서·코드·기존 그림·벡터 DB, 30초~1분)" }))
+                        val md = when (parts[0]) {
+                            "보기" -> Art.get(root) ?: "아직 아트 컨셉이 없습니다. `/art` 로 분석하세요."
+                            "수정" -> Art.revise(root, parts.getOrElse(1) { "" })
+                            else -> Art.analyze(root, arg.trim())
+                        }
+                        post(mapOf("type" to "notice", "level" to "info", "text" to md + "\n\n(`/art 수정 더 어둡게, 보라색 위주` 로 고치기 · `/art 보기` · `.yang/art-style.md`)"))
+                    } catch (e: Exception) {
+                        post(mapOf("type" to "notice", "level" to "error", "text" to "아트 컨셉 오류: ${e.message}"))
+                    }
+                }
+                "/assets" -> {
+                    val ctx = editorContext()
+                    pooled {
+                        val root = projectRoot(project) ?: return@pooled notice("프로젝트 폴더를 먼저 여세요.")
+                        val missing = Art.missingAssets(root)
+                        if (missing.isEmpty()) return@pooled notice("코드가 쓰는 그림 파일이 모두 있습니다 ✓")
+                        val list = missing.take(20).joinToString("\n") { "- ${it.ref} (${it.file}:${it.line})" }
+                        session.send("[그림 하네스] 코드가 쓰는데 파일이 없는 그림 ${missing.size}개:\n$list\n\n" +
+                            "각 그림이 쓰이는 코드를 READ 로 확인해 용도(kind)와 크기를 정하고, 프로젝트 아트 컨셉에 맞게 IMAGE 로 그 경로에 생성하세요. " +
+                            "한 응답에 최대 4개씩, 모두 만든 뒤 CHECK 로 경로 오류가 없는지 확인하세요.", ctx, atts)
+                    }
+                }
                 "/image" -> { val ctx = editorContext(); pooled { session.send("다음 그림을 IMAGE 도구로 만들어 프로젝트에 추가하고, 필요하면 코드에서 불러오도록 연결해줘 (prompt 는 영어로):\n$arg", ctx, atts) } }
                 "/play" -> pooled { notice(direct(ToolCall.Play(DebugKit.parsePlay(arg)))) }
                 "/reindex" -> pooled {

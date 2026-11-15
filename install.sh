@@ -12,7 +12,8 @@
 #    --repo <URL>        git 레포 주소 (기본: https://github.com/jinugi011/AI-agent.git)
 #    --branch <이름>     브랜치 (기본: main)
 #    --model <키>        auto | 30b | 14b | 7b | none   (기본: auto = 메모리에 맞게 선택)
-#    --imagegen <값>     auto | yes | no  그림 생성 FLUX.1-schnell 4bit(~9.6GB, Apple Silicon) + 배경 제거 (기본: auto = 메모리 32GB 이상)
+#    --imagegen <값>     auto | yes | no  그림 생성 Z-Image-Turbo 4bit(~5.9GB, Apple Silicon) + 배경 제거 (기본: auto = 메모리 32GB 이상)
+#    --flux              FLUX.1-schnell 4bit(~9.6GB)도 받기 (IMAGEGEN_FAMILY=flux 로 전환 가능)
 #    --vision <값>       auto | yes | no  이미지 분석용 비전 모델(Qwen2.5-VL 7B, ~5.5GB) (기본: auto = 메모리 24GB 이상이면 받음)
 #    --skip-vscode       VS Code 확장 설치 생략
 #    --skip-intellij     IntelliJ 플러그인 설치 생략
@@ -29,6 +30,7 @@ INSTALL_DIR=""
 MODEL="auto"
 VISION="auto"
 IMAGEGEN="auto"
+FLUX=0
 SKIP_VSCODE=0
 SKIP_INTELLIJ=0
 SKIP_DOCKER=0
@@ -42,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL="$2"; shift 2 ;;
     --vision) VISION="$2"; shift 2 ;;
     --imagegen) IMAGEGEN="$2"; shift 2 ;;
+    --flux) FLUX=1; shift ;;
     --skip-vscode) SKIP_VSCODE=1; shift ;;
     --skip-intellij) SKIP_INTELLIJ=1; shift ;;
     --skip-docker) SKIP_DOCKER=1; shift ;;
@@ -214,12 +217,17 @@ case "$IMAGEGEN" in
     if [[ ! -x imagegen/.venv/bin/python ]]; then "$PY" -m venv imagegen/.venv || die "imagegen 가상환경 생성 실패"; fi
     imagegen/.venv/bin/pip install -q --upgrade pip && imagegen/.venv/bin/pip install -q -r imagegen/requirements.txt || die "이미지 생성 패키지 설치 실패"
     ok "mflux · rembg 설치"
-    if [[ -d models/flux-schnell-4bit/transformer ]]; then ok "이미 있음: models/flux-schnell-4bit"
+    # 기본: Z-Image-Turbo (지시를 더 잘 따름 · 비교 시험 결과). FLUX 는 --flux 로 추가
+    if [[ -d models/z-image-turbo-q4/transformer ]]; then ok "이미 있음: models/z-image-turbo-q4"
     else
-      (( FREE_GB > 15 )) || die "디스크 공간 부족: 이미지 모델에 여유 15GB 이상 필요 (현재 ${FREE_GB}GB)"
+      (( FREE_GB > 10 )) || die "디스크 공간 부족: 이미지 모델에 여유 10GB 이상 필요 (현재 ${FREE_GB}GB)"
+      echo "  다운로드: mflux-community/z-image-turbo-mflux-q4 (~5.9GB, Apache-2.0)"
+      backend/.venv/bin/hf download mflux-community/z-image-turbo-mflux-q4 --local-dir models/z-image-turbo-q4 || die "이미지 모델 다운로드 실패 — 다시 실행하면 이어받습니다."
+      ok "models/z-image-turbo-q4"
+    fi
+    if [[ $FLUX == 1 && ! -d models/flux-schnell-4bit/transformer ]]; then
       echo "  다운로드: dhairyashil/FLUX.1-schnell-mflux-4bit (~9.6GB, Apache-2.0)"
-      backend/.venv/bin/hf download dhairyashil/FLUX.1-schnell-mflux-4bit --local-dir models/flux-schnell-4bit || die "이미지 모델 다운로드 실패 — 다시 실행하면 이어받습니다."
-      ok "models/flux-schnell-4bit"
+      backend/.venv/bin/hf download dhairyashil/FLUX.1-schnell-mflux-4bit --local-dir models/flux-schnell-4bit || warn "FLUX 다운로드 실패 (Z-Image 로 계속 사용)"
     fi
     # 배경 제거 모델(~180MB)을 미리 받아 첫 사용 때 기다리지 않게
     imagegen/.venv/bin/python -c "from rembg import new_session; new_session('isnet-general-use')" >/dev/null 2>&1 && ok "배경 제거 모델 준비" || warn "배경 제거 모델을 미리 받지 못함 (첫 사용 때 자동으로 받음)" ;;

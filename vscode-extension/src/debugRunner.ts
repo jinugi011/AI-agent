@@ -45,7 +45,9 @@ function proc(cmd: string, args: string[], opts: SpawnOptions & { timeoutMs?: nu
   return new Promise((resolve) => {
     let out = '';
     let timedOut = false;
-    const child = spawn(cmd, args, { ...opts, env: { ...process.env, ...(opts.env ?? {}), FORCE_COLOR: '0', NO_COLOR: '1' } });
+    // Windows 의 .cmd/.bat(npm, flutter, tsc)은 셸로 실행해야 한다
+    const shell = opts.shell ?? (process.platform === 'win32' && /\.(cmd|bat)$/i.test(cmd));
+    const child = spawn(cmd, args, { ...opts, shell, windowsHide: true, env: { ...process.env, ...(opts.env ?? {}), FORCE_COLOR: '0', NO_COLOR: '1' } });
     const onData = (d: Buffer) => { out += d.toString(); if (out.length > 400_000) out = out.slice(-200_000); };
     child.stdout?.on('data', onData);
     child.stderr?.on('data', onData);
@@ -64,7 +66,8 @@ async function which(cmd: string): Promise<string | null> {
   let found: string | null = null;
   if (process.platform === 'win32') {
     const r = await proc('where', [cmd], { timeoutMs: 5000 });
-    found = r.code === 0 ? r.out.split(/\r?\n/)[0].trim() : null;
+    const hits = r.code === 0 ? r.out.split(/\r?\n/).map((x) => x.trim()).filter(Boolean) : [];
+    found = hits.find((h) => /\.(exe|cmd|bat)$/i.test(h)) ?? hits[0] ?? null; // flutter → flutter.bat 등
   } else {
     const r = await proc('/bin/zsh', ['-lc', `command -v ${cmd}`], { timeoutMs: 8000 });
     found = r.code === 0 && r.out.trim().startsWith('/') ? r.out.trim().split('\n').pop()! : null;
@@ -89,8 +92,8 @@ async function ideDiagnostics(root: vscode.Uri, rels: string[] | null): Promise<
     await Promise.all(uris.map((u) => vscode.workspace.openTextDocument(u).then(() => undefined, () => undefined)));
     let last = '';
     let stable = 0;
-    for (let i = 0; i < 14 && stable < 3; i++) {
-      await sleep(250);
+    for (let i = 0; i < 8 && stable < 2; i++) { // 최대 약 1.5초 (코딩 흐름을 막지 않게)
+      await sleep(200);
       const snap = uris.map((u) => vscode.languages.getDiagnostics(u).length).join(',');
       stable = snap === last ? stable + 1 : 0;
       last = snap;
@@ -119,7 +122,7 @@ async function pythonExe(root: string): Promise<string | null> {
   for (const p of ['.venv/bin/python', 'venv/bin/python', '.venv/Scripts/python.exe', 'venv/Scripts/python.exe']) {
     if (exists(path.join(root, p))) return path.join(root, p);
   }
-  return (await which('python3')) ?? (await which('python'));
+  return (await which('python3')) ?? (await which('python')) ?? (process.platform === 'win32' ? await which('py') : null);
 }
 
 // 문법 검사 + (pyflakes 가 없을 때) 정의되지 않은 이름 검사. 파일을 쓰지 않는다(py_compile 은 __pycache__ 를 만든다).
@@ -228,7 +231,7 @@ async function checkJs(root: string, files: string[]): Promise<Problem[]> {
 async function checkTs(root: string): Promise<Problem[]> {
   const tsc = path.join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');
   if (!exists(tsc) || !exists(path.join(root, 'tsconfig.json'))) return [];
-  const r = await proc(tsc, ['--noEmit', '-p', root, '--pretty', 'false'], { cwd: root, timeoutMs: 120_000 });
+  const r = await proc(tsc, ['--noEmit', '-p', root, '--pretty', 'false'], { cwd: root, timeoutMs: 45_000 });
   const out: Problem[] = [];
   for (const m of r.out.matchAll(/^(.+?)\((\d+),(\d+)\): (error|warning) (TS\d+: .+)$/gm)) {
     out.push({ file: m[1].replace(/\\/g, '/'), line: +m[2], col: +m[3], severity: m[4] as 'error' | 'warning', message: m[5], source: 'tsc' });
@@ -453,7 +456,8 @@ function findChrome(): string | null {
        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser']
     : process.platform === 'win32'
       ? ['C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-         'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe']
+         path.join(process.env.LOCALAPPDATA ?? '', 'Google\\Chrome\\Application\\chrome.exe'),
+         'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe']
       : ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium'];
   return cands.find(exists) ?? null;
 }
@@ -607,19 +611,24 @@ async function webCapture(url: string, seconds: number, keys: string[], c: Colle
 function longRun(cmd: string, args: string[], opts: { cwd: string; env?: NodeJS.ProcessEnv; shell?: boolean; seconds: number; readyRe?: RegExp;
   readyTimeoutMs?: number; signal: AbortSignal; onReady?: (out: string) => Promise<void>; stdinQuit?: string }): Promise<{ out: string; code: number | null; exitedEarly: boolean; ready: boolean }> {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd: opts.cwd, env: { ...process.env, ...(opts.env ?? {}) }, shell: opts.shell, detached: process.platform !== 'win32' });
+    const win = process.platform === 'win32';
+    const child = spawn(cmd, args, { cwd: opts.cwd, env: { ...process.env, ...(opts.env ?? {}) }, shell: opts.shell ?? (win && /\.(cmd|bat)$/i.test(cmd)),
+      detached: !win, windowsHide: true });
     let out = '';
     let done = false;
     let ready = !opts.readyRe;
     let stopping = false; // 우리가 종료시켰는지 (아니면 스스로 끝남 = 크래시 또는 바로 종료)
     let timer: NodeJS.Timeout | undefined;
     const killTree = () => {
-      try { if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch { /* 이미 종료 */ }
+      try {
+        if (win && child.pid) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+        else if (child.pid) process.kill(-child.pid, 'SIGKILL');
+      } catch { /* 이미 종료 */ }
     };
     const stop = () => {
       stopping = true;
       if (opts.stdinQuit) { try { child.stdin?.write(opts.stdinQuit); } catch { /* 무시 */ } }
-      try { if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGINT'); else child.kill('SIGINT'); } catch { /* 무시 */ }
+      try { if (!win && child.pid) process.kill(-child.pid, 'SIGINT'); else if (win && child.pid) spawn('taskkill', ['/pid', String(child.pid), '/T'], { windowsHide: true }); } catch { /* 무시 */ }
       setTimeout(killTree, 2500);
     };
     const startCountdown = () => {

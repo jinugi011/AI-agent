@@ -6,6 +6,7 @@ import { backend, engine, isRemote, lastBackendError, serverUrl, getDefaultServe
 import { ensureRemoteIndex } from './remoteIndex';
 import { describeCall, parseToolCalls, ToolCall } from './protocol';
 import { debugPrompt, parsePlay } from './debugkit';
+import * as art from './art';
 import { Checkpoint, executeTool, OriginalContentProvider } from './tools';
 
 const HELP = `**사용법** — 자연어로 요청하면 됩니다. 예:
@@ -28,7 +29,9 @@ const HELP = `**사용법** — 자연어로 요청하면 됩니다. 예:
 - 파일을 고칠 때마다 자동 검사가 돌고, 오류가 남아 있으면 끝내지 않고 고칩니다 (설정에서 끌 수 있음)
 
 **그림 (다운로드하지 않고 생성)**
-- \`/image 설명\` → 맥의 이미지 모델(FLUX)로 생성해 프로젝트에 저장 · 예) \`/image 64x64 투명 배경 픽셀아트 슬라임\`
+- \`/image 설명\` → 맥의 이미지 모델(Z-Image)로 생성해 프로젝트에 저장 · 예) \`/image 64x64 투명 배경 픽셀아트 슬라임\`
+- \`/art\` → 프로젝트(문서·코드·기존 그림·벡터 DB)를 분석해 **아트 컨셉** 만들기 → 모든 그림에 자동 적용 · \`/art 어두운 판타지 16비트 픽셀아트\` (직접 컨셉 지정) · \`/art 수정 …\` · \`/art 보기\`
+- \`/assets\` → 코드가 쓰는데 파일이 없는 그림을 찾아 컨셉에 맞게 생성 (그림 하네스)
 - 대화로도 가능: "주인공 스프라이트 만들어서 assets 에 넣어줘", "이 첨부 그림 스타일로 배경 그려줘", "무료 이미지 참고해서 아이콘 만들어줘"
 - 가공: 배경 제거 · 픽셀아트 · 크기 · 자르기 · 뒤집기 · 색조 · 스프라이트 시트 나누기/합치기 · \`/undo\` 로 되돌리기`;
 
@@ -212,6 +215,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case '/debug': return this.session.send(debugPrompt(arg), this.editorContext(extraEditor), atts, { debug: true });
         case '/check': return this.runDirect({ kind: 'check' });
         case '/play': return this.runDirect({ kind: 'play', req: parsePlay(arg) });
+        case '/art': {
+          const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+          if (!root) return this.post({ type: 'notice', level: 'warn', text: '폴더를 먼저 여세요.' });
+          const [sub, ...more] = arg.split(/\s+/);
+          try {
+            this.post({ type: 'notice', level: 'info', text: sub === '수정' ? '아트 컨셉 수정 중…' : sub === '보기' ? '아트 컨셉 불러오는 중…' : '프로젝트를 분석해 아트 컨셉을 만드는 중… (문서·코드·기존 그림·벡터 DB, 30초~1분)' });
+            const md = sub === '보기' ? (await art.get(root)) ?? '아직 아트 컨셉이 없습니다. `/art` 로 분석하세요.'
+              : sub === '수정' ? await art.revise(root, more.join(' '))
+                : await art.analyze(root, arg.trim());
+            return this.post({ type: 'notice', level: 'info', text: md + '\n\n(`/art 수정 더 어둡게, 보라색 위주` 로 고치기 · `/art 보기` · `.yang/art-style.md`)' });
+          } catch (e: any) {
+            return this.post({ type: 'notice', level: 'error', text: `아트 컨셉 오류: ${e.message}` });
+          }
+        }
+        case '/assets': {
+          const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+          if (!root) return this.post({ type: 'notice', level: 'warn', text: '폴더를 먼저 여세요.' });
+          const missing = await art.missingAssets(root);
+          if (!missing.length) return this.post({ type: 'notice', level: 'info', text: '코드가 쓰는 그림 파일이 모두 있습니다 ✓' });
+          const list = missing.slice(0, 20).map((m) => `- ${m.ref} (${m.file}:${m.line})`).join('\n');
+          return this.session.send(`[그림 하네스] 코드가 쓰는데 파일이 없는 그림 ${missing.length}개:\n${list}\n\n` +
+            '각 그림이 쓰이는 코드를 READ 로 확인해 용도(kind)와 크기를 정하고, 프로젝트 아트 컨셉에 맞게 IMAGE 로 그 경로에 생성하세요. ' +
+            '한 응답에 최대 4개씩, 모두 만든 뒤 CHECK 로 경로 오류가 없는지 확인하세요.', this.editorContext(extraEditor), atts);
+        }
         case '/image': return this.session.send(`다음 그림을 IMAGE 도구로 만들어 프로젝트에 추가하고, 필요하면 코드에서 불러오도록 연결해줘 (prompt 는 영어로):\n${arg}`, this.editorContext(extraEditor), atts);
         case '/reindex':
           if (isRemote()) {

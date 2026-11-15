@@ -19,6 +19,9 @@ sealed class ToolCall {
     object Check : ToolCall()
     data class Play(val req: PlayRequest) : ToolCall()
     data class Image(val path: String, val fields: Map<String, String>) : ToolCall()
+    data class Delete(val path: String) : ToolCall()
+    data class Move(val from: String, val to: String) : ToolCall()
+    data class Mkdir(val path: String) : ToolCall()
 
     val kind: String
         get() = when (this) {
@@ -26,6 +29,7 @@ sealed class ToolCall {
             is Write -> "write"; is Edit -> "edit"; is Run -> "run"; is Remember -> "remember"
             is Harness -> "harness"; is Model -> "model"; is Connect -> "connect"
             is Check -> "check"; is Play -> "play"; is Image -> "image"
+            is Delete -> "delete"; is Move -> "move"; is Mkdir -> "mkdir"
         }
 
     val readOnly: Boolean get() = this is Read || this is ListFiles || this is Grep || this is Search || this is Check
@@ -53,7 +57,11 @@ FILE>>>                            파일 생성/전체 교체 (새 파일 또�
 바꿀 코드
 >>>>>>> REPLACE
 EDIT>>>                            부분 수정 (큰 파일은 반드시 EDIT 사용, SEARCH/REPLACE 쌍 여러 개 가능)
-<<<RUN 셸 명령>>>                    터미널 명령 실행 (테스트, 빌드, git 등. 사용자 승인 필요)
+<<<RUN 셸 명령>>>                    터미널 명령 실행 (테스트, 빌드, git 등. 사용자 승인 필요. Windows 는 PowerShell)
+<<<DELETE path>>>                   파일·폴더 삭제 (승인 필요 · 파일은 /undo 로 복구, 폴더는 휴지통)
+<<<MOVE 원래경로 -> 새경로>>>         파일·폴더 이동/이름 바꾸기 (승인 필요 · /undo 가능)
+<<<MKDIR path>>>                    폴더 만들기
+(파일 삭제·이동·폴더 생성은 RUN 의 rm/mv/mkdir 대신 위 도구를 쓴다: Windows·macOS 모두 동작)
 <<<REMEMBER 종류 범위
 내용
 REMEMBER>>>                        사용자 스타일/선호/제약을 영구 저장. 종류: style|preference|constraint,
@@ -65,7 +73,7 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
 <<<CONNECT 경로 또는 git URL>>>      다른 레포 연결 + 벡터화
 """ + DebugKit.PLAY_DOC + "\n" + DebugKit.IMAGE_DOC
 
-    private val SIMPLE_RE = Regex("""^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT|CHECK|PLAY)(?:[ \t]+([^\n]*?))?>>>[ \t]*$""", RegexOption.MULTILINE)
+    private val SIMPLE_RE = Regex("""^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT|CHECK|PLAY|DELETE|MOVE|MKDIR)(?:[ \t]+([^\n]*?))?>>>[ \t]*$""", RegexOption.MULTILINE)
     private val FILE_RE = Regex("""^<<<FILE[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^FILE>>>""", RegexOption.MULTILINE)
     private val EDIT_RE = Regex("""^<<<EDIT[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^EDIT>>>""", RegexOption.MULTILINE)
     private val REMEMBER_RE = Regex("""^<<<REMEMBER[ \t]*([^\n]*)\n([\s\S]*?)\n?^REMEMBER>>>""", RegexOption.MULTILINE)
@@ -91,6 +99,12 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
             if (arg.isEmpty() && tag !in setOf("CHECK", "PLAY", "MODEL", "LIST")) continue
             val call: ToolCall = when (tag) {
                 "CHECK" -> ToolCall.Check
+                "DELETE" -> ToolCall.Delete(cleanPath(arg))
+                "MKDIR" -> ToolCall.Mkdir(cleanPath(arg))
+                "MOVE" -> {
+                    val mv = Regex("""^(.+?)\s*(?:->|→|=>)\s*(.+)$""").find(arg) ?: Regex("""^(\S+)\s+(\S+)$""").find(arg) ?: continue
+                    ToolCall.Move(cleanPath(mv.groupValues[1]), cleanPath(mv.groupValues[2]))
+                }
                 "PLAY" -> ToolCall.Play(DebugKit.parsePlay(arg))
                 "READ" -> RANGE_RE.find(arg)?.let {
                     ToolCall.Read(cleanPath(it.groupValues[1]), it.groupValues[2].toInt(), it.groupValues[3].toInt())
@@ -216,6 +230,9 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
             is ToolCall.Connect -> "CONNECT ${c.location}"
             is ToolCall.Image -> "IMAGE ${c.path}${c.fields["size"]?.let { " $it" } ?: ""}${(c.fields["prompt"] ?: c.fields["ops"])?.let { " — " + one(it, 60) } ?: ""}"
             is ToolCall.Check -> "CHECK"
+            is ToolCall.Delete -> "DELETE ${c.path}"
+            is ToolCall.Move -> "MOVE ${c.from} -> ${c.to}"
+            is ToolCall.Mkdir -> "MKDIR ${c.path}"
             is ToolCall.Play -> "PLAY ${c.req.kind}${if (c.req.target.isNotEmpty()) " " + c.req.target else ""}${if (c.req.seconds > 0) " ${c.req.seconds}초" else ""}"
         }
     }

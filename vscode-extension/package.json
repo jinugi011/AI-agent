@@ -2,7 +2,7 @@
   "name": "local-coding-agent",
   "displayName": "Yang Coding",
   "description": "Yang Coding — 로컬 코딩 모델(Rust + llama.cpp)로 자연어 채팅을 통해 코딩하는 에이전트",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "publisher": "local",
   "license": "UNLICENSED",
   "private": true,
@@ -237,7 +237,7 @@
           },
           "localAgent.verifyBeforeFinish": {
             "type": "boolean",
-            "default": true,
+            "default": false,
             "order": 25,
             "markdownDescription": "**끝내기 전에 실행으로 확인**하도록 한 번 요청합니다 (코드를 바꿨는데 RUN/PLAY 를 안 했을 때). 남은 오류·임시 디버그 로그(YANG-DEBUG)는 이 설정과 관계없이 확인합니다."
           }

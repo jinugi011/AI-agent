@@ -117,6 +117,8 @@ export const backend = {
   get: <T = any>(path: string, timeoutMs?: number) => request<T>(cfg().backend, path, { timeoutMs }),
   post: <T = any>(path: string, body: unknown, timeoutMs?: number) =>
     request<T>(cfg().backend, path, { method: 'POST', body: JSON.stringify(body), timeoutMs }),
+  put: <T = any>(path: string, body: unknown, timeoutMs?: number) =>
+    request<T>(cfg().backend, path, { method: 'PUT', body: JSON.stringify(body), timeoutMs }),
   async alive(): Promise<boolean> {
     try {
       await request(cfg().backend, '/api/health', { timeoutMs: isRemote() ? 8000 : 2000 });

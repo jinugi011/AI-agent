@@ -186,15 +186,18 @@ object DebugKit {
     }
 
     val IMAGE_DOC = """<<<IMAGE 저장경로.png
-prompt: 영어로 그림 설명 (예: cute pixel art knight, front view, full body)
-size: 64x64                        최종 크기 (작은 스프라이트도 크게 그린 뒤 줄여 깨끗하게)
-transparent: yes                   배경 제거 (캐릭터·아이템·아이콘)
+prompt: 영어로 '무엇을' 그릴지 구체적으로 (대상·자세·방향·특징·색 등). 화풍은 프로젝트 아트 컨셉이 자동으로 붙음
+kind: character                    종류: character|enemy|item|icon|tile|background|ui|effect|portrait (종류별 구도·투명 배경·기본 크기 자동)
+size: 64x64                        최종 크기 (비우면 아트 컨셉의 종류별 크기)
+transparent: yes                   배경 제거 (비우면 종류에 따라 자동)
+verify: no                         생성 후 비전 모델이 컨셉과 대조해 낮으면 한 번 다시 그림 (기본 켬, 끄면 빠름)
 pixel: 32                          픽셀아트로 변환 (가로 32칸, colors: 16 으로 색 수 제한)
 ref: assets/concept.png            참고 이미지의 '스타일'을 따라 그림 (프로젝트 파일 | attachment:첨부이름 | search:무료 이미지 검색어)
 strength: 0.4                      참고 이미지를 밑그림으로도 쓰는 정도 0~0.9 (기본 0 = 스타일만)
 from: assets/old.png               기존 이미지를 고쳐 그리기 (prompt 와 함께) 또는 가공만 (prompt 없이)
 join: a.png, b.png, c.png          여러 이미지를 스프라이트 시트로 합치기 (cols: 3)
 ops: flip-x; rotate 90; tint #ff8800 0.3; crop x,y,w,h; resize WxH; remove-bg; trim; pixelate 32; grayscale; sheet-split 4x1
+overwrite: yes                     같은 경로에 그림이 이미 있으면 기본은 다시 만들지 않음 (새로 그릴 때만 yes)
 IMAGE>>>                           프로젝트용 그림을 맥의 이미지 모델(FLUX)로 생성·가공해 저장. 한 장에 15~40초.
                                    sheet-split 은 경로_0.png, 경로_1.png … 로 저장. 웹 참고 이미지는 CC0·퍼블릭 도메인만 쓰고 ASSET_CREDITS.md 에 기록."""
 
@@ -261,6 +264,7 @@ object DebugRunner {
     /** 로그인 셸의 PATH (IDE 를 Dock 에서 띄우면 PATH 가 짧아 flutter·node 를 못 찾는다) */
     private fun envPath(): String {
         loginPath?.let { return it }
+        if (Shell.isWindows) return (System.getenv("PATH") ?: "").also { loginPath = it }
         val p = try {
             val pr = ProcessBuilder("/bin/zsh", "-lc", "echo \$PATH").redirectErrorStream(true).start()
             pr.waitFor(8, TimeUnit.SECONDS)
@@ -270,7 +274,8 @@ object DebugRunner {
     }
 
     private fun builder(cmd: List<String>, cwd: Path?, env: Map<String, String>): ProcessBuilder {
-        val pb = ProcessBuilder(cmd).redirectErrorStream(true)
+        val full = if (Shell.isWindows && Regex("""\.(cmd|bat)$""", RegexOption.IGNORE_CASE).containsMatchIn(cmd.first())) listOf("cmd.exe", "/c") + cmd else cmd
+        val pb = ProcessBuilder(full).redirectErrorStream(true)
         cwd?.let { pb.directory(it.toFile()) }
         pb.environment()["PATH"] = envPath()
         pb.environment()["FORCE_COLOR"] = "0"
@@ -296,8 +301,14 @@ object DebugRunner {
     private val whichCache = ConcurrentHashMap<String, String>()
     fun which(cmd: String): String? {
         whichCache[cmd]?.let { return it.ifEmpty { null } }
-        val r = proc(listOf("/bin/zsh", "-lc", "command -v $cmd"), timeoutMs = 8000)
-        val found = r.out.trim().lines().lastOrNull()?.takeIf { r.code == 0 && it.startsWith("/") } ?: ""
+        val found = if (Shell.isWindows) {
+            val r = proc(listOf("where", cmd), timeoutMs = 5000)
+            val hits = if (r.code == 0) r.out.lines().map { it.trim() }.filter { it.isNotEmpty() } else emptyList()
+            hits.firstOrNull { Regex("""\.(exe|cmd|bat)$""", RegexOption.IGNORE_CASE).containsMatchIn(it) } ?: hits.firstOrNull() ?: ""
+        } else {
+            val r = proc(listOf("/bin/zsh", "-lc", "command -v $cmd"), timeoutMs = 8000)
+            r.out.trim().lines().lastOrNull()?.takeIf { r.code == 0 && it.startsWith("/") } ?: ""
+        }
         whichCache[cmd] = found
         return found.ifEmpty { null }
     }
@@ -315,8 +326,8 @@ object DebugRunner {
         }
         val out = mutableListOf<Problem>()
         var last = -1
-        for (i in 0 until 16) {  // 분석이 안정될 때까지 (최대 약 4초)
-            Thread.sleep(250)
+        for (i in 0 until 8) {  // 분석이 안정될 때까지 (최대 약 1.6초 — 코딩 흐름을 막지 않게)
+            Thread.sleep(200)
             out.clear()
             ReadAction.run<RuntimeException> {
                 for ((rel, vf) in vfs) {
@@ -330,7 +341,7 @@ object DebugRunner {
                     }
                 }
             }
-            if (i >= 4 && out.size == last) break
+            if (i >= 3 && out.size == last) break
             last = out.size
         }
         return out.toList()
@@ -340,7 +351,7 @@ object DebugRunner {
         for (p in listOf(".venv/bin/python", "venv/bin/python", ".venv/Scripts/python.exe", "venv/Scripts/python.exe")) {
             if (Files.exists(root.resolve(p))) return root.resolve(p).toString()
         }
-        return which("python3") ?: which("python")
+        return which("python3") ?: which("python") ?: if (Shell.isWindows) which("py") else null
     }
 
     private val PY_CHECK = """import sys, ast, builtins
@@ -441,7 +452,7 @@ for f in sys.argv[2:]:
     private fun checkTs(root: Path): List<Problem> {
         val tsc = root.resolve("node_modules/.bin/tsc")
         if (!Files.exists(tsc) || !Files.exists(root.resolve("tsconfig.json"))) return emptyList()
-        val r = proc(listOf(tsc.toString(), "--noEmit", "-p", root.toString(), "--pretty", "false"), root, timeoutMs = 120_000)
+        val r = proc(listOf(tsc.toString(), "--noEmit", "-p", root.toString(), "--pretty", "false"), root, timeoutMs = 45_000)
         return Regex("""^(.+?)\((\d+),(\d+)\): (error|warning) (TS\d+: .+)$""", RegexOption.MULTILINE).findAll(r.out).map {
             Problem(it.groupValues[1].replace('\\', '/'), it.groupValues[2].toInt(), it.groupValues[3].toInt(), it.groupValues[4], it.groupValues[5], "tsc")
         }.toList()
@@ -585,7 +596,8 @@ for f in sys.argv[2:]:
             "mac" in os -> listOf("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium",
                 "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser")
             "win" in os -> listOf("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-                "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe")
+                "${System.getenv("LOCALAPPDATA")}\\Google\\Chrome\\Application\\chrome.exe",
+                "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe")
             else -> listOf("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium")
         }
         return cands.firstOrNull(::exists)
@@ -755,7 +767,10 @@ for f in sys.argv[2:]:
         if (p.isAlive) {
             stopping = true
             stdinQuit?.let { try { p.outputStream.write(it.toByteArray()); p.outputStream.flush() } catch (e: Exception) { } }
-            try { ProcessBuilder("kill", "-INT", p.pid().toString()).start().waitFor(2, TimeUnit.SECONDS) } catch (e: Exception) { }
+            try {
+                if (Shell.isWindows) p.descendants().forEach { it.destroy() }.also { p.destroy() }
+                else ProcessBuilder("kill", "-INT", p.pid().toString()).start().waitFor(2, TimeUnit.SECONDS)
+            } catch (e: Exception) { }
             if (!p.waitFor(2500, TimeUnit.MILLISECONDS)) { p.descendants().forEach { it.destroyForcibly() }; p.destroyForcibly(); p.waitFor(3, TimeUnit.SECONDS) }
         }
         Thread.sleep(200)
@@ -869,7 +884,7 @@ except Exception as _e:
         if (devScript.isNotEmpty() && bundler && (req.target.isBlank() || req.target == "index.html")) {
             c.started += "dev 서버: npm run $devScript"
             var pageUrl = ""
-            val r = longRun(listOf("/bin/zsh", "-lc", "npm run $devScript"), root, mapOf("BROWSER" to "none", "CI" to "1"), 0.1, cancelled,
+            val r = longRun(Shell.command("npm run $devScript"), root, mapOf("BROWSER" to "none", "CI" to "1"), 0.1, cancelled,
                 readyRe = Regex("""https?://(localhost|127\.0\.0\.1|\[::1]):\d+"""), readyTimeoutMs = 60_000) { out ->
                 pageUrl = Regex("""https?://(?:localhost|127\.0\.0\.1|\[::1]):\d+/?\S*""").find(out.replace(Regex("\u001b\\[[0-9;]*m"), ""))?.value?.replace("[::1]", "127.0.0.1") ?: ""
                 if (pageUrl.isNotEmpty()) webCapture(pageUrl, seconds, req.keys, c, cancelled)
@@ -962,7 +977,7 @@ except Exception as _e:
         if (req.target.isBlank()) { c.notes += "실행할 명령이 없습니다 (PLAY cmd npm start 15)"; return }
         val seconds = if (req.seconds > 0) req.seconds else DebugKit.DEFAULT_SECONDS.getValue("cmd")
         c.started += "명령: ${req.target} (${seconds}초)"
-        val r = longRun(listOf("/bin/zsh", "-lc", req.target), root, mapOf("BROWSER" to "none", "CI" to "1"), seconds, cancelled) { out ->
+        val r = longRun(Shell.command(req.target), root, mapOf("BROWSER" to "none", "CI" to "1"), seconds, cancelled) { out ->
             Regex("""https?://(?:localhost|127\.0\.0\.1):\d+/?\S*""").find(out.replace(Regex("\u001b\\[[0-9;]*m"), ""))?.value?.let { webCapture(it, minOf(seconds, 10.0), req.keys, c, cancelled) }
         }
         val clean = r.out.replace(Regex("\u001b\\[[0-9;]*m"), "")

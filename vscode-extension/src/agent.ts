@@ -71,12 +71,15 @@ function attachmentBlock(atts: Attachment[], paths: Map<string, string>): string
 }
 
 const READ_ONLY = new Set(['read', 'list', 'grep', 'search', 'check']);
-const CONTEXT_CHAR_BUDGET = 70_000; // 32k 토큰 컨텍스트 중 응답 여유를 남긴 대략치
+const CONTEXT_CHAR_BUDGET = 45_000; // ~13k 토큰. 문맥이 길면 생성이 느려지고(1만→2만 토큰: 49→25 tok/s) 캐시를 놓칠 때 재계산이 길어진다
+const COMPACT_TARGET = 0.6;          // 넘치면 예산의 60% 까지 한 번에 줄인다 (자주 조금씩 줄이면 엔진 KV 재사용이 깨짐)
+const MAX_IMAGES_PER_STEP = 4;       // 한 응답에서 그림은 최대 4장 (장당 10~40초 → 몇 분씩 멈춘 것처럼 보이지 않게)
 
 // 시스템 프롬프트는 대화 중 바뀌지 않는 내용만 담는다 → 엔진 KV 캐시 재사용으로 다음 요청이 빨라짐.
 // 자주 바뀌는 에디터 상태·관련 코드는 사용자 메시지에 붙인다(editorBlock).
 function systemPrompt(ctx: any, repoInfo: string, tree: string): string {
   return `당신은 "Yang Coding" — 사용자의 VS Code 안에서 동작하는 로컬 코딩 에이전트입니다 (Claude Code 와 유사). 이름을 물으면 Yang Coding 이라고 답한다.
+사용자 PC 운영체제: ${process.platform === 'win32' ? 'Windows (RUN 은 PowerShell 로 실행됨: rm/mv 대신 DELETE/MOVE 도구, 경로 구분은 / 로 써도 됨)' : process.platform === 'darwin' ? 'macOS' : 'Linux'}
 사용자의 자연어 요청을 이해해 코드를 읽고, 수정하고, 명령을 실행해 작업을 끝까지 완료합니다.
 
 ## 일하는 방식
@@ -92,6 +95,8 @@ function systemPrompt(ctx: any, repoInfo: string, tree: string): string {
 - 사용자가 "기억해", "앞으로는", "항상" 같은 말로 스타일/선호/제약을 알려주면 REMEMBER 로 저장한다.
 - 사용자가 모델 다운로드/교체/엔진 관련 요청을 하면 MODEL 도구를 쓴다.
 - 프로젝트에 필요한 그림(캐릭터·배경·아이콘·UI)은 인터넷에서 받지 말고 IMAGE 로 생성한다. prompt 는 영어로 쓴다. 생성한 경로를 코드에서 정확히 불러온다.
+- 이미 있는 그림은 다시 만들지 않는다 (LIST 로 먼저 확인). 한 응답에 IMAGE 는 최대 4개, 꼭 필요한 그림만.
+- IMAGE 에는 kind 를 꼭 쓰고, prompt 는 프로젝트 아트 컨셉·캐릭터 설명에 맞춰 무엇을 그릴지 구체적으로 쓴다.
 - 답변은 사용자의 언어(기본 한국어)로 간결하게. 완료 후에는 무엇을 바꿨는지 1~3줄로 요약한다.
 - 도구 결과를 기다려야 하면 그 응답에서는 도구 블록까지만 쓰고 멈춘다. 파일을 READ 하기 전에는 EDIT 하지 않는다.
 
@@ -102,7 +107,7 @@ ${TOOL_DOCS}
 ## 레포
 ${repoInfo}
 
-## 사용자 선호 · 스타일 · 제약 (항상 준수)
+${ctx?.art ? `## 프로젝트 아트 컨셉 (그림을 만들 때 이 컨셉에 맞게 · IMAGE 에 자동 적용됨)\n${ctx.art}\n\n` : ''}## 사용자 선호 · 스타일 · 제약 (항상 준수)
 ${ctx?.preferences || '- (없음)'}
 
 ## 이 레포의 코딩 방법 (자동 추출)
@@ -184,18 +189,25 @@ export class AgentSession {
   }
 
   /** 오래된 도구 결과부터 요약해 컨텍스트 예산 안으로 줄인다. */
-  private compact(messages: ChatMessage[]): ChatMessage[] {
-    const size = () => messages.reduce((n, m) => n + m.content.length, 0);
-    for (let i = 1; i < messages.length - 2 && size() > CONTEXT_CHAR_BUDGET; i++) {
-      const m = messages[i];
+  /**
+   * 대화 기록 압축: 예산을 넘었을 때만, 기록 자체를 예산의 60% 까지 한 번에 줄인다.
+   * 매 단계 복사본을 조금씩 줄이면 앞부분이 계속 바뀌어 엔진의 프리픽스(KV) 재사용이 깨지고
+   * 단계마다 2만 토큰을 다시 계산하게 된다 (20~50초씩 멈춘 것처럼 보임).
+   */
+  private compactHistory(systemLen: number): boolean {
+    const size = () => systemLen + this.history.reduce((n, m) => n + m.content.length, 0);
+    if (size() <= CONTEXT_CHAR_BUDGET) return false;
+    const target = CONTEXT_CHAR_BUDGET * COMPACT_TARGET;
+    for (let i = 0; i < this.history.length - 2 && size() > target; i++) {
+      const m = this.history[i];
       if (m.role === 'user' && m.content.startsWith('[도구 결과]') && m.content.length > 600) {
-        messages[i] = { ...m, content: m.content.slice(0, 500) + '\n…(이전 도구 결과 생략: 필요하면 다시 READ)' };
+        this.history[i] = { ...m, content: m.content.slice(0, 500) + '\n…(이전 도구 결과 생략: 필요하면 다시 READ)' };
       } else if (m.role === 'assistant' && m.content.length > 1500) {
-        messages[i] = { ...m, content: stripToolBlocks(m.content).slice(0, 800) + '\n(이전 응답의 코드 블록 생략)' };
+        this.history[i] = { ...m, content: stripToolBlocks(m.content).slice(0, 800) + '\n(이전 응답의 코드 블록 생략)' };
       }
     }
-    while (size() > CONTEXT_CHAR_BUDGET && messages.length > 3) messages.splice(1, 1);
-    return messages;
+    while (size() > target && this.history.length > 2) this.history.splice(0, 1);
+    return true;
   }
 
   async send(userText: string, editor: EditorContext, attachments: Attachment[] = [], opts: { debug?: boolean } = {}): Promise<void> {
@@ -278,7 +290,7 @@ export class AgentSession {
       // 디버그 모드는 재현 → 계측 → 수정 → 재검증으로 단계가 많아 두 배까지 허용
       const maxSteps = opts.debug ? Math.max(24, cfg.get<number>('maxSteps', 16) * 2) : cfg.get<number>('maxSteps', 16);
       const autoCheck = cfg.get<boolean>('autoCheck', true);
-      const verify = cfg.get<boolean>('verifyBeforeFinish', true);
+      const verify = cfg.get<boolean>('verifyBeforeFinish', false); // 기본 끔: 매 턴 모델 호출이 한 번 더 늘어 느려짐 (/debug 에서는 항상 켬)
       // 완료 관문 상태: 남은 오류 · 실행 확인 여부 · 같은 독촉을 반복하지 않기 위한 횟수
       const gate = { errors: 0, errorText: '', ran: false, codeChanged: false, nudges: { errors: 0, markers: 0, verify: 0 } };
 
@@ -288,7 +300,8 @@ export class AgentSession {
         this.emit({ type: 'assistant-start', id });
         let raw = '';
         let lastShown = '';
-        const messages = this.compact([{ role: 'system', content: system }, ...this.history]);
+        if (this.compactHistory(system.length)) this.log.line(`[대화 압축] 기록이 길어 오래된 도구 결과·코드를 줄였습니다 (이번 단계만 전체 다시 계산)`, 'info');
+        const messages: ChatMessage[] = [{ role: 'system', content: system }, ...this.history];
         const stepStart = Date.now();
         const chars = messages.reduce((n, m) => n + m.content.length, 0);
         this.log.line(`[모델 #${steps}] 생성 시작 · 메시지 ${messages.length}개 · ${chars.toLocaleString()}자`, 'head');
@@ -323,6 +336,13 @@ export class AgentSession {
         }
         // 결과를 보기 전에 수정·실행까지 몰아서 호출하는 것을 막는다:
         // 앞쪽에 조회 도구가 있으면 조회만 실행하고, 나머지는 결과를 본 뒤 다시 요청하게 한다.
+        // 그림은 한 응답에 최대 MAX_IMAGES_PER_STEP 장: 나머지는 결과를 보고 다음 단계에서
+        const imgIdx = calls.map((c, i) => (c.kind === 'image' ? i : -1)).filter((i) => i >= 0);
+        const imgDeferred = imgIdx.length > MAX_IMAGES_PER_STEP ? imgIdx.length - MAX_IMAGES_PER_STEP : 0;
+        if (imgDeferred) {
+          const drop = new Set(imgIdx.slice(MAX_IMAGES_PER_STEP));
+          calls = calls.filter((_, i) => !drop.has(i));
+        }
         const firstAction = calls.findIndex((c) => !READ_ONLY.has(c.kind));
         const deferred = firstAction > 0 ? calls.length - firstAction : 0;
         if (deferred) calls = calls.slice(0, firstAction);
@@ -340,6 +360,9 @@ export class AgentSession {
         }
         if (deferred) {
           results.push(`(주의: 같은 응답의 수정/실행 도구 ${deferred}개는 실행하지 않았습니다. 위 조회 결과를 확인한 뒤 필요한 수정만 다시 요청하세요.)`);
+        }
+        if (imgDeferred) {
+          results.push(`(주의: 그림은 한 번에 최대 ${MAX_IMAGES_PER_STEP}장만 만듭니다. 남은 IMAGE ${imgDeferred}개는 실행하지 않았습니다. 필요한 것만 다음 응답에서 다시 요청하세요.)`);
         }
         // 실행으로 확인했는지 · CHECK 결과 기록
         calls.forEach((c, i) => {

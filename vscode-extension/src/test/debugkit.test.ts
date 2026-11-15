@@ -106,3 +106,13 @@ IMAGE>>>
     assert.equal(c.fields.ops, 'flip-x; tint #ff8800 0.3');
   }
 });
+
+test('parseToolCalls: DELETE · MOVE · MKDIR (Windows 경로 포함)', () => {
+  const calls = parseToolCalls('<<<DELETE assets/old.png>>>\n<<<MOVE src/a.js -> src/game/a.js>>>\n<<<MOVE "img\\\\x.png" → "img\\\\y.png">>>\n<<<MKDIR src/game>>>\n<<<DELETE>>>');
+  assert.deepEqual(calls, [
+    { kind: 'delete', path: 'assets/old.png' },
+    { kind: 'move', from: 'src/a.js', to: 'src/game/a.js' },
+    { kind: 'move', from: 'img\\\\x.png', to: 'img\\\\y.png' },
+    { kind: 'mkdir', path: 'src/game' },
+  ]);
+});

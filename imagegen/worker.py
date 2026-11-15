@@ -1,4 +1,4 @@
-"""Yang Coding 이미지 작업 프로세스 (FLUX.1-schnell 4bit · MLX + Pillow + rembg).
+"""Yang Coding 이미지 작업 프로세스 (Z-Image-Turbo / FLUX.1-schnell 4bit · MLX + Pillow + rembg).
 
 백엔드가 필요할 때 띄우고, IDLE 초 동안 요청이 없으면 스스로 종료해 메모리(약 10GB)를 돌려준다.
   GET  /health
@@ -46,15 +46,26 @@ def load_b64(data: str) -> Image.Image:
     return img
 
 
+# 모델 계열: zimage (Z-Image-Turbo, 지시를 잘 따름 · 6B · Apache-2.0) | flux (FLUX.1-schnell, Apache-2.0)
+DEFAULT_STEPS = {"zimage": 8, "flux": 4}
+
+
 def flux():
+    """이름은 그대로 두지만 --family 에 맞는 생성 모델을 한 번만 로드한다."""
     global _flux
     if _flux is None:
         t = time.time()
         from mflux.models.common.config import ModelConfig
-        from mflux.models.flux.variants.txt2img.flux import Flux1
 
-        _flux = Flux1(model_config=ModelConfig.schnell(), model_path=ARGS.model)
-        log(f"FLUX 로드 {time.time() - t:.1f}s")
+        if ARGS.family == "zimage":
+            from mflux.models.z_image.variants.z_image import ZImage
+
+            _flux = ZImage(model_config=ModelConfig.z_image_turbo(), model_path=ARGS.model)
+        else:
+            from mflux.models.flux.variants.txt2img.flux import Flux1
+
+            _flux = Flux1(model_config=ModelConfig.schnell(), model_path=ARGS.model)
+        log(f"{ARGS.family} 로드 {time.time() - t:.1f}s")
     return _flux
 
 
@@ -62,7 +73,7 @@ def generate(req: dict) -> dict:
     w = max(256, min(1536, int(req.get("width", 1024)) // 16 * 16))
     h = max(256, min(1536, int(req.get("height", 1024)) // 16 * 16))
     seed = int(req.get("seed") or random.randint(0, 2**31 - 1))
-    steps = int(req.get("steps") or 4)
+    steps = int(req.get("steps") or DEFAULT_STEPS.get(ARGS.family, 4))
     init_path = None
     if req.get("init_image"):
         init = load_b64(req["init_image"]).convert("RGB").resize((w, h), Image.LANCZOS)
@@ -195,6 +206,13 @@ def process(req: dict) -> dict:
     return {"images": [b64png(i) for i in images], "sizes": [list(i.size) for i in images], "log": logs}
 
 
+# MLX 는 스레드마다 GPU 스트림이 따로라, 모델을 올린 스레드에서만 생성해야 한다
+# (HTTP 요청마다 새 스레드 → "There is no Stream(cpu, 0) in current thread"). 모든 작업을 전용 스레드 하나에서.
+from concurrent.futures import ThreadPoolExecutor
+
+GPU = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -209,7 +227,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._send(200, {"status": "ok", "loaded": _flux is not None, "model": ARGS.model, "pid": os.getpid()})
+            self._send(200, {"status": "ok", "loaded": _flux is not None, "model": ARGS.model, "family": ARGS.family, "pid": os.getpid()})
         else:
             self._send(404, {"error": "not found"})
 
@@ -220,9 +238,9 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:  # GPU 작업은 한 번에 하나
                 _last = time.time()
                 if self.path == "/generate":
-                    res = generate(req)
+                    res = GPU.submit(generate, req).result()
                 elif self.path == "/process":
-                    res = process(req)
+                    res = GPU.submit(process, req).result()
                 elif self.path == "/shutdown":
                     self._send(200, {"ok": True})
                     threading.Thread(target=lambda: (time.sleep(0.3), os._exit(0)), daemon=True).start()
@@ -248,7 +266,8 @@ def main():
     global ARGS
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=18093)
-    p.add_argument("--model", required=True, help="mflux 4bit FLUX.1-schnell 폴더")
+    p.add_argument("--model", required=True, help="mflux 4bit 모델 폴더 (FLUX.1-schnell 또는 Z-Image-Turbo)")
+    p.add_argument("--family", default="flux", choices=["flux", "zimage"])
     p.add_argument("--idle", type=int, default=180)
     p.add_argument("--tmp", default="/tmp")
     ARGS = p.parse_args()

@@ -368,6 +368,11 @@ fn main() -> Result<()> {
                 let _ = reply.send(Event::Json(Ok(serde_json::json!({ "slept": had }))));
             }
             Work::Generate(req) => {
+                // 코딩에 집중: 비전 모델(~6GB)이 같이 있으면 스왑으로 코딩이 느려진다 → 코드 생성이 오면 내린다
+                if vis.as_mut().map(|v| v.unload_if_idle(5)).unwrap_or(false) {
+                    eprintln!("[engine] 코딩 요청 → 비전 모델을 내렸습니다");
+                    if let Ok(mut w) = vision_state.write() { *w = vision_info(&vis); }
+                }
                 if coder.is_none() {
                     // 큰 모델은 한 번에 하나: 이미지 생성 프로세스를 먼저 끄고 코딩 모델을 다시 올린다
                     let stopped = stop_imagegen(args.imagegen_port);

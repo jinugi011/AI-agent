@@ -72,7 +72,23 @@ export default function ImageStudio({ apiBase }) {
   // 가공 설정
   const [ed, setEd] = useState({ w: 64, h: 64, mode: 'fit', cells: 32, colors: 24, deg: 45, tint: '#ff8800', tintAmount: 0.3, bright: 1.2, contrast: 1.2, sat: 1.3, outline: '#000000', outlineW: 1, clear: '#ffffff', instruction: '' });
   // 생성 설정
-  const [gen, setGen] = useState({ prompt: '', w: 512, h: 512, transparent: true, pixel: 0, ref: '', count: 1 });
+  const [gen, setGen] = useState({ prompt: '', w: 512, h: 512, transparent: true, pixel: 0, ref: '', count: 1, project: '', kind: '', verify: true, useSize: true });
+  // 프로젝트 아트 컨셉 (IDE 에서 /art 로 분석한 것)
+  const [arts, setArts] = useState([]);
+  const [artMd, setArtMd] = useState('');
+  const [artEdit, setArtEdit] = useState('');
+  useEffect(() => { api(apiBase, '/api/art').then((r) => setArts(r.projects || [])).catch(() => undefined); }, [apiBase]);
+  useEffect(() => {
+    if (!gen.project) { setArtMd(''); return; }
+    api(apiBase, `/api/art/${encodeURIComponent(gen.project)}`).then((r) => setArtMd(r.markdown)).catch(() => setArtMd(''));
+  }, [apiBase, gen.project]);
+  const reviseArt = () => gen.project && artEdit.trim() && run('아트 컨셉 수정 중…', async () => {
+    const res = await fetch(`${apiBase}/api/art/${encodeURIComponent(gen.project)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instruction: artEdit }) });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.detail || '수정 실패');
+    setArtMd(d.markdown);
+    setArtEdit('');
+  });
 
   const selected = items.find((i) => i.id === selectedId) || null;
   // 미리보기 영역의 실제 크기 (맞춤 배율 계산용)
@@ -186,12 +202,13 @@ export default function ImageStudio({ apiBase }) {
   const doGenerate = () => gen.prompt.trim() && run(`생성 중… (한 장 15~40초${gen.count > 1 ? ` × ${gen.count}` : ''})`, async () => {
     for (let i = 0; i < gen.count; i++) {
       setBusy(`생성 중… ${i + 1}/${gen.count} (한 장 15~40초)`);
+      const useArtSize = gen.project && gen.kind && gen.useSize;
       const r = await api(apiBase, '/api/images/generate', {
-        prompt: gen.prompt, width: gen.w, height: gen.h, transparent: gen.transparent, pixel: Number(gen.pixel) || 0,
-        ref_search: gen.ref.trim(), translate: true,
+        prompt: gen.prompt, width: useArtSize ? 0 : gen.w, height: useArtSize ? 0 : gen.h, transparent: gen.kind ? undefined : gen.transparent,
+        pixel: Number(gen.pixel) || 0, ref_search: gen.ref.trim(), translate: true, project: gen.project, kind: gen.kind, verify: gen.verify,
       });
       await addItems([{ name: `생성_${new Date().toTimeString().slice(0, 8).replace(/:/g, '')}`, b64: r.images[0], w: r.sizes[0][0], h: r.sizes[0][1] }], i === 0);
-      setNote(`프롬프트: ${r.prompt_used}${r.credits?.length ? ` · 참고: ${r.credits[0].title} (${r.credits[0].license})` : ''} · ${r.timings.total}초`);
+      setNote(`${r.verify?.scores ? `컨셉 일치 ${r.verify.scores.join('→')}/10 · ` : ''}${r.model} · ${r.timings.total}초 · 프롬프트: ${r.prompt_used}${r.credits?.length ? ` · 참고: ${r.credits[0].title} (${r.credits[0].license})` : ''}`);
     }
   });
 
@@ -425,6 +442,34 @@ export default function ImageStudio({ apiBase }) {
 
         {tab === 'generate' && (
           <div className="is-form">
+            <label>프로젝트 아트 컨셉
+              <select value={gen.project} onChange={(e) => setGen({ ...gen, project: e.target.value })}>
+                <option value="">적용 안 함</option>
+                {arts.map((a) => <option key={a.project} value={a.project}>{a.project}</option>)}
+              </select>
+              <small>{arts.length ? '고르면 그 프로젝트의 화풍·색·크기가 자동 적용됩니다' : 'IDE 채팅에서 /art 로 프로젝트를 분석하면 여기 나타납니다'}</small>
+            </label>
+            {artMd && (
+              <details className="is-art">
+                <summary>컨셉 보기 · 수정</summary>
+                <pre>{artMd}</pre>
+                <div className="is-row">
+                  <input value={artEdit} placeholder="예) 더 밝게, 파스텔 톤으로" onChange={(e) => setArtEdit(e.target.value)} />
+                  <button type="button" className="aw-small" onClick={reviseArt} disabled={!artEdit.trim() || !!busy}>수정</button>
+                </div>
+              </details>
+            )}
+            <label>종류
+              <select value={gen.kind} onChange={(e) => setGen({ ...gen, kind: e.target.value })}>
+                <option value="">지정 안 함</option>
+                {[['character', '캐릭터'], ['enemy', '적'], ['item', '아이템'], ['icon', '아이콘'], ['tile', '타일'], ['background', '배경'], ['ui', 'UI'], ['effect', '이펙트'], ['portrait', '초상화']]
+                  .map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+              </select>
+            </label>
+            {gen.project && gen.kind && (
+              <label className="is-check"><input type="checkbox" checked={gen.useSize} onChange={(e) => setGen({ ...gen, useSize: e.target.checked })} /> 컨셉의 종류별 크기 사용</label>
+            )}
+            <label className="is-check"><input type="checkbox" checked={gen.verify} onChange={(e) => setGen({ ...gen, verify: e.target.checked })} /> 생성 후 컨셉과 대조해 낮으면 다시 그리기</label>
             <label>그림 설명 (한글 가능)
               <textarea rows={3} placeholder="예) 귀여운 초록 슬라임 몬스터, 큰 눈, 게임 캐릭터" value={gen.prompt} onChange={(e) => setGen({ ...gen, prompt: e.target.value })} />
             </label>
@@ -444,7 +489,7 @@ export default function ImageStudio({ apiBase }) {
             </label>
             <label>장 수 {num(gen, setGen, 'count', { min: 1, max: 4 })}</label>
             <button type="button" onClick={doGenerate} disabled={!gen.prompt.trim() || !!busy}>생성</button>
-            <p className="is-help">맥의 FLUX.1-schnell(Apache-2.0)로 생성합니다. 생성하는 동안 코딩 모델을 잠시 내리고, 다음 코딩 요청 때 다시 올립니다(약 15초).</p>
+            <p className="is-help">맥의 Z-Image-Turbo(Apache-2.0)로 생성합니다. 생성하는 동안 코딩 모델을 잠시 내리고, 다음 코딩 요청 때 다시 올립니다(약 15초).</p>
           </div>
         )}
       </section>

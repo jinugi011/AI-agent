@@ -20,6 +20,8 @@ def calls(monkeypatch):
     monkeypatch.setattr(imagegen, "engine_sleep", lambda: log.append(("sleep",)))
     monkeypatch.setattr(imagegen, "ensure_worker", lambda: log.append(("worker",)))
     monkeypatch.setattr(imagegen, "style_of", lambda b: (log.append(("style",)), "pixel art, flat colors")[1])
+    from app import artstyle
+    monkeypatch.setattr(artstyle, "verify", lambda *a, **k: {"score": 9, "problems": ""})
 
     def worker(path, body, timeout=900):
         log.append((path, body))

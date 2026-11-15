@@ -19,7 +19,7 @@ from .preferences import PreferenceStore
 from .profiles import PROFILES, get_profile
 from .repo_manager import RepoManager
 from .vector_store import CodeVectorStore
-from . import attachments, imagegen, imageops, remote, security
+from . import artstyle, attachments, imagegen, imageops, remote, security
 
 app = FastAPI(title="Yang Coding", version="1.0.0")
 app.add_middleware(
@@ -221,6 +221,7 @@ def chat_context(request: ContextRequest):
                                               profile=repo["profile"] if repo else ""),
         "methods": vector_store.project_methods(project) if project else None,
         "hits": vector_store.search(request.query, top_k=request.top_k, project=project or None) if request.query else [],
+        "art": artstyle.summary(request.attachment_project or project),  # 프로젝트 아트 컨셉 (그림 생성 프롬프트에 반영)
         # 업로드한 첨부(이미지·PDF·MD) 중 질문과 관련된 부분
         "attachments": attachments.search(vector_store, request.query, project=request.attachment_project or project, top_k=3)
         if request.query else [],
@@ -266,11 +267,15 @@ class ImageRequest(BaseModel):
     source: Optional[str] = None  # 고칠/가공할 기존 이미지 b64
     join: List[str] = []          # 스프라이트 시트로 합칠 이미지들 b64
     cols: int = 0
-    transparent: bool = False
+    transparent: Optional[bool] = None   # 비우면 종류에 따라 (캐릭터·아이템·아이콘·UI 는 투명)
     pixel: int = 0
     colors: int = 24
     ops: str = ""
     translate: bool = False       # 한글 prompt 를 영어로 바꿔서 생성 (웹 스튜디오)
+    project: str = ""             # 아트 컨셉을 적용할 프로젝트
+    kind: str = ""                # character|enemy|sprite|item|icon|tile|background|ui|effect|portrait
+    verify: bool = True           # 비전 모델로 요청·컨셉 대조, 낮으면 한 번 다시
+    use_art: bool = True
 
 
 @app.get("/api/images/status")
@@ -408,6 +413,56 @@ def images_search(q: str, n: int = 6):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+# ---- 프로젝트 아트 컨셉 ------------------------------------------------------------------------
+class ArtImage(BaseModel):
+    path: str = ""
+    data: str
+
+
+class ArtAnalyze(BaseModel):
+    project: str
+    files: List[str] = []
+    docs: Dict[str, str] = {}
+    code_hints: str = ""
+    images: List[ArtImage] = []
+    user_concept: str = ""
+
+
+class ArtRevise(BaseModel):
+    instruction: str
+
+
+@app.get("/api/art")
+def art_list():
+    return {"success": True, "projects": artstyle.list_all()}
+
+
+@app.get("/api/art/{project}")
+def art_get(project: str):
+    b = artstyle.get(project)
+    if not b:
+        raise HTTPException(status_code=404, detail="아직 아트 컨셉이 없습니다 (/art 로 분석)")
+    return {"success": True, "art": b, "markdown": artstyle.to_markdown(b)}
+
+
+@app.post("/api/art/analyze")
+def art_analyze(request: ArtAnalyze):
+    try:
+        b = artstyle.analyze(request.project, request.model_dump(), vector_store)
+    except artstyle.ArtError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"success": True, "art": b, "markdown": artstyle.to_markdown(b)}
+
+
+@app.put("/api/art/{project}")
+def art_revise(project: str, request: ArtRevise):
+    try:
+        b = artstyle.revise(project, request.instruction, vector_store)
+    except artstyle.ArtError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"success": True, "art": b, "markdown": artstyle.to_markdown(b)}
+
+
 class VisionInspect(BaseModel):
     image: str           # PNG/JPEG base64 (게임·앱 실행 화면)
     expect: str = ""     # 화면에 보여야 하는 것
@@ -455,6 +510,7 @@ def delete_attachment(att_id: str):
 @app.post("/api/llm/generate")
 def llm_generate(request: LLMRequest):
     """엔진은 localhost 에만 두고 백엔드가 중계한다 (원격 PC 의 IDE 플러그인용)."""
+    attachments.unload_now_if_pending()  # 코딩 중에는 비전 모델을 내려 코딩 속도 확보
     body = request.model_dump()
     body["max_tokens"] = min(body["max_tokens"], 8192)
     if not request.stream:
