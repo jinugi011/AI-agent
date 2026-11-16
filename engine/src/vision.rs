@@ -263,6 +263,9 @@ impl Vision {
             .ok()
             .and_then(|t| model.apply_chat_template(&t, &chat, true).ok())
             .unwrap_or_else(|| format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"));
+        // 생각 모델: 그림 설명은 생각 없이 바로 (빠르고 토큰 절약)
+        let think_tmpl = model.chat_template(None).ok().and_then(|t| t.to_string().ok()).map_or(false, |t| t.contains("<think>"));
+        let prompt = if think_tmpl && prompt.ends_with("<|im_start|>assistant\n") { prompt + "<think>\n\n</think>\n\n" } else { prompt };
         // 프롬프트를 [이미지까지] + [지시문 이후] 로 나눈다. 앞부분은 같은 이미지면 KV 를 재사용한다.
         let cut = prompt.find(marker).map(|i| i + marker.len()).ok_or_else(|| anyhow!("프롬프트에 이미지 자리가 없습니다"))?;
         let (head, tail) = prompt.split_at(cut);
@@ -354,7 +357,11 @@ impl Vision {
         self.last_used = Instant::now();
         let secs = gen_started.elapsed().as_secs_f64().max(1e-6);
         Ok(VisionResponse {
-            text: String::from_utf8_lossy(&out).trim().to_string(),
+            text: {
+                // 생각 모델(Qwen3.6 등)이 붙이는 <think>…</think> 는 빼고 답만
+                let t = String::from_utf8_lossy(&out).into_owned();
+                match t.find("</think>") { Some(i) => t[i + 8..].trim().to_string(), None => t.trim().to_string() }
+            },
             model_name: l.name.clone(),
             image_width: w,
             image_height: h,

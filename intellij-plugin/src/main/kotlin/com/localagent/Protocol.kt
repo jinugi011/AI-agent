@@ -16,6 +16,7 @@ sealed class ToolCall {
     data class Harness(val task: String) : ToolCall()
     data class Model(val action: String, val arg: String) : ToolCall()
     data class Connect(val location: String) : ToolCall()
+    data class Analyze(val path: String) : ToolCall()
     object Check : ToolCall()
     data class Play(val req: PlayRequest) : ToolCall()
     data class Image(val path: String, val fields: Map<String, String>) : ToolCall()
@@ -27,7 +28,7 @@ sealed class ToolCall {
         get() = when (this) {
             is Read -> "read"; is ListFiles -> "list"; is Grep -> "grep"; is Search -> "search"
             is Write -> "write"; is Edit -> "edit"; is Run -> "run"; is Remember -> "remember"
-            is Harness -> "harness"; is Model -> "model"; is Connect -> "connect"
+            is Harness -> "harness"; is Model -> "model"; is Connect -> "connect"; is Analyze -> "analyze"
             is Check -> "check"; is Play -> "play"; is Image -> "image"
             is Delete -> "delete"; is Move -> "move"; is Mkdir -> "mkdir"
         }
@@ -44,7 +45,8 @@ object Protocol {
 도구 블록은 줄 맨 앞에서 시작한다. 결과는 다음 메시지로 돌려준다. 도구 없이 답하면 대화 턴이 끝난다.
 
 <<<READ path/to/file>>>            파일 읽기 (부분: <<<READ path:120-200>>>)
-<<<LIST src/**/*.kt>>>             파일 목록 (glob)
+<<<LIST src/**/*.kt>>>             파일 찾기 (glob)
+<<<LIST src/main>>>                 폴더 한 단계 보기 (폴더는 / 로 끝남 · LIST . = 최상위)
 <<<GREP 정규식>>>                    워크스페이스 텍스트 검색
 <<<SEARCH 자연어 질의>>>             벡터 DB 에서 관련 코드·코딩 방법 검색
 <<<FILE path/to/file
@@ -70,10 +72,12 @@ REMEMBER>>>                        사용자 스타일/선호/제약을 영구 �
 요구사항
 HARNESS>>>                         요구사항→테스트 하네스→구현→테스트 반복을 새 브랜치에서 자동 수행 (큰 기능 구현 시)
 <<<MODEL list|status|download <key>|start [key]|stop>>>   로컬 모델 관리
-<<<CONNECT 경로 또는 git URL>>>      다른 레포 연결 + 벡터화
+<<<ANALYZE>>>                       프로젝트 전체 분석: 코드·문서를 임베딩하고 코딩 스타일·아키텍처 문서를 새로 만든다 (승인 필요, 1~3분).
+                                   구조를 모르거나 아키텍처 규칙이 없을 때, 큰 구조 변경 뒤에 쓴다. 결과로 아키텍처 문서를 돌려준다.
+<<<CONNECT git URL 또는 다른 폴더>>>  작업 폴더 밖의 다른 레포를 벡터화 (작업 폴더는 이미 연결됨 → 쓰지 말 것)
 """ + DebugKit.PLAY_DOC + "\n" + DebugKit.IMAGE_DOC
 
-    private val SIMPLE_RE = Regex("""^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT|CHECK|PLAY|DELETE|MOVE|MKDIR)(?:[ \t]+([^\n]*?))?>>>[ \t]*$""", RegexOption.MULTILINE)
+    private val SIMPLE_RE = Regex("""^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT|ANALYZE|CHECK|PLAY|DELETE|MOVE|MKDIR)(?:[ \t]+([^\n]*?))?>>>[ \t]*$""", RegexOption.MULTILINE)
     private val FILE_RE = Regex("""^<<<FILE[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^FILE>>>""", RegexOption.MULTILINE)
     private val EDIT_RE = Regex("""^<<<EDIT[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^EDIT>>>""", RegexOption.MULTILINE)
     private val REMEMBER_RE = Regex("""^<<<REMEMBER[ \t]*([^\n]*)\n([\s\S]*?)\n?^REMEMBER>>>""", RegexOption.MULTILINE)
@@ -87,7 +91,52 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
     private fun cleanPath(p: String) = p.trim().trim('"', '\'', '`').removePrefix("./")
 
     /** 응답 텍스트에서 도구 호출을 등장 순서대로 추출한다. 본문 블록 안의 태그는 무시. */
-    fun parseToolCalls(text: String): List<ToolCall> {
+    /** 모델이 도구 블록을 엉뚱한 태그로 감싸는 경우 정리 (<tool_code> … </tool_code> 등) */
+    fun normalizeToolText(text: String) = closeOpenEdits(text.replace(Regex("</?tool_(code|call)>"), "\n"))
+
+    /** 닫는 줄 EDIT>>> 를 빠뜨린 EDIT 블록을 닫아 준다 (FILE 은 잘린 파일일 수 있어 닫지 않음) */
+    fun closeOpenEdits(text: String): String {
+        val out = mutableListOf<String>()
+        var open = false
+        for (line in text.split("\n")) {
+            if (open && Regex("^<<<[A-Z]").containsMatchIn(line)) { out += "EDIT>>>"; open = false }
+            if (Regex("^<<<EDIT[ \t]+\\S").containsMatchIn(line)) open = true
+            else if (Regex("^EDIT>>>\\s*$").matches(line)) open = false
+            out += line
+        }
+        if (open) out += "EDIT>>>"
+        return out.joinToString("\n")
+    }
+
+    private const val FORMAT_MARK = "\u0000FORMAT\u0000"
+
+    /** EDIT 본문의 SEARCH/REPLACE 블록을 줄 단위로 읽는다 (VS Code parseSearchReplace 와 같은 규칙, 흔한 형식 실수 허용) */
+    fun parseSearchReplace(body: String): List<SearchReplace> {
+        val out = mutableListOf<SearchReplace>()
+        var state = 0 // 0 idle · 1 search · 2 replace
+        val sea = mutableListOf<String>()
+        val rep = mutableListOf<String>()
+        fun close() { out += SearchReplace(sea.joinToString("\n"), rep.joinToString("\n")); sea.clear(); rep.clear(); state = 0 }
+        for (line in body.split("\n")) {
+            val t = line.trim()
+            when {
+                Regex("^<{5,9}\\s*SEARCH$").matches(t) -> {
+                    if (state == 2) close() else if (state == 1) { out += SearchReplace(FORMAT_MARK + sea.joinToString("\n"), ""); sea.clear() }
+                    state = 1
+                }
+                Regex("^={5,9}$").matches(t) && state == 1 -> state = 2
+                Regex("^={5,9}$").matches(t) && state == 2 -> close() // REPLACE 대신 ======= 로 닫은 실수
+                Regex("^>{5,9}\\s*REPLACE$").matches(t) -> if (state == 2) close()
+                state == 1 -> sea += line
+                state == 2 -> rep += line
+            }
+        }
+        if (state == 2) close() else if (state == 1) out += SearchReplace(FORMAT_MARK + sea.joinToString("\n"), "")
+        return out
+    }
+
+    fun parseToolCalls(rawText: String): List<ToolCall> {
+        val text = normalizeToolText(rawText)
         val found = mutableListOf<Pair<Int, ToolCall>>()
         val bodies = listOf(FILE_RE, EDIT_RE, REMEMBER_RE, HARNESS_RE, IMAGE_RE)
             .flatMap { re -> re.findAll(text).map { it.range.first to it.range.last } }
@@ -96,7 +145,7 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
         for (m in SIMPLE_RE.findAll(text)) {
             val tag = m.groupValues[1]
             val arg = m.groupValues[2].trim()
-            if (arg.isEmpty() && tag !in setOf("CHECK", "PLAY", "MODEL", "LIST")) continue
+            if (arg.isEmpty() && tag !in setOf("CHECK", "PLAY", "MODEL", "LIST", "ANALYZE")) continue
             val call: ToolCall = when (tag) {
                 "CHECK" -> ToolCall.Check
                 "DELETE" -> ToolCall.Delete(cleanPath(arg))
@@ -109,11 +158,12 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
                 "READ" -> RANGE_RE.find(arg)?.let {
                     ToolCall.Read(cleanPath(it.groupValues[1]), it.groupValues[2].toInt(), it.groupValues[3].toInt())
                 } ?: ToolCall.Read(cleanPath(arg))
-                "LIST" -> ToolCall.ListFiles(arg.ifEmpty { "**/*" })
+                "LIST" -> ToolCall.ListFiles(arg.ifEmpty { "." })
                 "GREP" -> ToolCall.Grep(arg)
                 "SEARCH" -> ToolCall.Search(arg)
                 "RUN" -> ToolCall.Run(arg)
                 "CONNECT" -> ToolCall.Connect(arg)
+                "ANALYZE" -> ToolCall.Analyze(if (arg.isEmpty()) "" else cleanPath(arg))
                 else -> {
                     val parts = arg.split(Regex("\\s+")).filter { it.isNotEmpty() }
                     ToolCall.Model((parts.firstOrNull() ?: "status").lowercase(), parts.drop(1).joinToString(" "))
@@ -123,7 +173,7 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
         }
         for (m in FILE_RE.findAll(text)) found += m.range.first to ToolCall.Write(cleanPath(m.groupValues[1]), m.groupValues[2])
         for (m in EDIT_RE.findAll(text)) {
-            val blocks = SR_RE.findAll(m.groupValues[2]).map { SearchReplace(it.groupValues[1], it.groupValues[2]) }.toList()
+            val blocks = parseSearchReplace(m.groupValues[2])
             found += m.range.first to ToolCall.Edit(cleanPath(m.groupValues[1]), blocks)
         }
         for (m in REMEMBER_RE.findAll(text)) {
@@ -151,7 +201,7 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
 
     /** 채팅 표시용: 도구 블록 제거 + 스트리밍 중 미완성 블록 숨김. */
     fun stripToolBlocks(text: String): String {
-        var out = text
+        var out = normalizeToolText(text)
         for (re in listOf(FILE_RE, EDIT_RE, REMEMBER_RE, HARNESS_RE, IMAGE_RE, SIMPLE_RE)) out = re.replace(out, "")
         Regex("^<<<[A-Z]*", RegexOption.MULTILINE).find(out)?.let { out = out.substring(0, it.range.first) }
         out = out.replace(Regex("<{1,3}$"), "")
@@ -164,6 +214,10 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
         var applied = 0
         val failed = mutableListOf<String>()
         for ((search, replace) in blocks) {
+            if (search.startsWith(FORMAT_MARK)) {
+                failed += "EDIT 형식 오류: <<<<<<< SEARCH 다음에 ======= 와 >>>>>>> REPLACE 가 있어야 합니다 (블록마다)."
+                continue
+            }
             if (search.isEmpty()) {
                 content += (if (content.isEmpty() || content.endsWith("\n")) "" else "\n") + replace + "\n"
                 applied++
@@ -193,11 +247,53 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
                 lines.addAll(hit, replace.split("\n"))
                 content = lines.joinToString("\n")
                 applied++
-            } else {
-                failed += "SEARCH 블록을 파일에서 찾지 못했습니다:\n${search.take(200)}"
+                continue
             }
+            // 빈 줄 차이 허용: 빈 줄을 뺀 줄들로 비교해 유일하게 맞으면 그 범위를 바꾼다
+            val nonEmpty = lines.mapIndexedNotNull { i, l -> if (l.isBlank()) null else l.trim() to i }
+            val need2 = needle.filter { it.isNotEmpty() }
+            var hit2 = -1
+            if (need2.size >= 2) {
+                for (i in 0..(nonEmpty.size - need2.size)) {
+                    if (need2.indices.all { j -> nonEmpty[i + j].first == need2[j] }) {
+                        if (hit2 != -1) { hit2 = -2; break }
+                        hit2 = i
+                    }
+                }
+            }
+            if (hit2 >= 0) {
+                val from = nonEmpty[hit2].second
+                val to = nonEmpty[hit2 + need2.size - 1].second
+                repeat(to - from + 1) { lines.removeAt(from) }
+                lines.addAll(from, replace.split("\n"))
+                content = lines.joinToString("\n")
+                applied++
+                continue
+            }
+            failed += "SEARCH 블록을 파일에서 찾지 못했습니다${if (hit == -2 || hit2 == -2) " (여러 곳과 비슷함 — 앞뒤 줄을 더 넣어 고유하게)" else ""}:\n" +
+                "${search.take(200)}\n${closestSnippet(lines, needle)}"
         }
         return EditResult(content, applied, failed)
+    }
+
+    /** SEARCH 가 안 맞을 때: 파일에서 가장 비슷한 부분을 줄 번호와 함께 (그 원문으로 EDIT 를 다시 하도록) */
+    fun closestSnippet(lines: List<String>, needle: List<String>): String {
+        val need = needle.filter { it.isNotEmpty() }
+        if (need.isEmpty() || lines.isEmpty()) return ""
+        val set = need.toHashSet()
+        val win = maxOf(need.size, 1)
+        var best = -1
+        var bestScore = 0
+        for (i in lines.indices) {
+            var score = 0
+            for (j in i until minOf(lines.size, i + win + 2)) if (lines[j].trim() in set) score++
+            if (score > bestScore) { bestScore = score; best = i }
+        }
+        if (best < 0) return "(비슷한 부분 없음: 파일을 다시 READ 해서 실제 내용을 확인하세요)"
+        val from = maxOf(0, best - 2)
+        val to = minOf(lines.size, best + win + 4)
+        return "파일에서 가장 비슷한 부분 (${from + 1}~${to}줄) — 이 원문을 그대로 SEARCH 에 넣어 EDIT 를 다시 하세요 (FILE 로 전체를 다시 쓰지 말 것):\n" +
+            (from until to).joinToString("\n") { "${(it + 1).toString().padStart(4)}| ${lines[it]}" }
     }
 
     fun lineDiffStats(before: String, after: String): Pair<Int, Int> {
@@ -228,6 +324,7 @@ HARNESS>>>                         요구사항→테스트 하네스→구현�
             is ToolCall.Harness -> "HARNESS ${one(c.task)}"
             is ToolCall.Model -> "MODEL ${c.action}${if (c.arg.isNotEmpty()) " " + c.arg else ""}"
             is ToolCall.Connect -> "CONNECT ${c.location}"
+            is ToolCall.Analyze -> "ANALYZE ${c.path}".trim()
             is ToolCall.Image -> "IMAGE ${c.path}${c.fields["size"]?.let { " $it" } ?: ""}${(c.fields["prompt"] ?: c.fields["ops"])?.let { " — " + one(it, 60) } ?: ""}"
             is ToolCall.Check -> "CHECK"
             is ToolCall.Delete -> "DELETE ${c.path}"

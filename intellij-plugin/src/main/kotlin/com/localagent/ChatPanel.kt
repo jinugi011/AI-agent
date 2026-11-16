@@ -37,9 +37,14 @@ private val HELP = """**사용법** — 자연어로 요청하면 됩니다. 예
 
 **슬래시 명령**
 - `/new` 새 대화 · `/stop` 중단 · `/undo` 마지막 턴의 파일 변경 되돌리기 · `/log` 작업 로그 콘솔 열기
-- `/model [status|download <key>|start [key]|stop]`
+- `/model` 모델 목록 · `/model 코딩` 평소 코딩 (Qwen3.6) · `/model 이전` 이전 모델 (Qwen3-Coder-30B)
 - `/remember <style|preference|constraint> <global|language:x|profile:x|project> 내용`
 - `/task 요구사항` → 하네스(테스트 우선) 자동 구현 · `/connect 경로|URL` · `/reindex`
+- `/langchain 원하는 기능` 서버 LangChain으로 명세 생성 → 이 PC에서 구현 · `/langchain 하네스 목표와 완료 조건` 테스트 우선 구현
+- 입력창 작업 방식에서 **자연어 하네스**를 선택하면 문서 없이 목표·완료 조건을 입력할 수 있습니다.
+- `/arch 분석` 코드·문서 임베딩 + 코딩 스타일 + 아키텍처 분석 (1~3분) · `/arch` 보기 · `/arch 저장` (.yang/architecture.md 를 고친 뒤)
+- `/harness 문서.md` 요구사항 md → 체크리스트(.yang/harness) → 테스트 먼저 → 구현 → 통과까지 · `/harness` 목록·진행률
+- 에이전트도 필요하면 스스로 ANALYZE(프로젝트 분석)를 요청합니다 (승인 창)
 
 **디버깅**
 - `/debug 증상` → 재현(실행) → 원인 위치 → 가설 → 임시 로그 → 수정 → 재검증 → 정리 순서로 버그 잡기
@@ -55,7 +60,7 @@ private val HELP = """**사용법** — 자연어로 요청하면 됩니다. 예
 - 대화로도 가능: "주인공 스프라이트 만들어서 assets 에 넣어줘", "이 첨부 그림 스타일로 배경 그려줘", "무료 이미지 참고해서 아이콘 만들어줘"
 - 가공: 배경 제거 · 픽셀아트 · 크기 · 자르기 · 뒤집기 · 색조 · 스프라이트 시트 나누기/합치기 · `/undo` 로 되돌리기
 
-**원격 모드**에서는 하네스·레포 연결·모델 다운로드/시작이 서버 보안상 막혀 있습니다 (읽기·수정·명령 실행·선호 저장은 가능)."""
+**원격 모드**에서는 모델·LangChain은 서버에서, 파일 수정과 하네스 테스트는 현재 PC의 열린 프로젝트에서 수행합니다. 웹 LangChain 결과를 이 IDE에 전달할 수도 있습니다."""
 
 /** Yang Coding 툴 윈도우: JCEF 로 채팅 UI(VS Code 확장과 동일한 chat.js/css)를 띄우고 세션과 연결한다. */
 class ChatPanel(private val project: Project) : Disposable {
@@ -66,21 +71,30 @@ class ChatPanel(private val project: Project) : Disposable {
     val component: JComponent
     private val browser: JBCefBrowser?
     private val query: JBCefJSQuery?
+    private var swing: SwingChatView? = null
     private val approvals = ConcurrentHashMap<String, CompletableFuture<String>>()
     private val pending = mutableListOf<String>()
     @Volatile private var ready = false
     private val scheduler = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "local-agent-status").apply { isDaemon = true } }
     private val log = AgentLogService.of(project)
     private val session = AgentSession(project, ::post, ::askApproval, log)
+    private val workflowRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val workflowCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+    private var remoteInbox: RemoteWorkInbox? = null
 
     init {
         instances[project] = this
         if (!JBCefApp.isSupported()) {
+            // Android Studio 기본 런타임 등 내장 브라우저가 없는 IDE → Swing 채팅 화면 (같은 이벤트·같은 기능)
             browser = null
             query = null
-            component = JPanel(BorderLayout()).apply {
-                add(JLabel("이 IDE 에서는 JCEF(내장 브라우저)를 사용할 수 없습니다. JetBrains Runtime 으로 실행하세요.", SwingConstants.CENTER))
-            }
+            val view = SwingChatView { raw -> runCatching { onMessage(raw) }.onFailure { post(mapOf("type" to "notice", "level" to "error", "text" to (it.message ?: it.toString()))) } }
+            swing = view
+            component = view.component
+            ready = true
+            scheduler.scheduleWithFixedDelay({ runCatching { pushStatus() } }, 1, 4, TimeUnit.SECONDS)
+            if (AgentSettings.current.autoStartBackend)
+                pooled { BackendLauncher.ensureRunning(project.basePath)?.let { post(mapOf("type" to "notice", "level" to "warn", "text" to it)) } }
         } else {
             browser = JBCefBrowser()
             query = JBCefJSQuery.create(browser as JBCefBrowserBase)
@@ -96,9 +110,24 @@ class ChatPanel(private val project: Project) : Disposable {
             ApplicationManager.getApplication().messageBus.connect(this)
                 .subscribe(LafManagerListener.TOPIC, LafManagerListener { applyTheme() })
         }
+        // 웹 관리 페이지에서 '이 PC 의 경로'로 등록한 프로젝트를 찾아 올린다 (켜질 때 + 10분마다)
+        scheduler.scheduleWithFixedDelay({
+            if (Clients.remote) runCatching {
+                val done = RemoteIndex.syncPending(log)
+                if (done.isNotEmpty()) notice("원격 등록 프로젝트를 올려 분석을 시작했습니다: ${done.joinToString(", ")}")
+            }
+        }, 5, 600, TimeUnit.SECONDS)
+        projectRoot(project)?.let { root ->
+            remoteInbox = RemoteWorkInbox(root, { session.running || workflowRunning.get() },
+                { text, cancelled -> askCancellableApproval("run", "웹에서 전달한 원격 작업", "$root\n\n$text", cancelled) != "deny" },
+                { text, harness -> runWorkflowTask(text, harness) },
+                { if (workflowRunning.get()) { workflowCancelled.set(true); session.stop(); approvals.values.forEach { it.complete("deny") } } }, ::notice)
+        }
     }
 
     override fun dispose() {
+        workflowCancelled.set(true)
+        remoteInbox?.close()
         instances.remove(project, this)
         session.stop()
         scheduler.shutdownNow()
@@ -107,6 +136,7 @@ class ChatPanel(private val project: Project) : Disposable {
 
     // ---- Kotlin → 웹뷰 -----------------------------------------------------------
     private fun post(msg: Map<String, Any?>) {
+        swing?.let { it.render(msg); return }
         val json = Clients.gson.toJson(msg)
         synchronized(pending) {
             if (!ready) { pending += json; return }
@@ -214,12 +244,23 @@ class ChatPanel(private val project: Project) : Disposable {
     }
 
     // ---- 승인 (백그라운드 스레드에서 블로킹 대기) --------------------------------------
-    private fun askApproval(kind: String, title: String, detail: String): String {
+    private fun askApproval(kind: String, title: String, detail: String): String =
+        askCancellableApproval(kind, title, detail) { false }
+
+    private fun askCancellableApproval(kind: String, title: String, detail: String, cancelled: () -> Boolean): String {
         val reqId = "ap${System.nanoTime()}"
         val future = CompletableFuture<String>()
         approvals[reqId] = future
         post(mapOf("type" to "approval", "reqId" to reqId, "kind" to kind, "title" to title, "detail" to detail))
-        return try { future.get() } finally { approvals.remove(reqId) }
+        return try {
+            var answer: String? = null
+            while (answer == null) {
+                if (cancelled()) future.complete("deny")
+                try { answer = future.get(1, TimeUnit.SECONDS) }
+                catch (_: java.util.concurrent.TimeoutException) { /* Recheck only this approval's cancellation. */ }
+            }
+            requireNotNull(answer)
+        } finally { approvals.remove(reqId) }
     }
 
     // ---- 웹뷰 → Kotlin -----------------------------------------------------------
@@ -244,7 +285,7 @@ class ChatPanel(private val project: Project) : Disposable {
                     }
                 }
             }
-            "stop" -> session.stop()
+            "stop" -> { workflowCancelled.set(true); session.stop() }
             "new" -> newChat()
             "approval" -> approvals[s("reqId")]?.complete(s("answer"))
             "undo" -> pooled { undo() }
@@ -294,6 +335,7 @@ class ChatPanel(private val project: Project) : Disposable {
         post(mapOf("type" to "notice", "level" to if ("오류" in text) "error" else "info", "text" to text.lineSequence().first()))
 
     fun newChat() {
+        workflowCancelled.set(true)
         session.reset()
         approvals.values.forEach { it.complete("deny") }
         post(mapOf("type" to "cleared"))
@@ -379,22 +421,51 @@ class ChatPanel(private val project: Project) : Disposable {
     fun handleInput(input: String, attachmentIds: List<String> = emptyList()) {
         val text = input.trim()
         if (text.isEmpty()) return
+        if ((session.running || workflowRunning.get()) && text !in setOf("/stop", "/new", "/clear")) return notice("현재 작업이 끝나거나 중단된 뒤 요청하세요.")
         val atts = attachmentIds.mapNotNull { attached[it] }
         post(mapOf("type" to "user", "text" to text, "attachments" to atts.map { it.name }))
         if (text.startsWith("/")) {
             val parts = text.split(Regex("\\s+"))
-            val arg = parts.drop(1).joinToString(" ")
+            val arg = text.removePrefix(parts[0]).trim()
             when (parts[0]) {
                 "/help" -> post(mapOf("type" to "notice", "level" to "info", "text" to HELP))
                 "/new", "/clear" -> newChat()
-                "/stop" -> session.stop()
+                "/stop" -> { workflowCancelled.set(true); session.stop() }
                 "/undo" -> pooled { undo() }
                 "/log" -> log.show()
-                "/model" -> pooled { notice(direct(ToolCall.Model(parts.getOrElse(1) { "status" }, parts.drop(2).joinToString(" ")))) }
+                "/model" -> pooled {
+                    val action = parts.getOrElse(1) { "" }
+                    val preset = mapOf("코딩" to "coder", "coder" to "coder", "이전" to "coder-old", "30b" to "coder-old", "coder-old" to "coder-old")[action.lowercase()]
+                    if (action.isNotEmpty() && preset == null) return@pooled notice(direct(ToolCall.Model(action, parts.drop(2).joinToString(" "))))
+                    try {
+                        if (preset == null) {
+                            val list = Clients.get("/api/admin/models").getAsJsonArray("presets").joinToString("\n") {
+                                val m = it.asJsonObject
+                                val mark = if (m.get("active").asBoolean) "✅" else if (m.get("available").asBoolean) "⬜" else "⏳"
+                                "- $mark **${m.get("label").asString}** — ${m.get("help").asString}" + if (m.get("available").asBoolean) "" else " (아직 없음)"
+                            }
+                            return@pooled notice("$list\n\n`/model 코딩` · `/model 이전` 으로 바꿉니다 (엔진 재시작 20~60초).")
+                        }
+                        val r = Clients.post("/api/admin/models", mapOf("preset" to preset))
+                        notice(r.get("message").asString)
+                        for (i in 0 until 60) {
+                            Thread.sleep(3000)
+                            val st = runCatching { Clients.get("/api/engine/status", 3) }.getOrNull()
+                            if (st?.get("online")?.asBoolean == true && i > 1) {
+                                return@pooled notice("모델 준비 완료: ${st.getAsJsonObject("model")?.get("model_name")?.asString ?: ""}")
+                            }
+                        }
+                        notice("엔진이 아직 준비되지 않았습니다. 관리 페이지 → 서버 관리에서 로그를 확인하세요.")
+                    } catch (e: Exception) { notice("모델 변경 실패: ${e.message}") }
+                }
                 "/remember" -> Protocol.parseToolCalls("<<<REMEMBER ${parts.drop(1).take(2).joinToString(" ")}\n${parts.drop(3).joinToString(" ")}\nREMEMBER>>>")
                     .firstOrNull()?.let { call -> pooled { notice(direct(call)) } }
                 "/connect" -> pooled { notice(direct(ToolCall.Connect(arg))) }
-                "/task" -> { val ctx = editorContext(); pooled { session.send("다음 요구사항을 HARNESS 도구로 구현해줘:\n$arg", ctx) } }
+                "/langchain", "/chain" -> pooled {
+                    val (goal, harness) = Workflow.request(arg)
+                    if (goal.isBlank()) notice("/langchain 원하는 기능 · /langchain 하네스 목표와 완료 조건")
+                    else runCatching { runWorkflowTask(goal, harness, generate = true) }.onFailure { notice("워크플로 오류: ${it.message}") }
+                }
                 "/debug" -> { val ctx = editorContext(); pooled { session.send(DebugKit.debugPrompt(arg), ctx, atts, debug = true) } }
                 "/check" -> pooled { notice(direct(ToolCall.Check)) }
                 "/art" -> pooled {
@@ -426,6 +497,65 @@ class ChatPanel(private val project: Project) : Disposable {
                 }
                 "/image" -> { val ctx = editorContext(); pooled { session.send("다음 그림을 IMAGE 도구로 만들어 프로젝트에 추가하고, 필요하면 코드에서 불러오도록 연결해줘 (prompt 는 영어로):\n$arg", ctx, atts) } }
                 "/play" -> pooled { notice(direct(ToolCall.Play(DebugKit.parsePlay(arg)))) }
+                "/task", "/harness" -> pooled {
+                    val root = projectRoot(project) ?: return@pooled notice("프로젝트 폴더를 먼저 여세요.")
+                    val files = WorkspaceInfo.walkFiles(root, 4000).map { root.relativize(it).toString().replace('\\', '/') }
+                    val testCmd = HarnessKit.detectTestCommand(files, Shell.isWindows)
+                    val a = arg.trim()
+                    if (a.isEmpty()) {
+                        val hs = files.filter { it.startsWith(HarnessKit.DIR + "/") && it.endsWith(".md") }.map {
+                            val (d, t) = HarnessKit.progress(java.nio.file.Files.readString(root.resolve(it))); "- `$it` $d/$t 완료"
+                        }
+                        val docs = files.filter { Regex("\\.(md|markdown)$", RegexOption.IGNORE_CASE).containsMatchIn(it) && !it.startsWith(".yang/") && !Regex("node_modules|CHANGELOG|LICENSE", RegexOption.IGNORE_CASE).containsMatchIn(it) }.take(15)
+                        return@pooled notice("**하네스** (요구사항 md → 테스트 우선 구현, 테스트 명령: `${testCmd.ifBlank { "감지 못함" }}`)\n\n" +
+                            (if (hs.isNotEmpty()) "진행 중인 하네스:\n${hs.joinToString("\n")}\n\n" else "") +
+                            "사용법: `/harness docs/기능명세.md` · `/harness .yang/harness/x.md` (이어서) · `/harness 요구사항 문장`" +
+                            (if (docs.isNotEmpty()) "\n\n프로젝트의 md 문서:\n${docs.joinToString("\n") { "- `$it`" }}" else ""))
+                    }
+                    val ctx = editorContext()
+                    if (Regex("\\.(md|markdown|txt)$", RegexOption.IGNORE_CASE).containsMatchIn(a)) {
+                        val rel = a.removePrefix("./")
+                        val text = runCatching { java.nio.file.Files.readString(root.resolve(rel)) }.getOrNull() ?: return@pooled notice("파일이 없습니다: $a")
+                        val own = rel.startsWith(HarnessKit.DIR + "/") || HarnessKit.isChecklist(text)
+                        val tgt = if (own) rel else "${HarnessKit.DIR}/${HarnessKit.name(rel)}.md"
+                        val resume = own || tgt in files
+                        notice("하네스 시작: $a → `$tgt`${if (resume) " (이어서)" else ""} · 테스트 `${testCmd.ifBlank { "감지 못함" }}`")
+                        session.send(HarnessKit.prompt(a, text, tgt, testCmd, resume), ctx, atts, harness = true)
+                    } else {
+                        val tgt = "${HarnessKit.DIR}/${HarnessKit.name(a.split(Regex("\\s+")).take(4).joinToString("-"))}.md"
+                        session.send(HarnessKit.fromRequest(a, tgt, testCmd), ctx, atts, harness = true)
+                    }
+                }
+                "/arch" -> pooled {
+                    val root = projectRoot(project) ?: return@pooled notice("프로젝트 폴더를 먼저 여세요.")
+                    val name = RemoteIndex.projectName(root)
+                    val enc = java.net.URLEncoder.encode(name, Charsets.UTF_8).replace("+", "%20")
+                    val local = root.resolve(".yang").resolve("architecture.md")
+                    when (arg.trim()) {
+                        "분석" -> {
+                            notice("프로젝트를 올려 분석합니다: 코드·문서 임베딩 → 코딩 스타일 → 아키텍처 (1~3분).")
+                            try {
+                                val (summary, md) = RemoteIndex.analyze(root, log) { log.line("[분석] $it") }
+                                if (md.isNotBlank()) runCatching { java.nio.file.Files.createDirectories(local.parent); java.nio.file.Files.writeString(local, md) }
+                                notice("$summary\n\n${md.ifBlank { "(아키텍처 문서 없음)" }}")
+                            } catch (e: Exception) { notice("분석 실패: ${e.message}") }
+                        }
+                        "저장" -> {
+                            val md = runCatching { java.nio.file.Files.readString(local) }.getOrDefault("")
+                            if (md.isBlank()) notice(".yang/architecture.md 가 없습니다. 먼저 /arch 로 받으세요.")
+                            else { Clients.put("/api/arch/$enc", mapOf("markdown" to md)); notice("아키텍처 규칙을 저장했습니다. 다음 요청부터 적용됩니다.") }
+                        }
+                        else -> {
+                            val r = runCatching { Clients.get("/api/arch/$enc") }.getOrNull()
+                            val md = r?.get("markdown")?.takeIf { !it.isJsonNull }?.asString
+                            if (md != null) runCatching { java.nio.file.Files.createDirectories(local.parent); java.nio.file.Files.writeString(local, md) }
+                            val st = r?.get("status")?.takeIf { !it.isJsonNull }?.asString
+                            val extra = when (st) { "analyzing" -> "\n\n(지금 다시 분석 중…)"; "error" -> "\n\n(최근 분석 실패: ${r.get("error")?.takeIf { !it.isJsonNull }?.asString})"; else -> "" }
+                            notice((md ?: "아직 아키텍처 분석이 없습니다. /arch 분석 으로 시작하세요.") + extra +
+                                "\n\n(/arch 분석 다시 분석 · .yang/architecture.md 를 고친 뒤 /arch 저장 하면 내 규칙으로 덮어씀)")
+                        }
+                    }
+                }
                 "/reindex" -> pooled {
                     if (Clients.remote) {
                         projectRoot(project)?.let { RemoteIndex.ensure(it, log, force = true) }
@@ -441,5 +571,20 @@ class ChatPanel(private val project: Project) : Disposable {
         }
         val ctx = editorContext()
         pooled { session.send(text, ctx, atts) }
+    }
+
+    private fun runWorkflowTask(text: String, harness: Boolean, generate: Boolean = false) {
+        if (session.running || !workflowRunning.compareAndSet(false, true)) error("다른 작업이 실행 중입니다")
+        workflowCancelled.set(false)
+        post(mapOf("type" to "busy", "busy" to true))
+        try {
+            val root = projectRoot(project) ?: error("프로젝트 폴더를 먼저 여세요")
+            val task = if (generate) Workflow.generate(text, RemoteIndex.projectName(root), harness, { workflowCancelled.get() }, ::notice) else text
+            if (workflowCancelled.get()) error("중단됨")
+            val files = if (harness) WorkspaceInfo.walkFiles(root, 4000).map { root.relativize(it).toString().replace('\\', '/') } else emptyList()
+            val prompt = if (harness) HarnessKit.fromRequest(task, "${HarnessKit.DIR}/workflow-${System.currentTimeMillis()}.md", HarnessKit.detectTestCommand(files, Shell.isWindows)) else task
+            session.send(prompt, editorContext(), harness = harness)
+            if (workflowCancelled.get()) error("사용자가 중단했습니다")
+        } finally { workflowRunning.set(false); post(mapOf("type" to "busy", "busy" to false)) }
     }
 }

@@ -23,6 +23,7 @@ class AgentSettings : PersistentStateComponent<AgentSettings.Data> {
         var autoStartBackend: Boolean = true,
         var approveEdits: String = "auto",
         var approveCommands: String = "ask",
+        var approveFileOps: String = "ask",
         var maxSteps: Int = 16,
         var maxTokens: Int = 4096,
         var temperature: Double = 0.2,
@@ -111,6 +112,10 @@ class AgentConfigurable : Configurable {
         Opt("ask", "ask — 터미널 명령마다 승인 받기 (권장)"),
         Opt("auto", "auto — 승인 없이 바로 실행"),
     )
+    private val approveFileOps = combo(
+        Opt("ask", "ask — 파일·폴더 삭제/이동마다 승인 받기 (권장)"),
+        Opt("auto", "auto — 승인 없이 바로 실행 (파일은 /undo 로 복구)"),
+    )
     private val maxSteps = com.intellij.ui.JBIntSpinner(16, 1, 100)
     private val autoCheck = javax.swing.JCheckBox("파일을 고칠 때마다 자동 검사 (IDE 오류 + 문법·타입 검사 + 이미지·사운드 경로)")
     private val verifyBeforeFinish = javax.swing.JCheckBox("끝내기 전에 실행(RUN/PLAY)으로 확인하도록 한 번 요청")
@@ -186,6 +191,7 @@ class AgentConfigurable : Configurable {
             .addComponent(section("에이전트 동작"))
             .addLabeledComponent("파일 수정 승인", approveEdits)
             .addLabeledComponent("명령 실행 승인", approveCommands)
+            .addLabeledComponent("삭제·이동 승인", approveFileOps)
             .addLabeledComponent("최대 도구 반복", maxSteps)
             .addTooltip("요청 한 번에 파일 읽기·수정·실행 같은 도구를 최대 몇 번까지 쓸지 (1~100, 기본 16). 크면 큰 작업도 끝까지 하지만 오래 걸립니다.")
             .addComponentToRightColumn(autoCheck)
@@ -214,7 +220,7 @@ class AgentConfigurable : Configurable {
             String(cfSecret.password).trim() != (AgentSecrets.get(AgentSecrets.CF_SECRET) ?: "") ||
             backendUrl.text != s.backendUrl || engineUrl.text != s.engineUrl || agentRoot.text != s.agentRoot ||
             autoStartBackend.isSelected != s.autoStartBackend ||
-            approveEdits.value() != s.approveEdits || approveCommands.value() != s.approveCommands ||
+            approveEdits.value() != s.approveEdits || approveCommands.value() != s.approveCommands || approveFileOps.value() != s.approveFileOps ||
             maxSteps.number != s.maxSteps || autoCheck.isSelected != s.autoCheck || verifyBeforeFinish.isSelected != s.verifyBeforeFinish || maxTokens.number != s.maxTokens || temp() != s.temperature
     }
 
@@ -231,6 +237,7 @@ class AgentConfigurable : Configurable {
         s.autoStartBackend = autoStartBackend.isSelected
         s.approveEdits = approveEdits.value()
         s.approveCommands = approveCommands.value()
+        s.approveFileOps = approveFileOps.value()
         s.maxSteps = maxSteps.number
         s.autoCheck = autoCheck.isSelected
         s.verifyBeforeFinish = verifyBeforeFinish.isSelected
@@ -251,6 +258,7 @@ class AgentConfigurable : Configurable {
         autoStartBackend.isSelected = s.autoStartBackend
         approveEdits.select(s.approveEdits)
         approveCommands.select(s.approveCommands)
+        approveFileOps.select(s.approveFileOps)
         maxSteps.number = s.maxSteps.coerceIn(1, 100)
         autoCheck.isSelected = s.autoCheck
         verifyBeforeFinish.isSelected = s.verifyBeforeFinish

@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import re
 import subprocess
 import time
@@ -92,7 +93,7 @@ def ensure_worker() -> None:
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG, "ab") as log:
         fam = family()
-        subprocess.Popen([str(PYTHON), str(WORKER), "--model", str(MODEL_DIRS[fam]), "--family", fam, "--port", str(WORKER_PORT), "--idle", "180",
+        subprocess.Popen([str(PYTHON), str(WORKER), "--model", str(MODEL_DIRS[fam]), "--family", fam, "--port", str(WORKER_PORT), "--idle", os.getenv("IMAGEGEN_IDLE", "180"),
                           "--tmp", str(Path(settings.state_dir))],
                          stdout=log, stderr=log, start_new_session=True, env={"PATH": "/usr/bin:/bin", "TQDM_DISABLE": "1",
                                                                                "HOME": str(Path.home())})

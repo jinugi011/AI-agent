@@ -45,6 +45,9 @@ class Checkpoint {
     val originals = LinkedHashMap<String, String?>() // 절대경로 → 원본(null = 새 파일)
     val binaries = HashMap<String, ByteArray>()       // 이미지 등 바이너리 원본
     val moves = mutableListOf<Pair<String, String>>() // 이동 기록 (원래 → 새), 되돌릴 때 역순
+    val readPaths = HashSet<String>()     // 이번 턴에 READ 한 파일 (스타일 기준 확인용)
+    val styleChecked = HashSet<String>()  // 스타일 확인을 이미 한 새 파일
+    val overwriteOk = HashSet<String>()   // 전체 재작성 경고를 이미 한 파일 (두 번째는 허용)
 
     fun record(path: Path, before: String?) {
         originals.putIfAbsent(path.toString(), before)
@@ -97,21 +100,41 @@ object FileOps {
     /** IntelliJ 문서 편집으로 기록 → 에디터에서 Cmd+Z 로 되돌릴 수 있다. */
     /** IDE 파일 시스템으로 이동/이름 바꾸기 (에디터·인덱스가 따라감) */
     fun move(project: Project, from: Path, to: Path) {
+        var failure: Throwable? = null
         ApplicationManager.getApplication().invokeAndWait {
-            WriteCommandAction.runWriteCommandAction(project, "Yang Coding 이동", "local-agent", {
-                val vf = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(from) ?: throw IllegalStateException("파일이 없습니다: $from")
-                val parent = VfsUtil.createDirectoryIfMissing(to.parent.toString()) ?: throw IllegalStateException("폴더를 만들 수 없습니다: ${to.parent}")
-                if (vf.parent != parent) vf.move(this, parent)
-                if (vf.name != to.fileName.toString()) vf.rename(this, to.fileName.toString())
-            })
+            try {
+                WriteCommandAction.runWriteCommandAction(project, "Yang Coding 이동", "local-agent", {
+                    val vf = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(from) ?: throw IllegalStateException("파일이 없습니다: $from")
+                    val parent = VfsUtil.createDirectoryIfMissing(to.parent.toString()) ?: throw IllegalStateException("폴더를 만들 수 없습니다: ${to.parent}")
+                    if (vf.parent != parent) vf.move(this, parent)
+                    if (vf.name != to.fileName.toString()) vf.rename(this, to.fileName.toString())
+                })
+            } catch (e: Throwable) { failure = e }
+        }
+        if (!Files.exists(to) && Files.exists(from)) {
+            // IDE 파일 시스템으로 옮기지 못했으면 디스크에서 직접 (이름만 바꾸는 경우·잠금 등)
+            runCatching {
+                Files.createDirectories(to.parent)
+                Files.move(from, to)
+            }.onFailure { e -> throw IllegalStateException("이동 실패: ${e.message ?: failure?.message ?: e}", e) }
+            LocalFileSystem.getInstance().refreshAndFindFileByNioFile(to.parent)?.refresh(false, true)
+            LocalFileSystem.getInstance().refreshAndFindFileByNioFile(from.parent)?.refresh(false, true)
         }
     }
 
     fun mkdirs(project: Project, path: Path) {
+        var failure: Throwable? = null
         ApplicationManager.getApplication().invokeAndWait {
-            WriteCommandAction.runWriteCommandAction(project, "Yang Coding 폴더", "local-agent", {
-                VfsUtil.createDirectoryIfMissing(path.toString()) ?: throw IllegalStateException("폴더를 만들 수 없습니다: $path")
-            })
+            try {
+                WriteCommandAction.runWriteCommandAction(project, "Yang Coding 폴더", "local-agent", {
+                    VfsUtil.createDirectoryIfMissing(path.toString()) ?: throw IllegalStateException("폴더를 만들 수 없습니다: $path")
+                })
+            } catch (e: Throwable) { failure = e }
+        }
+        if (!Files.isDirectory(path)) {
+            runCatching { Files.createDirectories(path) }
+                .onFailure { e -> throw IllegalStateException("폴더 만들기 실패: ${e.message ?: failure?.message ?: e}", e) }
+            LocalFileSystem.getInstance().refreshAndFindFileByNioFile(path)
         }
     }
 
@@ -145,10 +168,21 @@ object FileOps {
     }
 
     fun delete(project: Project, path: Path) {
+        var failure: Throwable? = null
         ApplicationManager.getApplication().invokeAndWait {
-            WriteCommandAction.runWriteCommandAction(project, "Yang Coding 삭제", "local-agent", {
-                LocalFileSystem.getInstance().refreshAndFindFileByNioFile(path)?.delete(this)
-            })
+            try {
+                WriteCommandAction.runWriteCommandAction(project, "Yang Coding 삭제", "local-agent", {
+                    LocalFileSystem.getInstance().refreshAndFindFileByNioFile(path)?.delete(this)
+                })
+            } catch (e: Throwable) { failure = e }
+        }
+        if (Files.exists(path)) {
+            // IDE 파일 시스템으로 지우지 못했으면(잠금·권한·VFS 불일치) 디스크에서 직접 지운다
+            runCatching {
+                if (Files.isDirectory(path)) Files.walk(path).use { s -> s.sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) } }
+                else Files.deleteIfExists(path)
+            }.onFailure { e -> throw IllegalStateException("삭제 실패: ${e.message ?: failure?.message ?: e}", e) }
+            LocalFileSystem.getInstance().refreshAndFindFileByNioFile(path.parent)?.refresh(false, true)
         }
     }
 
@@ -215,7 +249,7 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
         host.emit(mapOf("type" to "tool", "id" to id, "title" to title, "status" to status, "detail" to detail, "diff" to diff))
 
     // 원격 모드: 서버(맥)에서 코드를 실행하거나 서버 설정을 바꾸는 기능은 쓸 수 없다
-    val serverSide = call is ToolCall.Harness || call is ToolCall.Connect ||
+    val serverSide = false &&
         (call is ToolCall.Model && call.action in setOf("download", "start", "stop"))
     if (Clients.remote && serverSide) {
         emit(call.kind, "denied", "원격 모드에서는 사용할 수 없음")
@@ -230,6 +264,7 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
                 if (text == null) {
                     emit("Read ${call.path}", "error", "파일 없음"); "[READ ${call.path}] 파일이 없습니다."
                 } else {
+                    host.checkpoint.readPaths += call.path.removePrefix("./")
                     val body = if (call.start != null) text.split("\n").let { it.subList((call.start - 1).coerceIn(0, it.size), (call.end ?: it.size).coerceIn(0, it.size)) }.joinToString("\n") else text
                     val range = if (call.start != null) ":${call.start}-${call.end}" else ""
                     emit("Read ${call.path}$range", "done", "${body.count { it == '\n' } + 1}줄")
@@ -238,14 +273,19 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
             }
 
             is ToolCall.ListFiles -> {
+                if (WorkspaceInfo.isDirListing(call.pattern)) {
+                    val dir = FileOps.resolveInRoot(host.root, if (call.pattern == ".") "" else call.pattern)
+                    if (!Files.isDirectory(dir)) return "[LIST ${call.pattern}] 그런 폴더가 없습니다. LIST . 으로 최상위부터 확인하세요."
+                    val items = WorkspaceInfo.listDir(host.root, dir)
+                    emit("List ${call.pattern}", "done", "${items.size}개")
+                    return "[LIST ${call.pattern}] ${items.size}개 (폴더는 / 로 끝남)\n${items.joinToString("\n")}"
+                }
                 val patterns = listOf(call.pattern, call.pattern.removePrefix("**/")).distinct()
                     .map { FileSystems.getDefault().getPathMatcher("glob:$it") }
-                val files = Files.walk(host.root).use { stream ->
-                    stream.filter { p -> p.relativeTo(host.root).none { it.name in EXCLUDED_DIRS } && !p.isDirectory() }
-                        .map { it.relativeTo(host.root) }
-                        .filter { rel -> patterns.any { it.matches(rel) } }
-                        .limit(400).map { it.toString().replace('\\', '/') }.sorted().toList()
-                }
+                val files = WorkspaceInfo.walkFiles(host.root, 400) { p ->
+                    val rel = p.relativeTo(host.root)
+                    rel.none { it.name in EXCLUDED_DIRS } && patterns.any { it.matches(rel) }
+                }.map { it.relativeTo(host.root).toString().replace('\\', '/') }.sorted()
                 emit("List ${call.pattern}", "done", "${files.size}개")
                 "[LIST ${call.pattern}] ${files.size}개\n${files.joinToString("\n")}"
             }
@@ -273,6 +313,17 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
                 val path = FileOps.resolveInRoot(host.root, rel)
                 val before = FileOps.read(path)
                 var warn = ""
+                if (call is ToolCall.Write && before == null && host.checkpoint.styleChecked.add(rel.removePrefix("./"))) {
+                    // 같은 스타일 강제: 새 파일인데 같은 역할의 기존 파일을 아직 안 읽었으면 한 번 멈추고 그 파일을 보여 준다
+                    val files = WorkspaceInfo.walkFiles(host.root, 6000).map { host.root.relativize(it).toString().replace('\\', '/') }
+                    val sib = WorkspaceInfo.pickStyleSibling(rel.removePrefix("./"), files)
+                    if (sib != null && sib !in host.checkpoint.readPaths) {
+                        val ex = FileOps.read(host.root.resolve(sib)).orEmpty().lines().take(80).joinToString("\n")
+                        emit("Style check $rel", "done", "기준 파일: $sib")
+                        return "[FILE $rel] 아직 만들지 않았습니다 — 같은 스타일로 만들기 위해 같은 역할의 기존 파일을 먼저 보세요.\n기준 파일: $sib\n```\n$ex\n```\n" +
+                            "위 파일의 구조·네이밍·어노테이션·예외 처리·주석 습관에 맞춰 FILE 을 다시 보내세요 (같은 내용이면 그대로 다시 보내도 됨)."
+                    }
+                }
                 val after: String = if (call is ToolCall.Write) {
                     if (call.content.endsWith("\n")) call.content else call.content + "\n"
                 } else {
@@ -285,12 +336,24 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
                     val r = Protocol.applySearchReplace(before, call.blocks)
                     if (r.applied == 0) {
                         emit("Edit $rel", "error", r.failed.joinToString("\n"))
-                        return "[EDIT $rel] 실패:\n${r.failed.joinToString("\n")}\n파일을 다시 READ 한 뒤 정확한 원문으로 SEARCH 하세요."
+                        return "[EDIT $rel] 실패 (파일은 그대로):\n${r.failed.joinToString("\n")}\n위에 보인 실제 원문으로 SEARCH 를 고쳐 EDIT 를 다시 하세요. FILE 로 파일 전체를 다시 쓰지 마세요."
                     }
                     if (r.failed.isNotEmpty()) warn = "\n일부 블록 실패:\n" + r.failed.joinToString("\n")
                     r.content
                 }
                 if (before == after) return "[${call.kind.uppercase()} $rel] 변경 사항 없음"
+                // 처음부터 다시 쓰기 방지: 기존 파일 대부분을 FILE 로 갈아엎으려 하면 한 번 멈추고 EDIT 를 권한다
+                if (before != null) {
+                    val kept = WorkspaceInfo.keptRatio(before, after)
+                    val lines = before.lines().size
+                    if (lines > 15 && kept < 0.6 && host.checkpoint.overwriteOk.add(rel.removePrefix("./"))) {
+                        val tag = if (call is ToolCall.Write) "FILE" else "EDIT"
+                        emit("Overwrite check $rel", "done", "기존 코드 ${(kept * 100).toInt()}% 만 남음")
+                        return "[$tag $rel] 적용하지 않았습니다 — 이 변경으로 기존 파일(${lines}줄)의 코드 ${((1 - kept) * 100).toInt()}% 가 사라집니다.\n" +
+                            "사용자가 기존 기능을 없애거나 바꾸라고 하지 않았다면, 기존 코드는 그대로 두고 필요한 부분만 추가·수정하세요 (작은 EDIT 여러 개).\n" +
+                            "사용자가 정말 기존 것을 대체하라고 했다면 같은 $tag 를 한 번 더 보내세요."
+                    }
+                }
                 val (added, removed) = Protocol.lineDiffStats(before ?: "", after)
                 val title = "${if (before == null) "Create" else "Edit"} $rel"
                 if (!host.approve("edit", title, "+$added −$removed")) {
@@ -305,7 +368,7 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
 
             is ToolCall.Run -> {
                 val title = "Run: ${call.command}"
-                if (!host.approve("run", title, call.command)) {
+                if (!WorkspaceInfo.isReadOnlyGit(call.command) && !host.approve("run", title, call.command)) {
                     emit(title, "denied")
                     return "[RUN ${call.command}] 사용자가 실행을 거부했습니다. 다른 방법을 제안하거나 이유를 물어보세요."
                 }
@@ -345,8 +408,28 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
                 "[REMEMBER] 저장됨: ${call.text}"
             }
 
+            is ToolCall.Analyze -> {
+                val target = if (call.path.isBlank()) host.root else FileOps.resolveInRoot(host.root, call.path)
+                val name = if (call.path.isBlank()) RemoteIndex.projectName(host.root) else ""
+                val title = "Analyze: ${call.path.ifBlank { name }}"
+                if (!host.approve("index", title, "이 PC 의 $target 코드·문서를 서버(맥)로 올려 임베딩하고 코딩 스타일·아키텍처를 분석합니다 (1~3분).")) {
+                    emit(title, "denied"); return "[ANALYZE] 사용자가 분석을 거부했습니다. 지금 있는 정보(LIST/READ)로 진행하세요."
+                }
+                emit(title, "running", "분석 시작")
+                val quiet = object : AgentLog { override fun line(text: String, level: String) {}; override fun raw(text: String) {}; override fun show() {} }
+                val (summary, md) = RemoteIndex.analyze(target, quiet, name, { host.isCancelled() }) { emit(title, "running", it) }
+                emit(title, "done", summary)
+                "[ANALYZE] 완료\n$summary\n\n## 아키텍처 · 코딩 규칙 (새로 분석)\n${md.take(7000).ifBlank { "(아키텍처 문서 없음)" }}"
+            }
+
             is ToolCall.Harness -> {
-                if (host.repoName.isBlank()) return "[HARNESS] 연결된 레포가 없습니다. 먼저 CONNECT 하세요."
+                if (Clients.remote || host.repoName.isBlank()) {
+                    // 원격: 코드가 이 PC 에 있으므로 서버 하네스 대신 여기서 테스트 우선으로 직접 진행
+                    val files = WorkspaceInfo.walkFiles(host.root, 3000).map { host.root.relativize(it).toString().replace('\\', '/') }
+                    val target = "${HarnessKit.DIR}/${HarnessKit.name(call.task.lineSequence().first().take(40))}.md"
+                    emit("Harness (이 PC 에서 테스트 우선)", "done", target)
+                    return "[HARNESS] 이 PC 에서 직접 진행합니다.\n" + HarnessKit.fromRequest(call.task, target, HarnessKit.detectTestCommand(files, Shell.isWindows))
+                }
                 val title = "Harness: ${call.task.lineSequence().first().take(60)}"
                 emit(title, "running", "요구사항 → 테스트 → 구현 반복 시작")
                 val jobId = Clients.post("/api/agent/run", mapOf("repo" to host.repoName, "task" to call.task)).getAsJsonObject("job").str("id")
@@ -406,6 +489,22 @@ fun executeTool(call: ToolCall, host: ToolHost): String {
             }
 
             is ToolCall.Connect -> {
+                val loc = call.location.trim()
+                if (!Regex("^(https?://|git@|ssh://)").containsMatchIn(loc)) {
+                    // 로컬 경로: 서버(맥)는 이 PC 의 폴더를 열 수 없다 → 이 PC 에서 읽어 서버로 올려 색인
+                    val abs = host.root.resolve(loc).normalize()
+                    if (abs.startsWith(host.root.normalize())) {
+                        emit("Connect $loc", "done", "이미 작업 폴더 안")
+                        return "[CONNECT $loc] 작업 폴더 안의 경로입니다. 이미 연결되어 있으니 READ / LIST / GREP 를 바로 쓰세요."
+                    }
+                    if (!Files.isDirectory(abs)) return "[CONNECT $loc] 이 PC 에 그런 폴더가 없습니다: $abs"
+                    if (Clients.remote) {
+                        emit("Connect $loc", "running", "이 PC 에서 읽어 서버로 올려 벡터화")
+                        RemoteIndex.ensure(abs, object : AgentLog { override fun line(text: String, level: String) {}; override fun raw(text: String) {}; override fun show() {} }, true)
+                        emit("Connect ${RemoteIndex.projectName(abs)}", "done", "색인 시작 (SEARCH 로 검색 가능)")
+                        return "[CONNECT $loc] ${RemoteIndex.projectName(abs)} 를 서버로 올려 벡터화를 시작했습니다. 그 레포의 코드는 SEARCH 로 찾을 수 있습니다 (파일 수정은 작업 폴더 안에서만)."
+                    }
+                }
                 emit("Connect ${call.location}", "running", "연결 + 벡터화 중")
                 val repo = Clients.post("/api/repos/connect", mapOf("location" to call.location, "init_if_missing" to false), 600).getAsJsonObject("repo")
                 val chunks = repo.getAsJsonObject("index_stats")?.get("chunks")
@@ -517,8 +616,8 @@ private fun runImage(call: ToolCall.Image, host: ToolHost, emit: (String, String
 private fun grepFiles(root: Path, pattern: String, cancelled: () -> Boolean): List<String> {
     val re = try { Regex(pattern) } catch (e: Exception) { Regex(Regex.escape(pattern)) }
     val out = mutableListOf<String>()
-    Files.walk(root).use { stream ->
-        val it = stream.filter { p -> p.relativeTo(root).none { seg -> seg.name in EXCLUDED_DIRS } && Files.isRegularFile(p) }.iterator()
+    run {
+        val it = WorkspaceInfo.walkFiles(root, 50_000) { p -> p.relativeTo(root).none { seg -> seg.name in EXCLUDED_DIRS } }.iterator()
         while (it.hasNext() && out.size < 200 && !cancelled()) {
             val p = it.next()
             val bytes = try { if (Files.size(p) > 1_000_000) continue else Files.readAllBytes(p) } catch (e: Exception) { continue }
@@ -550,7 +649,7 @@ private fun fileOp(call: ToolCall, host: ToolHost, emit: (String, String, String
         if (src.normalize() == host.root.normalize()) error("프로젝트 폴더 자체는 삭제·이동할 수 없습니다")
         if (!Files.exists(src)) return "[$tag $label] 오류: 파일이 없습니다"
         val isDir = Files.isDirectory(src)
-        if (!host.approve("edit", title, if (isDir) "폴더 전체 (되돌리기 대신 휴지통/로컬 기록에서 복구)" else "파일")) {
+        if (!host.approve("files", title, if (isDir) "폴더 전체 (되돌리기 대신 휴지통/로컬 기록에서 복구)" else "파일 (/undo 로 복구 가능)")) {
             emit(title, "denied", null)
             return "[$tag $label] 사용자가 거부했습니다"
         }
@@ -561,6 +660,7 @@ private fun fileOp(call: ToolCall, host: ToolHost, emit: (String, String, String
                 else host.checkpoint.record(src, bytes.toString(Charsets.UTF_8))
             }
             FileOps.delete(host.project, src)
+            if (Files.exists(src)) error("삭제 후에도 파일이 남아 있습니다 (다른 프로그램이 사용 중이거나 권한 문제)")
             emit(title, "done", if (isDir) "폴더 삭제" else "파일 삭제 (/undo 로 복구)")
             "[DELETE $label] 완료"
         } else {

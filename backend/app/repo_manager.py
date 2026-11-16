@@ -85,8 +85,13 @@ class RepoManager:
         path = Path(location).expanduser().resolve()
         if not path.exists():
             if not init_if_missing:
-                raise FileNotFoundError(f"경로가 없습니다: {path}")
-            path.mkdir(parents=True)
+                raise FileNotFoundError(
+                    f"서버(맥)에 없는 경로입니다: {path} — 원격 PC 의 폴더는 서버가 직접 열 수 없습니다. "
+                    "IDE 에서 그 폴더를 열면 자동으로 분석·벡터화됩니다 (git URL 은 CONNECT 가능).")
+            try:
+                path.mkdir(parents=True)
+            except OSError as exc:
+                raise FileNotFoundError(f"서버(맥)에 폴더를 만들 수 없습니다: {path} ({exc.strerror})") from exc
         if not (path / ".git").exists():
             if not init_if_missing:
                 raise RuntimeError(f"git 레포가 아닙니다: {path} (새 프로젝트면 init_if_missing=true)")

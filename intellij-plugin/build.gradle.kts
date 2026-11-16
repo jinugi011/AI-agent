@@ -3,8 +3,16 @@ plugins {
     id("org.jetbrains.intellij.platform") version "2.20.1"
 }
 
+// 대상 IDE: intellij(기본) | android (Android Studio — 내장 브라우저가 없어 Swing 채팅 화면으로 동작)
+//   ./gradlew buildPlugin -PtargetIde=android   → build-android/distributions/local-coding-agent-android-studio-*.zip
+val targetIde = providers.gradleProperty("targetIde").getOrElse("intellij")
+val isAndroid = targetIde == "android"
+if (isAndroid) layout.buildDirectory.set(layout.projectDirectory.dir("build-android"))
+// Allow verification without racing the IDE's own build outputs.
+providers.gradleProperty("buildOutput").orNull?.let { layout.buildDirectory.set(layout.projectDirectory.dir(it)) }
+
 group = "com.localagent"
-version = "0.6.0"
+version = "0.9.1"
 
 repositories {
     mavenCentral()
@@ -15,7 +23,7 @@ kotlin { jvmToolchain(21) }
 
 dependencies {
     intellijPlatform {
-        local(providers.gradleProperty("localIdePath"))
+        local(providers.gradleProperty(if (isAndroid) "androidStudioPath" else "localIdePath"))
     }
     testImplementation(kotlin("test"))
     testImplementation("junit:junit:4.13.2")
@@ -25,7 +33,8 @@ dependencies {
 intellijPlatform {
     pluginConfiguration {
         ideaVersion {
-            sinceBuild = "252"
+            // Android Studio 2025.1 = 빌드 251 (IntelliJ 2025.1 기반)
+            sinceBuild = if (isAndroid) "251" else "252"
             untilBuild = provider { null }
         }
     }
@@ -60,4 +69,11 @@ val writeServerJson by tasks.registering {
 sourceSets["main"].resources.srcDir(layout.buildDirectory.dir("generated/server"))
 tasks.processResources { dependsOn(copyChatUi, writeServerJson) }
 
-tasks.test { useJUnit() }
+tasks.test {
+    useJUnit()
+    System.getenv("YANG_SHOT")?.let { systemProperty("yang.shot", it) }
+}
+
+if (isAndroid) {
+    tasks.named<Zip>("buildPlugin") { archiveBaseName.set("local-coding-agent-android-studio") }
+}

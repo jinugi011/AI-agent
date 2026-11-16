@@ -6,7 +6,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import re
+import threading
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -24,6 +26,7 @@ try:
         Filter,
         FilterSelector,
         MatchValue,
+        PointIdsList,
         PointStruct,
         VectorParams,
     )
@@ -35,7 +38,11 @@ CODE_EXTENSIONS = {
     ".java": "java", ".kt": "kotlin", ".kts": "kotlin", ".dart": "dart", ".swift": "swift", ".go": "go",
     ".rs": "rust", ".cpp": "cpp", ".cc": "cpp", ".hpp": "cpp", ".h": "cpp", ".c": "c", ".sql": "sql",
     ".md": "markdown", ".yaml": "yaml", ".yml": "yaml", ".json": "json", ".toml": "toml", ".css": "css",
+    # 문서 · MyBatis 매퍼 · Spring/Gradle 설정 (플러그인이 올리는 파일 — 예전에는 여기서 빠져 검색되지 않았다)
+    ".xml": "xml", ".properties": "properties", ".gradle": "gradle", ".adoc": "asciidoc", ".rst": "rst", ".txt": "text",
 }
+# 색인이 관리하는 항목 종류 (재색인 때 사라진 파일의 것만 정리). history 등 다른 종류는 건드리지 않는다.
+INDEX_KINDS = ("code", "style-config", "methods")
 SKIP_DIRS = {
     ".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "target", ".next", "Pods",
     ".dart_tool", ".gradle", ".idea", ".vscode", "coverage", ".pytest_cache", "DerivedData", "models",
@@ -180,12 +187,17 @@ class CodeVectorStore:
     def backend(self) -> str:
         return "qdrant" if self.qdrant_client is not None else "memory"
 
+    _model_lock = threading.Lock()
+
     @property
     def model(self):
+        # 여러 요청(원격 색인 + 검색)이 동시에 처음 로드하면 torch 가 "meta tensor" 오류를 낸다 → 한 번만 로드
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            with self._model_lock:
+                if self._model is None:
+                    from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(settings.embedding_model)
+                    self._model = SentenceTransformer(settings.embedding_model)
         return self._model
 
     def embed(self, texts: List[str]) -> np.ndarray:
@@ -224,6 +236,42 @@ class CodeVectorStore:
             )
         return len(items)
 
+    def delete_ids(self, collection: str, ids: List[str]) -> None:
+        if not ids:
+            return
+        if self.qdrant_client is None:
+            drop = set(ids)
+            self._memory[collection] = [p for p in self._memory.get(collection, []) if p["id"] not in drop]
+            return
+        for start in range(0, len(ids), 512):
+            self.qdrant_client.delete(collection_name=collection, points_selector=PointIdsList(points=ids[start:start + 512]))
+
+    def existing_hashes(self, collection: str, project: str, sources: Optional[set] = None) -> Dict[str, Tuple[str, str]]:
+        """프로젝트의 기존 항목: point id → (내용 해시, 종류). 재색인 때 바뀐 것만 다시 임베딩하려고."""
+        out: Dict[str, Tuple[str, str]] = {}
+        if self.qdrant_client is None:
+            for p in self._memory.get(collection, []):
+                if p["payload"].get("project") == project and (sources is None or p["payload"].get("source") in sources):
+                    out[p["id"]] = (p["payload"].get("hash", ""), p["payload"].get("kind", ""))
+            return out
+        if not self.qdrant_client.collection_exists(collection_name=collection):
+            return out
+        must = [FieldCondition(key="project", match=MatchValue(value=project))]
+        if sources is not None:
+            if not sources:
+                return out
+            from qdrant_client.models import MatchAny
+            must.append(FieldCondition(key="source", match=MatchAny(any=sorted(sources))))
+        flt = Filter(must=must)
+        offset = None
+        while True:
+            points, offset = self.qdrant_client.scroll(collection_name=collection, scroll_filter=flt, limit=1024, offset=offset,
+                                                       with_payload=["hash", "kind", "source"], with_vectors=False)
+            for pt in points:
+                out[str(pt.id)] = ((pt.payload or {}).get("hash", ""), (pt.payload or {}).get("kind", ""))
+            if offset is None:
+                return out
+
     def delete_where(self, collection: str, key: str, value: str) -> None:
         if self.qdrant_client is None:
             self._memory[collection] = [p for p in self._memory.get(collection, []) if p["payload"].get(key) != value]
@@ -257,9 +305,50 @@ class CodeVectorStore:
                    for f in STYLE_CONFIG_FILES if (root_path / f).is_file()}
         return self.index_docs(project, read_docs(root_path, files), configs)
 
-    def index_docs(self, project: str, docs: List[SourceDoc], configs: Dict[str, str]) -> Dict[str, Any]:
-        """파일 내용 목록을 청크 단위로 벡터화하고 코딩 방법 요약을 함께 저장한다. 이전 색인은 교체.
+    _project_locks: Dict[str, threading.Lock] = {}
+    _locks_guard = threading.Lock()
+
+    def _project_lock(self, project: str) -> threading.Lock:
+        with self._locks_guard:
+            return self._project_locks.setdefault(project, threading.Lock())
+
+    def index_docs(self, project: str, docs: List[SourceDoc], configs: Dict[str, str],
+                   partial: bool = False, deleted: Optional[List[str]] = None) -> Dict[str, Any]:
+        """파일 내용 목록을 청크 단위로 벡터화하고 코딩 방법 요약을 함께 저장한다.
+        - 증분: 내용 해시가 같은 청크는 다시 임베딩하지 않는다 (바뀐 파일만 계산).
+        - 안전한 교체: 새 항목을 모두 넣은 뒤에만, 더 이상 없는 파일의 항목을 지운다 (도중에 실패해도 기존 검색 데이터 유지).
+        - 같은 프로젝트의 색인은 한 번에 하나 (프로젝트별 잠금).
         원격 PC 의 IDE 플러그인이 업로드한 파일도 이 경로로 색인된다."""
+        with self._project_lock(project):
+            if partial:
+                return self._index_partial(project, docs, deleted or [])
+            return self._index_docs(project, docs, configs)
+
+    def _index_partial(self, project: str, docs: List[SourceDoc], deleted: List[str]) -> Dict[str, Any]:
+        """바뀐 파일만 갱신 (에이전트가 고친 직후): 그 파일들의 청크만 다시 넣고, 파일별로 줄어든 청크·삭제된 파일 항목을 지운다.
+        코딩 방법 요약·설정은 전체 색인 때만 갱신한다."""
+        docs = [(rel, text) for rel, text in docs if Path(rel).suffix.lower() in CODE_EXTENSIONS]
+        touched = {rel for rel, _ in docs} | set(deleted)
+        items: List[Dict[str, Any]] = []
+        for rel, text in docs:
+            if not text.strip():
+                continue
+            lang = CODE_EXTENSIONS[Path(rel).suffix.lower()]
+            for i, chunk in enumerate(chunk_text(text)):
+                item = {"id_key": f"{project}:{rel}:{i}", "text": f"{project} {rel}\n{chunk[:2000]}",
+                        "payload": {"project": project, "source": rel, "language": lang, "kind": "code", "chunk": i, "content": chunk[:4000]}}
+                item["payload"]["hash"] = hashlib.sha1(item["text"].encode("utf-8")).hexdigest()
+                items.append(item)
+        ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, it["id_key"])) for it in items]
+        existing = self.existing_hashes(self.collection_name, project, sources=touched)
+        changed = [it for pid, it in zip(ids, items) if existing.get(pid, ("", ""))[0] != it["payload"]["hash"]]
+        self.upsert(self.collection_name, changed)
+        keep = set(ids)
+        stale = [pid for pid, (_h, kind) in existing.items() if pid not in keep and kind == "code"]
+        self.delete_ids(self.collection_name, stale)
+        return {"files": len(docs), "chunks": len(items), "embedded": len(changed), "removed": len(stale), "partial": True}
+
+    def _index_docs(self, project: str, docs: List[SourceDoc], configs: Dict[str, str]) -> Dict[str, Any]:
         docs = [(rel, text) for rel, text in docs if Path(rel).suffix.lower() in CODE_EXTENSIONS]
         methods = extract_coding_methods_docs(docs, set(configs))
 
@@ -287,9 +376,17 @@ class CodeVectorStore:
             "payload": {"project": project, "source": "coding-methods", "language": "meta", "kind": "methods", "content": methods_text},
         })
 
-        self.delete_where(self.collection_name, "project", project)
-        count = self.upsert(self.collection_name, items)
-        return {"files": len(docs), "chunks": count, "methods": methods, "backend": self.backend}
+        for it in items:
+            it["payload"]["hash"] = hashlib.sha1(it["text"].encode("utf-8")).hexdigest()
+        ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, it["id_key"])) for it in items]
+        existing = self.existing_hashes(self.collection_name, project)
+        changed = [it for pid, it in zip(ids, items) if existing.get(pid, ("", ""))[0] != it["payload"]["hash"]]
+        self.upsert(self.collection_name, changed)  # 여기서 실패하면 예외 → 아래 정리는 하지 않아 기존 데이터가 남는다
+        keep = set(ids)
+        stale = [pid for pid, (_h, kind) in existing.items() if pid not in keep and kind in INDEX_KINDS]
+        self.delete_ids(self.collection_name, stale)
+        return {"files": len(docs), "chunks": len(items), "embedded": len(changed), "removed": len(stale),
+                "methods": methods, "backend": self.backend}
 
     def project_methods(self, project: str) -> Optional[str]:
         hits = self.query(self.collection_name, f"{project} 코딩 방법 요약", top_k=1, filters={"project": project, "kind": "methods"})

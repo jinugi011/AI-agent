@@ -3,6 +3,9 @@ import AgentWorkbench from './AgentWorkbench';
 import TokenManager from './TokenManager';
 import Downloads from './Downloads';
 import ImageStudio from './ImageStudio';
+import ServerAdmin from './ServerAdmin';
+import Console from './Console';
+import LangChainBuilder from './LangChainBuilder';
 
 // 같은 주소(origin)로 API 호출: 백엔드가 이 페이지를 직접 서비스하므로 localhost·Tailscale 주소 어디서 열어도 동작
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
@@ -18,7 +21,10 @@ const promptTemplates = [
 
 const menuItems = [
   { id: 'agent', label: 'Yang Coding' },
+  { id: 'langchain', label: 'LangChain 빌더' },
   { id: 'images', label: '이미지 스튜디오' },
+  { id: 'server', label: '서버 관리' },
+  { id: 'console', label: '명령 창' },
   { id: 'tokens', label: '접속 토큰' },
   { id: 'downloads', label: '플러그인' },
   { id: 'overview', label: 'Overview' },
@@ -61,6 +67,7 @@ function App() {
   const [mode, setMode] = useState('implement');
   const [workspace, setWorkspace] = useState('/Users/jinugi/Desktop/Project2026/AI-agent/generated_projects');
   const [selectedView, setSelectedView] = useState('agent');
+  const [chainTask, setChainTask] = useState('');
   const [loading, setLoading] = useState(false);
   const [deployLoading, setDeployLoading] = useState(false);
   const [result, setResult] = useState(null);
@@ -536,8 +543,11 @@ function App() {
           <div className="workspace-status">상태: 준비 완료</div>
         </div>
 
-        {selectedView === 'agent' && <AgentWorkbench apiBase={API_BASE_URL} />}
+        {selectedView === 'agent' && <AgentWorkbench apiBase={API_BASE_URL} initialTask={chainTask} />}
+        {selectedView === 'langchain' && <LangChainBuilder apiBase={API_BASE_URL} onImplement={(task) => { setChainTask(task); setSelectedView('agent'); }} />}
         {selectedView === 'images' && <ImageStudio apiBase={API_BASE_URL} />}
+        {selectedView === 'server' && <ServerAdmin apiBase={API_BASE_URL} />}
+        {selectedView === 'console' && <Console apiBase={API_BASE_URL} />}
         {selectedView === 'tokens' && <TokenManager apiBase={API_BASE_URL} />}
         {selectedView === 'downloads' && <Downloads apiBase={API_BASE_URL} onOpenTokens={() => setSelectedView('tokens')} />}
         {selectedView === 'overview' && renderOverview()}

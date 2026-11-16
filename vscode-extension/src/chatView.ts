@@ -3,10 +3,14 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { AgentEvent, AgentLog, AgentSession, Attachment, EditorContext } from './agent';
 import { backend, engine, isRemote, lastBackendError, serverUrl, getDefaultServer } from './clients';
-import { ensureRemoteIndex } from './remoteIndex';
+import { listFiles } from './debugRunner';
+import { analyzeProject, ensureRemoteIndex, remoteProjectName } from './remoteIndex';
+import { checklistProgress, detectTestCommand, harnessFromRequestPrompt, harnessName, harnessPrompt, HARNESS_DIR, isChecklist } from './harnesskit';
 import { describeCall, parseToolCalls, ToolCall } from './protocol';
 import { debugPrompt, parsePlay } from './debugkit';
 import * as art from './art';
+import { generateWorkflow, RemoteInbox } from './remoteWork';
+import { workflowRequest, WorkflowMode } from './workflow';
 import { Checkpoint, executeTool, OriginalContentProvider } from './tools';
 
 const HELP = `**사용법** — 자연어로 요청하면 됩니다. 예:
@@ -17,9 +21,16 @@ const HELP = `**사용법** — 자연어로 요청하면 됩니다. 예:
 
 **슬래시 명령**
 - \`/new\` 새 대화 · \`/stop\` 중단 · \`/undo\` 마지막 턴의 파일 변경 되돌리기
-- \`/model [status|download <key>|start [key]|stop]\`
+- \`/model\` 모델 목록 · \`/model 코딩\` 평소 코딩 (Qwen3.6) · \`/model 이전\` 이전 모델 (Qwen3-Coder-30B)
 - \`/remember <style|preference|constraint> <global|language:x|profile:x|project> 내용\`
 - \`/task 요구사항\` → 하네스(테스트 우선) 자동 구현 · \`/connect 경로|URL\` · \`/reindex\`
+
+**프로젝트 분석 · 같은 스타일로 코딩**
+- \`/langchain 원하는 기능\` 서버 LangChain으로 명세 생성 → 이 PC에서 구현 · \`/langchain 하네스 목표와 완료 조건\` 테스트 우선 구현
+- 입력창 작업 방식에서 **자연어 하네스**를 선택하면 문서 없이 목표·완료 조건을 입력할 수 있습니다.
+- \`/arch 분석\` 코드·문서 임베딩 + 코딩 스타일 + 아키텍처 분석 (1~3분) · \`/arch\` 보기 · \`/arch 저장\` (.yang/architecture.md 를 고친 뒤)
+- \`/harness 문서.md\` 요구사항 md → 체크리스트(.yang/harness) → 테스트 먼저 → 구현 → 통과까지 · \`/harness\` 목록·진행률
+- 에이전트도 필요하면 스스로 ANALYZE(프로젝트 분석)를 요청합니다 (승인 창)
 
 **디버깅**
 - \`/debug 증상\` → 재현(실행) → 원인 위치 → 가설 → 임시 로그 → 수정 → 재검증 → 정리 순서로 버그 잡기
@@ -44,6 +55,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private pending: AgentEvent[] = [];
   /** 이번 세션에서 올린 첨부 (id → 분석 결과) */
   private attached = new Map<string, Attachment>();
+  private workflowAbort?: AbortController;
 
   constructor(
     private readonly ctx: vscode.ExtensionContext,
@@ -56,6 +68,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       diffProvider,
       log,
     );
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (root) ctx.subscriptions.push(new RemoteInbox({
+      target: () => isRemote() && vscode.workspace.workspaceFolders?.[0]?.uri.fsPath === root.fsPath ? { project: remoteProjectName(root), workspace: root.fsPath } : undefined,
+      busy: () => this.session.running || !!this.workflowAbort,
+      approve: async (text, signal) => {
+        await vscode.commands.executeCommand('localAgent.chat.focus');
+        return (await this.askApproval('run', '웹에서 전달한 원격 작업', `${root.fsPath}\n\n${text}`, signal)) !== 'deny';
+      },
+      run: (text, mode) => this.runWorkflowTask(text, mode),
+      cancel: () => {
+        if (this.workflowAbort) {
+          this.workflowAbort.abort();
+          this.session.stop();
+          for (const resolve of this.approvals.values()) resolve('deny');
+          this.approvals.clear();
+        }
+      },
+      notice: (text) => this.post({ type: 'notice', level: 'warn', text }),
+    }));
   }
 
   resolveWebviewView(view: vscode.WebviewView) {
@@ -104,11 +135,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   // ---- 승인 -------------------------------------------------------------------
-  private askApproval(kind: 'edit' | 'run', title: string, detail: string): Promise<'allow' | 'always' | 'deny'> {
+  private askApproval(kind: 'edit' | 'run' | 'files' | 'index', title: string, detail: string, signal?: AbortSignal): Promise<'allow' | 'always' | 'deny'> {
+    if (signal?.aborted) return Promise.resolve('deny');
     const reqId = `ap${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
     void vscode.commands.executeCommand('localAgent.chat.focus');
     this.post({ type: 'approval', reqId, kind, title, detail });
-    return new Promise((resolve) => this.approvals.set(reqId, resolve));
+    return new Promise((resolve) => {
+      const finish = (answer: 'allow' | 'always' | 'deny') => {
+        signal?.removeEventListener('abort', abort);
+        this.approvals.delete(reqId);
+        resolve(answer);
+      };
+      const abort = () => finish('deny');
+      this.approvals.set(reqId, finish);
+      signal?.addEventListener('abort', abort, { once: true });
+    });
   }
 
   // ---- 웹뷰 → 확장 메시지 ----------------------------------------------------------
@@ -123,6 +164,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'attachUris':
         return this.attachUris(Array.isArray(m.uris) ? m.uris.map(String) : []);
       case 'stop':
+        this.workflowAbort?.abort();
         return this.session.stop();
       case 'new':
         return this.newChat();
@@ -150,6 +192,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   newChat() {
+    this.workflowAbort?.abort();
     this.session.reset();
     for (const resolve of this.approvals.values()) resolve('deny');
     this.approvals.clear();
@@ -190,20 +233,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   async handleInput(text: string, extraEditor?: Partial<EditorContext>, attachmentIds: string[] = []) {
     text = text.trim();
     if (!text) return;
+    if ((this.workflowAbort || this.session.running) && !/^\/(stop|new|clear)$/.test(text)) return this.post({ type: 'notice', level: 'warn', text: '현재 작업이 끝나거나 중단된 뒤 요청하세요.' });
     const atts = attachmentIds.map((id) => this.attached.get(id)).filter((a): a is Attachment => !!a);
     this.post({ type: 'user', text, attachments: atts.map((a) => a.name) });
 
     if (text.startsWith('/')) {
       const [cmd, ...rest] = text.split(/\s+/);
-      const arg = rest.join(' ');
+      const arg = text.slice(cmd.length).trim();
       switch (cmd) {
         case '/help': return this.post({ type: 'notice', level: 'info', text: HELP });
         case '/new': case '/clear': return this.newChat();
-        case '/stop': return this.session.stop();
+        case '/stop': this.workflowAbort?.abort(); return this.session.stop();
         case '/undo': return this.undo();
         case '/log': return vscode.commands.executeCommand('localAgent.showLog');
         case '/model': {
-          const [action = 'status', ...a] = rest;
+          const [action = '', ...a] = rest;
+          const preset = ({ '코딩': 'coder', coder: 'coder', '이전': 'coder-old', '30b': 'coder-old', 'coder-old': 'coder-old', } as Record<string, string>)[action.toLowerCase()];
+          if (!action || preset) {
+            try {
+              if (!preset) {
+                const r: any = await backend.get('/api/admin/models');
+                const list = r.presets.map((m: any) => `- ${m.active ? '✅' : m.available ? '⬜' : '⏳'} **${m.label}** — ${m.help}${m.available ? '' : ' (아직 없음)'}`).join('\n');
+                return this.post({ type: 'notice', level: 'info', text: `${list}\n\n\`/model 코딩\` · \`/model 이전\` 으로 바꿉니다 (엔진 재시작 20~60초).` });
+              }
+              const r: any = await backend.post('/api/admin/models', { preset });
+              this.post({ type: 'notice', level: 'info', text: r.message });
+              for (let i = 0; i < 60; i++) {
+                await new Promise((res) => setTimeout(res, 3000));
+                const st: any = await backend.get('/api/engine/status', 3000).catch(() => null);
+                if (st?.online && i > 1) return this.post({ type: 'notice', level: 'info', text: `모델 준비 완료: ${st.model?.model_name ?? ''}` });
+              }
+              return this.post({ type: 'notice', level: 'warn', text: '엔진이 아직 준비되지 않았습니다. 관리 페이지 → 서버 관리에서 로그를 확인하세요.' });
+            } catch (e: any) {
+              return this.post({ type: 'notice', level: 'error', text: `모델 변경 실패: ${e.message}` });
+            }
+          }
           return this.runDirect({ kind: 'model', action, arg: a.join(' ') });
         }
         case '/remember': {
@@ -211,7 +275,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           return calls[0] ? this.runDirect(calls[0]) : undefined;
         }
         case '/connect': return this.runDirect({ kind: 'connect', location: arg });
-        case '/task': return this.session.send(`다음 요구사항을 HARNESS 도구로 구현해줘:\n${arg}`, this.editorContext(extraEditor));
+        case '/langchain': case '/chain': {
+          const request = workflowRequest(arg);
+          if (!request.goal) return this.post({ type: 'notice', level: 'info', text: '/langchain 원하는 기능 · /langchain 하네스 목표와 완료 조건' });
+          return this.runWorkflowTask(request.goal, request.mode, true).catch(() => undefined);
+        }
         case '/debug': return this.session.send(debugPrompt(arg), this.editorContext(extraEditor), atts, { debug: true });
         case '/check': return this.runDirect({ kind: 'check' });
         case '/play': return this.runDirect({ kind: 'play', req: parsePlay(arg) });
@@ -240,6 +308,70 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             '한 응답에 최대 4개씩, 모두 만든 뒤 CHECK 로 경로 오류가 없는지 확인하세요.', this.editorContext(extraEditor), atts);
         }
         case '/image': return this.session.send(`다음 그림을 IMAGE 도구로 만들어 프로젝트에 추가하고, 필요하면 코드에서 불러오도록 연결해줘 (prompt 는 영어로):\n${arg}`, this.editorContext(extraEditor), atts);
+        case '/task': case '/harness': {
+          const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+          if (!root) return this.post({ type: 'notice', level: 'warn', text: '폴더를 먼저 여세요.' });
+          const files = await listFiles(root, 4000);
+          const testCmd = detectTestCommand(files, process.platform === 'win32');
+          const target = (n: string) => `${HARNESS_DIR}/${n}.md`;
+          if (!arg.trim()) {
+            const hs = files.filter((f) => f.startsWith(HARNESS_DIR + '/') && f.endsWith('.md'));
+            const lines: string[] = [];
+            for (const f of hs) {
+              const t = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, ...f.split('/')))).toString('utf8');
+              const p = checklistProgress(t);
+              lines.push(`- \`${f}\` ${p.done}/${p.total} 완료`);
+            }
+            const docs = files.filter((f) => /\.(md|markdown)$/i.test(f) && !f.startsWith('.yang/') && !/node_modules|CHANGELOG|LICENSE/i.test(f)).slice(0, 15);
+            return this.post({ type: 'notice', level: 'info', text:
+              `**하네스** (요구사항 md → 테스트 우선 구현, 테스트 명령: \`${testCmd || '감지 못함'}\`)\n\n` +
+              (lines.length ? `진행 중인 하네스:\n${lines.join('\n')}\n\n` : '') +
+              `사용법: \`/harness docs/기능명세.md\` · \`/harness .yang/harness/x.md\` (이어서) · \`/harness 요구사항 문장\`` +
+              (docs.length ? `\n\n프로젝트의 md 문서:\n${docs.map((d) => `- \`${d}\``).join('\n')}` : '') });
+          }
+          const mdPath = arg.trim();
+          if (/\.(md|markdown|txt)$/i.test(mdPath)) {
+            const uri = vscode.Uri.joinPath(root, ...mdPath.replace(/^\.?\//, '').split('/'));
+            const text = await vscode.workspace.fs.readFile(uri).then((b) => Buffer.from(b).toString('utf8'), () => null);
+            if (text === null) return this.post({ type: 'notice', level: 'warn', text: `파일이 없습니다: ${mdPath}` });
+            const own = mdPath.replace(/^\.?\//, '').startsWith(HARNESS_DIR + '/') || isChecklist(text);
+            const tgt = own ? mdPath.replace(/^\.?\//, '') : target(harnessName(mdPath));
+            const resume = own || files.includes(tgt);
+            this.post({ type: 'notice', level: 'info', text: `하네스 시작: ${mdPath} → \`${tgt}\`${resume ? ' (이어서)' : ''} · 테스트 \`${testCmd || '감지 못함'}\`` });
+            return this.session.send(harnessPrompt({ source: mdPath, text, target: tgt, testCmd, resume }), this.editorContext(extraEditor), atts, { harness: true });
+          }
+          const tgt = target(harnessName(mdPath.split(/\s+/).slice(0, 4).join('-')));
+          return this.session.send(harnessFromRequestPrompt(mdPath, tgt, testCmd), this.editorContext(extraEditor), atts, { harness: true });
+        }
+        case '/arch': {
+          const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+          if (!root) return this.post({ type: 'notice', level: 'warn', text: '폴더를 먼저 여세요.' });
+          const project = remoteProjectName(root);
+          if (arg.trim() === '분석') {
+            this.post({ type: 'notice', level: 'info', text: '프로젝트를 올려 분석합니다: 코드·문서 임베딩 → 코딩 스타일 → 아키텍처 (1~3분).' });
+            try {
+              const r = await analyzeProject(root, this.log, (p) => this.log.line(`[분석] ${p}`, 'info'));
+              if (r.architecture) await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(root, '.yang', 'architecture.md'), Buffer.from(r.architecture, 'utf8')).then(undefined, () => undefined);
+              return this.post({ type: 'notice', level: 'info', text: `${r.summary}\n\n${r.architecture || '(아키텍처 문서 없음)'}` });
+            } catch (e: any) {
+              return this.post({ type: 'notice', level: 'error', text: `분석 실패: ${e.message}` });
+            }
+          }
+          if (arg.trim() === '저장') {
+            const md = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(root, '.yang', 'architecture.md')).then((b) => Buffer.from(b).toString('utf8'), () => '');
+            if (!md.trim()) return this.post({ type: 'notice', level: 'warn', text: '.yang/architecture.md 가 없습니다. 먼저 `/arch` 로 받으세요.' });
+            await backend.put(`/api/arch/${encodeURIComponent(project)}`, { markdown: md });
+            return this.post({ type: 'notice', level: 'info', text: '아키텍처 규칙을 저장했습니다. 다음 요청부터 적용됩니다.' });
+          }
+          const r: any = await backend.get(`/api/arch/${encodeURIComponent(project)}`).catch((e: any) => ({ error: e.message }));
+          if (r.markdown) {
+            await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(root, '.yang')).then(undefined, () => undefined);
+            await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(root, '.yang', 'architecture.md'), Buffer.from(r.markdown, 'utf8')).then(undefined, () => undefined);
+          }
+          const status = r.status === 'analyzing' ? '\n\n(지금 다시 분석 중…)' : r.status === 'error' ? `\n\n(최근 분석 실패: ${r.error})` : '';
+          return this.post({ type: 'notice', level: 'info', text: (r.markdown ?? '아직 아키텍처 분석이 없습니다. `/arch 분석` 으로 시작하세요.') + status +
+            '\n\n(`/arch 분석` 다시 분석 · `.yang/architecture.md` 를 고친 뒤 `/arch 저장` 하면 내 규칙으로 덮어씀)' });
+        }
         case '/reindex':
           if (isRemote()) {
             const root = vscode.workspace.workspaceFolders?.[0]?.uri;
@@ -255,6 +387,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     await this.session.send(text, this.editorContext(extraEditor), atts);
+  }
+
+  private async runWorkflowTask(text: string, mode: WorkflowMode, generate = false): Promise<void> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!root || this.session.running || this.workflowAbort) throw new Error('프로젝트가 없거나 다른 작업이 실행 중입니다');
+    const ctrl = this.workflowAbort = new AbortController();
+    this.post({ type: 'busy', busy: true });
+    try {
+      const task = generate ? await generateWorkflow(text, remoteProjectName(root), mode, ctrl.signal,
+        (s) => this.post({ type: 'notice', level: 'info', text: s })) : text;
+      if (ctrl.signal.aborted) throw new Error('중단됨');
+      const files = mode === 'harness' ? await listFiles(root, 4000) : [];
+      const prompt = mode === 'harness' ? harnessFromRequestPrompt(task, `${HARNESS_DIR}/workflow-${Date.now()}.md`, detectTestCommand(files, process.platform === 'win32')) : task;
+      await this.session.send(prompt, this.editorContext(), [], { harness: mode === 'harness' });
+      if (ctrl.signal.aborted) throw new Error('사용자가 중단했습니다');
+    } catch (e: any) {
+      this.post({ type: 'notice', level: 'error', text: `워크플로 오류: ${e.message}` });
+      throw e;
+    } finally { this.workflowAbort = undefined; this.post({ type: 'busy', busy: false }); }
   }
 
   // ---- 첨부 파일 (이미지 · PDF · MD) → 서버에서 분석 ---------------------------------

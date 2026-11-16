@@ -14,7 +14,19 @@ async function api(base, path, options = {}) {
   return data;
 }
 
-export default function AgentWorkbench({ apiBase }) {
+const CONNECT_MODES = [
+  { id: 'remote', label: '원격 PC 경로', field: '원격 PC 의 프로젝트 폴더 경로',
+    placeholder: '/Users/me/work/gehs  ·  C:\\work\\gehs',
+    help: '회사 PC 등 원격 PC 의 폴더 경로를 등록합니다. 그 PC 의 IDE(Yang Coding 플러그인)가 켜질 때·10분마다·요청할 때 경로를 찾아 파일을 올리고, 코드·문서 임베딩 → 코딩 스타일 → 아키텍처 분석을 합니다.' },
+  { id: 'upload', label: '원격 PC 폴더 올리기', field: '',
+    placeholder: '', help: '지금 이 브라우저가 열린 PC 의 폴더를 바로 골라 올립니다 (IDE 없이도 등록 · 코드 파일만, 최대 2,500개).' },
+  { id: 'server', label: '이 맥 경로', field: '서버(맥)의 폴더 경로',
+    placeholder: '/Users/jinugi/projects/shop', help: '서버 맥에 있는 폴더를 연결합니다 (서버에서 직접 읽고 색인).' },
+  { id: 'git', label: 'git URL', field: 'git 원격 주소',
+    placeholder: 'https://github.com/me/app.git', help: '서버 맥에 clone 해서 연결합니다.' },
+];
+
+export default function AgentWorkbench({ apiBase, initialTask = '' }) {
   const [profiles, setProfiles] = useState([]);
   const [repos, setRepos] = useState([]);
   const [prefs, setPrefs] = useState([]);
@@ -22,10 +34,14 @@ export default function AgentWorkbench({ apiBase }) {
   const [selectedRepo, setSelectedRepo] = useState('');
   const [activeJob, setActiveJob] = useState(null);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [connectMode, setConnectMode] = useState('remote');
+  const [remoteProjects, setRemoteProjects] = useState({});
+  const [archView, setArchView] = useState(null);
   const [busy, setBusy] = useState('');
 
   const [connectForm, setConnectForm] = useState({ location: '', name: '', profile: '', language: '', init_if_missing: false });
-  const [task, setTask] = useState('');
+  const [task, setTask] = useState(initialTask);
   const [iterations, setIterations] = useState(4);
   const [prefForm, setPrefForm] = useState({ text: '', kind: 'constraint', scope: 'global', scope_value: '' });
   const pollRef = useRef(null);
@@ -51,6 +67,7 @@ export default function AgentWorkbench({ apiBase }) {
         api(apiBase, '/api/preferences'),
         api(apiBase, '/api/agent/jobs'),
       ]);
+      api(apiBase, '/api/remote/projects').then((x) => setRemoteProjects(x.projects || {})).catch(() => undefined);
       setProfiles(p.profiles);
       setRepos(r.repos);
       setPrefs(pr.items);
@@ -89,11 +106,53 @@ export default function AgentWorkbench({ apiBase }) {
   const connectRepo = (e) => {
     e.preventDefault();
     run('connect', async () => {
-      const data = await api(apiBase, '/api/repos/connect', { method: 'POST', body: JSON.stringify(connectForm) });
+      const data = await api(apiBase, '/api/repos/connect', { method: 'POST', body: JSON.stringify({ ...connectForm, target: connectMode === 'remote' ? 'remote' : 'server' }) });
+      if (data.pending) {
+        setNotice(data.message);
+        setConnectForm((f) => ({ ...f, location: '', name: '' }));
+        await refresh();
+        return;
+      }
       setSelectedRepo(data.repo.name);
       setConnectForm((f) => ({ ...f, location: '', name: '' }));
       await refresh();
     });
+  };
+
+  // 브라우저에서 고른 폴더를 그대로 올려 원격 프로젝트로 등록 (코드 임베딩 · 코딩 스타일 · 아키텍처 분석)
+  const uploadFolder = (e) => {
+    const list = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (!list.length) return;
+    run('upload', async () => {
+      const skip = /(^|\/)(node_modules|\.git|dist|build|target|\.venv|venv|__pycache__|\.next|Pods|\.dart_tool|\.gradle|out|\.idea|coverage)\//;
+      const ok = /\.(py|js|jsx|ts|tsx|java|kt|kts|dart|swift|go|rs|cpp|cc|hpp|h|c|sql|md|ya?ml|json|toml|css|adoc|rst|gradle|properties)$|Mapper\.xml$|(^|\/)(mapper|mappers|sqlmap|mybatis)\/.*\.xml$|(^|\/)pom\.xml$/;
+      const top = list[0].webkitRelativePath.split('/')[0];
+      const files = [];
+      let total = 0;
+      for (const f of list) {
+        const rel = f.webkitRelativePath.split('/').slice(1).join('/');
+        if (!rel || skip.test(rel) || !ok.test(rel) || f.size > 200000 || total + f.size > 25000000) continue;
+        files.push({ path: rel, content: await f.text() });
+        total += f.size;
+        if (files.length >= 2500) break;
+      }
+      if (!files.length) throw new Error('올릴 코드 파일이 없습니다');
+      setNotice(`${top}: 파일 ${files.length}개 (${(total / 1e6).toFixed(1)}MB) 올리는 중…`);
+      const r = await api(apiBase, '/api/remote/index', { method: 'POST', body: JSON.stringify({ project: connectForm.name || top, files, arch: 'force' }) });
+      setNotice(`'${r.project?.name || top}' 등록 완료 · 임베딩 → 코딩 스타일 → 아키텍처 분석이 백그라운드로 진행됩니다 (1~3분).`);
+      await refresh();
+    });
+  };
+
+  const openArch = (name) => run('arch', async () => {
+    const r = await api(apiBase, `/api/arch/${encodeURIComponent(name)}`);
+    setArchView({ name, markdown: r.markdown });
+  });
+
+  const removeRemote = (name) => {
+    if (!window.confirm(`'${name}' 원격 프로젝트 등록을 지울까요? (PC 의 파일은 그대로)`)) return;
+    run('remove', async () => { await api(apiBase, `/api/remote/projects/${encodeURIComponent(name)}`, { method: 'DELETE' }); await refresh(); });
   };
 
   const reindex = (name) => run(`reindex:${name}`, async () => {
@@ -139,46 +198,96 @@ export default function AgentWorkbench({ apiBase }) {
           <h3>1. 레포 연결</h3>
           <span>연결할 때마다 코딩 방법을 벡터화</span>
         </div>
-        <form className="aw-form" onSubmit={connectRepo}>
-          <label className="field">
-            <span>로컬 경로 또는 git URL</span>
-            <input
-              required
-              placeholder="/Users/me/projects/shop 또는 https://github.com/me/app.git"
-              value={connectForm.location}
-              onChange={(e) => setConnectForm({ ...connectForm, location: e.target.value })}
-            />
-          </label>
-          <div className="aw-row">
+        <div className="aw-tabs" role="tablist">
+          {CONNECT_MODES.map((m) => (
+            <button key={m.id} type="button" role="tab" className={connectMode === m.id ? 'active' : ''}
+              onClick={() => { setConnectMode(m.id); setNotice(''); }}>{m.label}</button>
+          ))}
+        </div>
+        <p className="aw-help">{CONNECT_MODES.find((m) => m.id === connectMode).help}</p>
+
+        {connectMode === 'upload' ? (
+          <div className="aw-form">
             <label className="field">
-              <span>이름 (선택)</span>
+              <span>프로젝트 이름 (선택 · 비우면 폴더 이름)</span>
               <input value={connectForm.name} onChange={(e) => setConnectForm({ ...connectForm, name: e.target.value })} />
             </label>
-            <label className="field">
-              <span>언어</span>
-              <input placeholder="python, dart, kotlin…" value={connectForm.language} onChange={(e) => setConnectForm({ ...connectForm, language: e.target.value })} />
+            <label className={`aw-filebtn big ${busy === 'upload' ? 'disabled' : ''}`}>
+              {busy === 'upload' ? '올리는 중…' : '폴더 선택해서 올리기'}
+              <input type="file" webkitdirectory="" directory="" multiple hidden disabled={busy === 'upload'} onChange={uploadFolder} />
             </label>
           </div>
-          <label className="field">
-            <span>프로젝트 유형</span>
-            <select value={connectForm.profile} onChange={(e) => setConnectForm({ ...connectForm, profile: e.target.value })}>
-              <option value="">자동 감지</option>
-              {['server', 'web', 'mobile'].map((cat) => (
-                <optgroup key={cat} label={cat === 'server' ? '서버' : cat === 'web' ? '웹' : '모바일'}>
-                  {profiles.filter((p) => p.category === cat).map((p) => (
-                    <option key={p.key} value={p.key}>{p.label}</option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-          </label>
-          <label className="aw-check">
-            <input type="checkbox" checked={connectForm.init_if_missing} onChange={(e) => setConnectForm({ ...connectForm, init_if_missing: e.target.checked })} />
-            새 프로젝트 (폴더·git init 생성)
-          </label>
-          <button type="submit" disabled={busy === 'connect'}>{busy === 'connect' ? '연결·벡터화 중…' : '연결'}</button>
-        </form>
+        ) : (
+          <form className="aw-form" onSubmit={connectRepo}>
+            <label className="field">
+              <span>{CONNECT_MODES.find((m) => m.id === connectMode).field}</span>
+              <input
+                required
+                placeholder={CONNECT_MODES.find((m) => m.id === connectMode).placeholder}
+                value={connectForm.location}
+                onChange={(e) => setConnectForm({ ...connectForm, location: e.target.value })}
+              />
+            </label>
+            <div className="aw-row">
+              <label className="field">
+                <span>이름 (선택)</span>
+                <input value={connectForm.name} onChange={(e) => setConnectForm({ ...connectForm, name: e.target.value })} />
+              </label>
+              <label className="field">
+                <span>언어</span>
+                <input placeholder="kotlin, dart, python…" value={connectForm.language} onChange={(e) => setConnectForm({ ...connectForm, language: e.target.value })} />
+              </label>
+            </div>
+            <label className="field">
+              <span>프로젝트 유형</span>
+              <select value={connectForm.profile} onChange={(e) => setConnectForm({ ...connectForm, profile: e.target.value })}>
+                <option value="">자동 감지</option>
+                {['server', 'web', 'mobile'].map((cat) => (
+                  <optgroup key={cat} label={cat === 'server' ? '서버' : cat === 'web' ? '웹' : '모바일'}>
+                    {profiles.filter((p) => p.category === cat).map((p) => (
+                      <option key={p.key} value={p.key}>{p.label}</option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+            </label>
+            {connectMode === 'server' && (
+              <label className="aw-check">
+                <input type="checkbox" checked={connectForm.init_if_missing} onChange={(e) => setConnectForm({ ...connectForm, init_if_missing: e.target.checked })} />
+                새 프로젝트 (폴더·git init 생성)
+              </label>
+            )}
+            <button type="submit" disabled={busy === 'connect'}>
+              {busy === 'connect' ? '연결 중…' : connectMode === 'remote' ? '원격 PC 프로젝트로 등록' : '연결 · 벡터화'}
+            </button>
+          </form>
+        )}
+        {notice && <p className="aw-notice">{notice}</p>}
 
+        <h4 className="aw-subhead">원격 PC 프로젝트</h4>
+        <ul className="aw-list">
+          {Object.values(remoteProjects).map((p) => (
+            <li key={p.name}>
+              <button type="button" className="aw-link" onClick={() => openArch(p.name)}>
+                <strong>{p.name}</strong>
+                <small>
+                  {p.status === 'waiting-pc' ? `PC 대기 · ${p.client_path}` : `${p.profile || '?'} · 파일 ${p.files ?? '?'} · ${p.chunks ?? 0} chunks · ${p.status}`}
+                  {p.arch_status ? ` · 아키텍처 ${p.arch_status === 'ready' ? '분석됨' : p.arch_status}` : ''}
+                </small>
+              </button>
+              <button type="button" className="secondary aw-small" onClick={() => removeRemote(p.name)}>삭제</button>
+            </li>
+          ))}
+          {Object.keys(remoteProjects).length === 0 && <li className="aw-empty">원격 PC 프로젝트가 없습니다.</li>}
+        </ul>
+        {archView && (
+          <div className="aw-arch">
+            <div className="aw-arch-head"><strong>{archView.name} 아키텍처 · 코딩 규칙</strong><button type="button" className="secondary aw-small" onClick={() => setArchView(null)}>닫기</button></div>
+            <pre>{archView.markdown || '아직 분석 전입니다. IDE 에서 /arch 분석 을 실행하세요.'}</pre>
+          </div>
+        )}
+
+        <h4 className="aw-subhead">이 맥의 레포</h4>
         <ul className="aw-list">
           {repos.map((r) => (
             <li key={r.name} className={r.name === selectedRepo ? 'selected' : ''}>

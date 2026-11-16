@@ -31,6 +31,15 @@ def auth(token=TOKEN):
     return {**CF, "Authorization": f"Bearer {token}"}
 
 
+def test_remote_langchain_and_ide_handoff_require_auth(client):
+    assert client.get("/api/langchain/status", headers=CF).status_code == 401
+    assert client.get("/api/langchain/status", headers=auth()).status_code == 200
+    assert client.get("/api/remote/work/agents", headers=CF).status_code == 401
+    assert client.get("/api/remote/work/agents", headers=auth()).status_code == 200
+    assert client.post("/api/remote/work/tasks", headers=auth(), json={"agent_id": "f" * 32, "task": "구현"}).status_code == 409
+    assert client.post("/api/agent/run", headers=auth(), json={}).status_code == 403
+
+
 def test_local_requests_need_no_token(client):
     assert client.get("/api/agent/jobs").status_code == 200
 
@@ -151,7 +160,7 @@ def test_plugin_downloads_for_local_and_owner_only(client, monkeypatch):
     monkeypatch.setenv("AGENT_TS_USERS", OWNER)
     listing = client.get("/api/downloads", headers=TS_OWNER).json()
     kinds = {i["kind"]: i for i in listing["items"]}
-    assert set(kinds) == {"vscode", "intellij"}
+    assert set(kinds) == {"vscode", "intellij", "android-studio"}
     for kind, item in kinds.items():
         if item["available"]:
             r = client.get(item["url"], headers=TS_OWNER)

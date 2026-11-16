@@ -5,6 +5,7 @@ import json
 import queue
 import threading
 import time
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterator, List, Optional
 
@@ -13,6 +14,7 @@ import httpx
 from .config import settings
 from .profiles import detect_profile_from
 from .repo_manager import slugify
+from . import archinfo
 from .vector_store import STYLE_CONFIG_FILES, CodeVectorStore
 
 REGISTRY = Path(settings.state_dir) / "remote_projects.json"
@@ -21,6 +23,9 @@ MAX_FILE_BYTES = 200_000
 MAX_TOTAL_BYTES = 30_000_000
 HEARTBEAT_SECONDS = 15
 _lock = threading.Lock()
+_jobs_guard = threading.Lock()
+_project_locks: Dict[str, threading.Lock] = {}
+_latest: Dict[str, tuple] = {}  # 프로젝트 → 처리할 가장 최근 요청 (job_id, docs, store, arch)
 
 
 def _load() -> Dict[str, dict]:
@@ -44,6 +49,45 @@ def get_project(name: str) -> Optional[dict]:
     return _load().get(slugify(name))
 
 
+_URL_RE = __import__("re").compile(r"^(https?://|git@|ssh://)")
+
+
+def register_pending(location: str, name: str = "", language: str = "", profile: str = "") -> dict:
+    """원격 PC 의 로컬 경로로 프로젝트 등록 (서버는 그 폴더를 못 보므로 'PC 대기').
+    그 PC 의 플러그인이 다음에 연결될 때 경로를 확인하고 파일을 올려 색인한다 (/api/remote/pending)."""
+    loc = location.strip()
+    if not loc or _URL_RE.match(loc):
+        raise ValueError("원격 PC 의 폴더 경로를 입력하세요")
+    base = loc.replace("\\", "/").rstrip("/").split("/")[-1]
+    pname = slugify(name or base)
+    rec = {"name": pname, "client_path": loc, "status": "waiting-pc", "language": language, "profile": profile,
+           "requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "remote": True}
+    with _lock:
+        data = _load()
+        data[pname] = {**data.get(pname, {}), **rec}
+        _save(data)
+    return rec
+
+
+def remove(name: str) -> None:
+    with _lock:
+        data = _load()
+        data.pop(slugify(name), None)
+        _save(data)
+
+
+def pending() -> List[dict]:
+    return [{"name": k, "client_path": v.get("client_path", "")} for k, v in _load().items()
+            if v.get("status") == "waiting-pc" and v.get("client_path")]
+
+
+def _set(name: str, update: dict) -> None:
+    with _lock:
+        data = _load()
+        data[name] = {**data.get(name, {}), **update}
+        _save(data)
+
+
 def _clean_rel(path: str) -> Optional[str]:
     p = PurePosixPath(path.replace("\\", "/"))
     if p.is_absolute() or ".." in p.parts or not p.parts or p.parts[0] == ".git":
@@ -51,7 +95,8 @@ def _clean_rel(path: str) -> Optional[str]:
     return str(p)
 
 
-def start_index(store: CodeVectorStore, project: str, files: List[dict], language: str = "") -> dict:
+def start_index(store: CodeVectorStore, project: str, files: List[dict], language: str = "", arch: str = "auto",
+                client_path: str = "") -> dict:
     """업로드 파일 검증 → 프로필 감지 → 백그라운드 색인 (Cloudflare 100초 응답 제한 회피)."""
     name = slugify(project)
     if len(files) > MAX_FILES:
@@ -80,26 +125,58 @@ def start_index(store: CodeVectorStore, project: str, files: List[dict], languag
         "requested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "remote": True,
     }
+    if client_path:
+        record["client_path"] = client_path
     with _lock:
         data = _load()
         data[name] = {**data.get(name, {}), **record}
         _save(data)
 
-    def work():
+    job_id = uuid.uuid4().hex[:12]
+    with _jobs_guard:
+        # 같은 프로젝트에 요청이 몰리면 가장 최근 것만 남긴다 (이전 대기 요청은 버림)
+        prev = _latest.get(name)
+        want_arch = arch if not prev or arch != "auto" else prev[3]
+        if prev and prev[3] == "force":
+            want_arch = "force"
+        _latest[name] = (job_id, docs, store, want_arch)
+    _set(name, {"job_id": job_id})
+    threading.Thread(target=_run_jobs, args=(name,), daemon=True).start()
+    return {**record, "job_id": job_id}
+
+
+def _run_jobs(name: str) -> None:
+    """프로젝트별로 한 번에 하나만 색인. 기다리는 동안 새 요청이 오면 가장 최근 것만 처리한다."""
+    with _jobs_guard:
+        lock = _project_locks.setdefault(name, threading.Lock())
+    with lock:
+        with _jobs_guard:
+            job = _latest.pop(name, None)
+        if job is None:  # 다른 스레드가 이미 최신 요청을 처리함
+            return
+        job_id, docs, store, arch = job
         try:
             configs = {k: v for k, v in docs.items() if k in STYLE_CONFIG_FILES}
             stats = store.index_docs(name, list(docs.items()), configs)
-            update = {"status": "ready", "chunks": stats["chunks"], "methods": stats["methods"],
-                      "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            update = {"chunks": stats["chunks"], "methods": stats["methods"], "embedded": stats.get("embedded"),
+                      "removed": stats.get("removed"), "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "error": ""}
+            ok = True
         except Exception as exc:  # noqa: BLE001
-            update = {"status": "error", "error": str(exc)}
-        with _lock:
-            data = _load()
-            data[name] = {**data.get(name, record), **update}
-            _save(data)
-
-    threading.Thread(target=work, daemon=True).start()
-    return record
+            update, ok = {"error": str(exc)}, False
+        with _jobs_guard:
+            newer = name in _latest
+        # 더 새 요청이 기다리면 상태는 'indexing' 유지 (그 작업이 끝날 때 ready 로)
+        update["status"] = "indexing" if newer else ("ready" if ok else "error")
+        update["last_job_id"] = job_id
+        _set(name, update)
+        # 아키텍처 분석 (큰 프로젝트의 레이어·패턴·코딩 규칙) — 없거나 오래됐을 때만, 코딩 모델로 1분 정도
+        if ok and not newer and (arch == "force" or (arch == "auto" and not archinfo.is_fresh(name))):
+            _set(name, {"arch_status": "analyzing"})
+            try:
+                archinfo.analyze(name, docs)
+                _set(name, {"arch_status": "ready", "arch_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "arch_error": ""})
+            except Exception as exc:  # noqa: BLE001
+                _set(name, {"arch_status": "error", "arch_error": str(exc)[:300]})
 
 
 def stream_generate(body: dict) -> Iterator[str]:

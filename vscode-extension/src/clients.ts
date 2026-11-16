@@ -150,7 +150,7 @@ export const engine = {
   /** 토큰 스트리밍 생성. signal 로 중단하면 엔진도 생성을 멈춘다(연결 종료 감지). */
   async stream(
     messages: ChatMessage[],
-    opts: { maxTokens: number; temperature: number; signal: AbortSignal },
+    opts: { maxTokens: number; temperature: number; signal: AbortSignal; think?: boolean; thinkBudget?: number },
     onToken: (t: string) => void,
   ): Promise<{ text: string; stats?: GenerateStats }> {
     const c = cfg();
@@ -158,7 +158,8 @@ export const engine = {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ messages, max_tokens: opts.maxTokens, temperature: opts.temperature, stream: true }),
+      body: JSON.stringify({ messages, max_tokens: opts.maxTokens, temperature: opts.temperature, stream: true,
+        ...(opts.think !== undefined ? { think: opts.think, think_budget: opts.thinkBudget } : {}) }),
       signal: opts.signal,
     });
     if (!res.ok || !res.body) {

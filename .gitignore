@@ -16,6 +16,8 @@ backend/data/agent_state/
 vscode-extension/server.json
 intellij-plugin/src/main/resources/server.json
 intellij-plugin/bin/
+intellij-plugin/build-remote-validation/
+intellij-plugin/build-android-remote-validation/
 # 업로드한 첨부 파일과 분석 결과 (사용자 데이터)
 backend/data/attachments/
 # 이미지 생성 가상환경

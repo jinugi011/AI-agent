@@ -1,11 +1,12 @@
 /** 채팅 에이전트 루프: 사용자 메시지 → (모델 스트리밍 → 도구 실행 → 결과 피드백) 반복 → 최종 답변. */
 import * as vscode from 'vscode';
+import { folderTree, gitNow, gitStable } from './workspace';
 import { backend, ChatMessage, engine, isRemote } from './clients';
-import { ensureRemoteIndex, remoteProjectName } from './remoteIndex';
+import { ensureRemoteIndex, remoteProjectName, syncPendingProjects } from './remoteIndex';
 import { describeCall, parseToolCalls, stripToolBlocks, TOOL_DOCS } from './protocol';
 import { DEBUG_RULES } from './debugkit';
 import { runCheck } from './debugRunner';
-import { Checkpoint, executeTool, OriginalContentProvider, ToolHost, UiEvent } from './tools';
+import { Checkpoint, executeTool, OriginalContentProvider, readText, ToolHost, UiEvent } from './tools';
 
 export type AgentEvent =
   | UiEvent
@@ -77,7 +78,7 @@ const MAX_IMAGES_PER_STEP = 4;       // 한 응답에서 그림은 최대 4장 (
 
 // 시스템 프롬프트는 대화 중 바뀌지 않는 내용만 담는다 → 엔진 KV 캐시 재사용으로 다음 요청이 빨라짐.
 // 자주 바뀌는 에디터 상태·관련 코드는 사용자 메시지에 붙인다(editorBlock).
-function systemPrompt(ctx: any, repoInfo: string, tree: string): string {
+function systemPrompt(ctx: any, repoInfo: string, tree: string, rootPath: string, gitInfo: string): string {
   return `당신은 "Yang Coding" — 사용자의 VS Code 안에서 동작하는 로컬 코딩 에이전트입니다 (Claude Code 와 유사). 이름을 물으면 Yang Coding 이라고 답한다.
 사용자 PC 운영체제: ${process.platform === 'win32' ? 'Windows (RUN 은 PowerShell 로 실행됨: rm/mv 대신 DELETE/MOVE 도구, 경로 구분은 / 로 써도 됨)' : process.platform === 'darwin' ? 'macOS' : 'Linux'}
 사용자의 자연어 요청을 이해해 코드를 읽고, 수정하고, 명령을 실행해 작업을 끝까지 완료합니다.
@@ -100,6 +101,23 @@ function systemPrompt(ctx: any, repoInfo: string, tree: string): string {
 - 답변은 사용자의 언어(기본 한국어)로 간결하게. 완료 후에는 무엇을 바꿨는지 1~3줄로 요약한다.
 - 도구 결과를 기다려야 하면 그 응답에서는 도구 블록까지만 쓰고 멈춘다. 파일을 READ 하기 전에는 EDIT 하지 않는다.
 
+## 요청 이해
+- 요청이 짧고 단순하면 그대로 단순하게 한다. 요청 범위를 넓히거나, 새 앱·새 화면을 통째로 만들지 않는다.
+- 무언가를 '만들어줘/추가해줘'는 기존 화면·기능에 더하라는 뜻이다. 사용자가 바꾸라고 하지 않은 기존 기능(예: 카운터)은 지우거나 대체하지 않는다.
+- 요청에 오타·줄임말이 있을 수 있다 (예: '덱스트 박스' = '텍스트 박스'). 기존 코드와 문맥에 맞는 가장 평범한 해석을 고른다.
+  해석이 둘 이상이고 결과가 크게 달라지면, 작업 전에 한 줄로 확인 질문만 하고 멈춘다.
+- 기존 파일은 EDIT 로 필요한 부분만 고친다. FILE 로 기존 파일 전체를 다시 쓰거나, 기존 코드를 지우고 처음부터 다시 만들지 않는다.
+- EDIT 가 실패하면 결과에 보여 준 실제 원문(줄 번호 부분)으로 SEARCH 를 고쳐 다시 EDIT 한다. 실패했다고 FILE 로 갈아엎지 않는다.
+
+## 작업 폴더 · 권한
+- 모든 도구(READ/LIST/GREP/FILE/EDIT/RUN/DELETE/MOVE/MKDIR/CHECK/PLAY)는 사용자 PC 의 작업 폴더에서 직접 실행된다.
+  서버(맥)는 이 폴더를 직접 보지 못하므로, 작업 폴더나 그 하위 폴더를 CONNECT 하지 않는다 (이미 연결·색인되어 있음).
+- 파일·폴더의 생성·삭제·이동 권한이 있다. 사용자가 요청하면 망설이지 말고 DELETE / MOVE / MKDIR 를 쓴다
+  (실행 전에 사용자 승인 창이 뜬다). "권한이 없다", "직접 지워 달라"고 답하지 않는다.
+- git 은 사용자 PC 에서 RUN git … 으로 실행한다. status·log·diff·branch·show 같은 조회는 승인 없이 바로 실행된다.
+  커밋·푸시·브랜치 변경은 사용자가 요청할 때만 한다.
+- 폴더 내용은 LIST 폴더경로 (예: LIST lib/screens) 로, 파일 찾기는 LIST 글롭 (예: LIST **/*.dart) 로 본다.
+
 ${DEBUG_RULES}
 
 ${TOOL_DOCS}
@@ -107,13 +125,20 @@ ${TOOL_DOCS}
 ## 레포
 ${repoInfo}
 
-${ctx?.art ? `## 프로젝트 아트 컨셉 (그림을 만들 때 이 컨셉에 맞게 · IMAGE 에 자동 적용됨)\n${ctx.art}\n\n` : ''}## 사용자 선호 · 스타일 · 제약 (항상 준수)
+${ctx?.architecture ? `## 이 프로젝트의 아키텍처 · 코딩 규칙 (자동 분석 · 반드시 따른다)
+새 코드는 아래 레이어·패턴·네이밍을 그대로 따른다. 새 파일을 만들기 전에 같은 레이어의 기존 파일을 READ 해 구조를 맞춘다.
+${ctx.architecture}
+
+` : ''}${ctx?.art ? `## 프로젝트 아트 컨셉 (그림을 만들 때 이 컨셉에 맞게 · IMAGE 에 자동 적용됨)\n${ctx.art}\n\n` : ''}## 사용자 선호 · 스타일 · 제약 (항상 준수)
 ${ctx?.preferences || '- (없음)'}
 
 ## 이 레포의 코딩 방법 (자동 추출)
 ${ctx?.methods || '(색인 전)'}
 
-## 파일 목록 (일부)
+## 작업 폴더 (사용자 PC)
+경로: ${rootPath}
+${gitInfo}
+폴더 구조 (깊이 3, 폴더별 파일 수):
 ${tree}`;
 }
 
@@ -139,13 +164,14 @@ function editorBlock(editor: EditorContext): string {
 export class AgentSession {
   private history: ChatMessage[] = [];
   private abort?: AbortController;
-  private approvalsAlways = new Set<'edit' | 'run'>();
+  private approvalsAlways = new Set<'edit' | 'run' | 'files' | 'index'>();
   lastCheckpoint?: Checkpoint;
   repoName = '';
+  private indexDenied = new Set<string>(); // 이번 창에서 분석을 거절한 폴더
 
   constructor(
     private readonly emit: (ev: AgentEvent) => void,
-    private readonly requestApproval: (kind: 'edit' | 'run', title: string, detail: string) => Promise<'allow' | 'always' | 'deny'>,
+    private readonly requestApproval: (kind: 'edit' | 'run' | 'files' | 'index', title: string, detail: string) => Promise<'allow' | 'always' | 'deny'>,
     private readonly diffProvider: OriginalContentProvider,
     private readonly log: AgentLog,
   ) {}
@@ -168,24 +194,14 @@ export class AgentSession {
     return vscode.workspace.workspaceFolders?.[0]?.uri;
   }
 
-  private async approve(kind: 'edit' | 'run', title: string, detail: string): Promise<boolean> {
-    const setting = vscode.workspace.getConfiguration('localAgent').get<string>(kind === 'edit' ? 'approveEdits' : 'approveCommands');
+  private async approve(kind: 'edit' | 'run' | 'files' | 'index', title: string, detail: string): Promise<boolean> {
+    const setting = kind === 'index' ? 'ask' : vscode.workspace.getConfiguration('localAgent').get<string>(kind === 'edit' ? 'approveEdits' : kind === 'files' ? 'approveFileOps' : 'approveCommands') ?? (kind === 'files' ? 'ask' : undefined);
     if (setting === 'auto' || this.approvalsAlways.has(kind)) return true;
     this.log.line(`[승인 대기] ${title}`, 'info');
     const answer = await this.requestApproval(kind, title, detail);
     this.log.line(`[승인] ${{ allow: '허용', always: '항상 허용', deny: '거부' }[answer]}`, answer === 'deny' ? 'error' : 'info');
     if (answer === 'always') this.approvalsAlways.add(kind);
     return answer !== 'deny';
-  }
-
-  private async fileTree(root: vscode.Uri): Promise<string> {
-    const uris = await vscode.workspace.findFiles(
-      new vscode.RelativePattern(root, '**/*'),
-      '**/{node_modules,.git,dist,build,target,.venv,venv,__pycache__,.next,Pods,.dart_tool,.gradle,models,out}/**',
-      250,
-    );
-    const rel = uris.map((u) => vscode.workspace.asRelativePath(u, false)).sort();
-    return rel.join('\n') + (rel.length >= 250 ? '\n…(더 있음: LIST 로 확인)' : '');
   }
 
   /** 오래된 도구 결과부터 요약해 컨텍스트 예산 안으로 줄인다. */
@@ -210,7 +226,7 @@ export class AgentSession {
     return true;
   }
 
-  async send(userText: string, editor: EditorContext, attachments: Attachment[] = [], opts: { debug?: boolean } = {}): Promise<void> {
+  async send(userText: string, editor: EditorContext, attachments: Attachment[] = [], opts: { debug?: boolean; harness?: boolean } = {}): Promise<void> {
     if (this.running) return;
     const root = this.root();
     const abort = (this.abort = new AbortController());
@@ -219,6 +235,7 @@ export class AgentSession {
     const started = Date.now();
     let steps = 0;
     let outcome = '완료';
+    let finalText = '';
     this.log.show();
     this.log.line(`━━━━━━━━ [${clock()}] 요청 ━━━━━━━━`, 'head');
     this.log.line(userText.length > 500 ? userText.slice(0, 500) + '…' : userText, 'info');
@@ -237,21 +254,49 @@ export class AgentSession {
       let ctx: any = null;
       try {
         if (isRemote()) {
+          syncPendingProjects(this.log).catch(() => undefined); // 웹에서 이 PC 경로로 등록한 프로젝트가 있으면 올림
+          // 처음 보는 프로젝트: 올리기 전에 먼저 묻는다 (능동적 권한 요청)
+          const known: any = await backend.get('/api/remote/projects', 5000).catch(() => null);
+          const pname = remoteProjectName(root).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+          if (known && !known.projects?.[pname] && !this.indexDenied.has(root.fsPath)) {
+            const ok = await this.approve('index', `Analyze: ${remoteProjectName(root)}`,
+              `처음 보는 프로젝트입니다. 이 PC 의 ${root.fsPath} 코드·문서를 서버(맥)로 올려 임베딩하고 코딩 스타일·아키텍처를 분석할까요? (같은 스타일로 코딩하려면 필요 · 1~3분, 백그라운드)`);
+            if (!ok) this.indexDenied.add(root.fsPath);
+          }
           // 원격: 이 PC 의 파일을 서버로 올려 벡터화(처음/6시간마다) 후 프로젝트 이름으로 컨텍스트 조회
-          await ensureRemoteIndex(root, this.log).catch((e) => this.log.line(`[원격 색인] 실패: ${e.message}`, 'error'));
+          if (!this.indexDenied.has(root.fsPath)) await ensureRemoteIndex(root, this.log).catch((e) => this.log.line(`[원격 색인] 실패: ${e.message}`, 'error'));
           ctx = await backend.post('/api/context', { query: userText, project: remoteProjectName(root), attachment_project: remoteProjectName(root), top_k: 6 }, 60_000);
         } else {
           ctx = await backend.post('/api/context', { query: userText, workspace_path: root.fsPath, attachment_project: remoteProjectName(root), top_k: 6 }, 600_000);
         }
         this.repoName = ctx.repo?.name ?? '';
+        if (isRemote() && !this.indexDenied.has(root.fsPath) && (!ctx.repo || ctx.repo.status === 'error')) {
+          // 색인이 없거나 실패한 프로젝트 → 다시 올려 분석 (코드 임베딩 · 코딩 스타일 · 아키텍처)
+          this.log.line(`[원격 색인] ${ctx.repo ? '이전 색인 실패' : '색인 없음'} → 다시 분석합니다`, 'info');
+          ensureRemoteIndex(root, this.log, true).catch((e) => this.log.line(`[원격 색인] 실패: ${e.message}`, 'error'));
+        }
       } catch (e: any) {
         this.emit({ type: 'notice', level: 'warn', text: `백엔드 컨텍스트를 가져오지 못했습니다 (선호/벡터 검색 없이 진행): ${e.message}` });
         this.log.line(`[컨텍스트] 실패: ${e.message}`, 'error');
       }
       const repoInfo = ctx?.repo
         ? `${ctx.repo.name} · ${ctx.repo.profile} · ${ctx.repo.language} · ${root.fsPath}`
-        : `${root.fsPath} (미연결)`;
-      const related = (ctx?.hits ?? []).slice(0, 4).map((h: any) => `--- ${h.source} ---\n${h.content}`).join('\n');
+        : isRemote()
+          ? `${remoteProjectName(root)} · 원격 PC 작업 폴더 (서버 색인 진행 중 — 도구는 모두 정상 사용 가능, CONNECT 불필요)`
+          : `${root.fsPath} (벡터 색인 전 — 도구는 모두 정상 사용 가능)`;
+      const [tree, gitInfo, gitState] = await Promise.all([folderTree(root), gitStable(root), gitNow(root)]);
+      // 벡터 검색 결과 중 지금 파일과 다른 옛 코드(이미 고쳐진 부분)는 넣지 않는다 — 모델이 옛 코드를 보고 헷갈리지 않게
+      const fresh: any[] = [];
+      for (const h of (ctx?.hits ?? []) as any[]) {
+        if (fresh.length >= 4) break;
+        const cur = await readText(vscode.Uri.joinPath(root, ...String(h.source).split('/'))).catch(() => null);
+        if (cur === null) { if (h.kind && h.kind !== 'code') fresh.push(h); continue; }
+        const probe = String(h.content ?? '').split('\n').map((l) => l.trim()).filter((l) => l.length > 8).slice(0, 3);
+        if (probe.every((l) => cur.includes(l))) fresh.push(h);
+      }
+      const staleN = Math.min(4, (ctx?.hits ?? []).length) - fresh.length;
+      if (staleN > 0) this.log.line(`[컨텍스트] 지금 파일과 다른 옛 검색 결과 ${staleN}개는 뺐습니다`, 'info');
+      const related = fresh.map((h: any) => `--- ${h.source} ---\n${h.content}`).join('\n');
 
       // 이번에 첨부한 파일은 내용을 직접 넣고, 예전에 올린 첨부는 질문과 관련된 부분만 (벡터 검색)
       const attPaths = await saveAttachments(root, attachments);
@@ -261,14 +306,16 @@ export class AgentSession {
       if (attachments.length) {
         this.log.line(`[첨부] ${attachments.map((a) => `${a.name}(${a.chars.toLocaleString()}자)`).join(', ')} → 대화에 포함 · 전체는 ${ATT_DIR}/`, 'info');
       }
+      const isNewChat = this.history.length === 0;
       this.history.push({
         role: 'user',
-        content: `${userText}\n\n${editorBlock(editor)}` + attachmentBlock(attachments, attPaths) +
+        content: `${userText}\n\n${editorBlock(editor)}` +
+          (isNewChat && ctx?.worklog ? `\n\n(이 프로젝트의 최근 작업 기록 — 이전 대화에서 한 일. 이어서 작업할 때 참고)\n${ctx.worklog}` : '') + (gitState ? `\n${gitState}` : '') + attachmentBlock(attachments, attPaths) +
           (pastAtts ? `\n\n(참고: 이전에 첨부한 자료 중 관련 부분)\n${pastAtts}` : '') +
           (related ? `\n\n(참고: 벡터 검색으로 찾은 관련 코드)\n${related}` : ''),
       });
       // 같은 대화에서 시스템 프롬프트가 그대로면 엔진이 앞부분을 재사용한다
-      const system = systemPrompt(ctx, repoInfo, await this.fileTree(root));
+      const system = systemPrompt(ctx, repoInfo, tree, root.fsPath, gitInfo);
       const prefCount = (ctx?.preferences ?? '').split('\n').filter(Boolean).length;
       this.log.line(`[컨텍스트] 레포 ${repoInfo}`, 'info');
       this.log.line(`[컨텍스트] 선호·제약 ${prefCount}개 · 코딩 방법 ${ctx?.methods ? '있음' : '없음'} · 관련 코드 ${(ctx?.hits ?? []).map((h: any) => h.source).join(', ') || '없음'}`, 'info');
@@ -288,9 +335,9 @@ export class AgentSession {
       };
       const cfg = vscode.workspace.getConfiguration('localAgent');
       // 디버그 모드는 재현 → 계측 → 수정 → 재검증으로 단계가 많아 두 배까지 허용
-      const maxSteps = opts.debug ? Math.max(24, cfg.get<number>('maxSteps', 16) * 2) : cfg.get<number>('maxSteps', 16);
+      const maxSteps = opts.debug || opts.harness ? Math.max(24, cfg.get<number>('maxSteps', 16) * 2) : cfg.get<number>('maxSteps', 16);
       const autoCheck = cfg.get<boolean>('autoCheck', true);
-      const verify = cfg.get<boolean>('verifyBeforeFinish', false); // 기본 끔: 매 턴 모델 호출이 한 번 더 늘어 느려짐 (/debug 에서는 항상 켬)
+      const verify = cfg.get<boolean>('verifyBeforeFinish', false) || !!opts.harness; // 기본 끔: 매 턴 모델 호출이 한 번 더 늘어 느려짐 (/debug 에서는 항상 켬)
       // 완료 관문 상태: 남은 오류 · 실행 확인 여부 · 같은 독촉을 반복하지 않기 위한 횟수
       const gate = { errors: 0, errorText: '', ran: false, codeChanged: false, nudges: { errors: 0, markers: 0, verify: 0 } };
 
@@ -307,7 +354,9 @@ export class AgentSession {
         this.log.line(`[모델 #${steps}] 생성 시작 · 메시지 ${messages.length}개 · ${chars.toLocaleString()}자`, 'head');
         const { text, stats } = await engine.stream(
           messages,
-          { maxTokens: cfg.get<number>('maxTokens', 4096), temperature: cfg.get<number>('temperature', 0.2), signal: abort.signal },
+          { maxTokens: cfg.get<number>('maxTokens', 4096), temperature: cfg.get<number>('temperature', 0.2), signal: abort.signal,
+            // 요청의 첫 단계: 무엇을 원하는지 짧게 생각한 뒤 시작 (오타·애매한 요청 오해 방지, 최대 약 10초)
+            ...(step === 0 ? { think: true, thinkBudget: 600 } : {}) },
           (tok) => {
             raw += tok;
             this.log.raw(tok);
@@ -332,6 +381,7 @@ export class AgentSession {
             continue;
           }
           this.log.line('[턴 종료] 도구 호출 없음 → 최종 답변', 'info');
+          finalText = stripToolBlocks(text);
           break;
         }
         // 결과를 보기 전에 수정·실행까지 몰아서 호출하는 것을 막는다:
@@ -405,6 +455,27 @@ export class AgentSession {
       this.log.line(`━━━━━━━━ ${outcome} · ${steps}단계 · 변경 파일 ${checkpoint.originals.size}개 · ${((Date.now() - started) / 1000).toFixed(1)}s ━━━━━━━━\n`, outcome === '오류' ? 'error' : 'head');
       this.abort = undefined;
       this.emit({ type: 'turn-end', changedFiles: checkpoint.originals.size });
+      // 고친 파일만 바로 재색인 (다음 요청의 관련 코드 검색이 옛 코드를 주지 않게) — 서버는 바뀐 청크만 계산
+      if (root && isRemote() && (checkpoint.originals.size || checkpoint.moves.length)) {
+        const paths = new Set<string>([...checkpoint.originals.keys(), ...checkpoint.moves.flat()]);
+        void (async () => {
+          const files: { path: string; content: string }[] = [];
+          const deleted: string[] = [];
+          for (const fsPath of paths) {
+            const rel = vscode.workspace.asRelativePath(fsPath, false).split('\\').join('/');
+            const text = await readText(vscode.Uri.file(fsPath)).catch(() => null);
+            if (text === null) deleted.push(rel);
+            else if (text.length < 200_000) files.push({ path: rel, content: text });
+          }
+          await backend.post('/api/remote/index', { project: remoteProjectName(root), files, deleted, partial: true }, 60_000).catch(() => undefined);
+        })();
+      }
+      // 작업 기록: 새 대화에서도 "어디까지 했는지" 알고 이어서 작업하도록 서버에 남긴다
+      if (root && finalText && outcome === '완료') {
+        const files = [...checkpoint.originals.keys()].map((f) => vscode.workspace.asRelativePath(f, false));
+        backend.post('/api/worklog', { project: remoteProjectName(root), request: userText.slice(0, 500), summary: finalText.slice(0, 800), files }, 10_000)
+          .catch(() => undefined);
+      }
       this.emit({ type: 'busy', busy: false });
     }
   }

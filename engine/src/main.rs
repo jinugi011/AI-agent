@@ -53,6 +53,9 @@ struct Args {
     /// Flash Attention auto | on | off
     #[arg(long, env = "ENGINE_FLASH", default_value = "auto")]
     flash: String,
+    /// 생각(추론) 모드 auto | on | off — auto: QwQ·R1 같은 추론 모델만 켬 (코딩 모델은 꺼서 빠르게)
+    #[arg(long, env = "ENGINE_THINKING", default_value = "auto")]
+    thinking: String,
     /// 비전 모델 GGUF (비우면 코딩 모델과 같은 폴더에서 *-VL-*.gguf + mmproj*.gguf 자동 탐색)
     #[arg(long, env = "ENGINE_VISION_MODEL")]
     vision_model: Option<String>,
@@ -168,6 +171,7 @@ fn main() -> Result<()> {
         n_threads: args.threads,
         kv_type: args.kv_type.clone(),
         flash: args.flash.clone(),
+        thinking: args.thinking.clone(),
     };
 
     eprintln!("[engine] 모델 로딩: {}", cfg.model_path);
@@ -396,9 +400,10 @@ fn main() -> Result<()> {
                     .map_err(|e| format!("{e:#}"));
                 if let Ok(r) = &res {
                     eprintln!(
-                        "[engine] prompt {} (재사용 {}, 새로 계산 {} · {:.1}s) + gen {} tokens ({:.1} tok/s, {})",
+                        "[engine] prompt {} (재사용 {}, 새로 계산 {} · {:.1}s) + gen {} tokens{} ({:.1} tok/s, {})",
                         r.prompt_tokens, r.cached_tokens, r.prompt_tokens - r.cached_tokens, r.prompt_seconds,
-                        r.completion_tokens, r.tokens_per_second, r.finish_reason
+                        r.completion_tokens, if r.think_tokens > 0 { format!(" + 생각 {} tokens", r.think_tokens) } else { String::new() },
+                        r.tokens_per_second, r.finish_reason
                     );
                 }
                 let _ = reply.send(Event::Done(res));

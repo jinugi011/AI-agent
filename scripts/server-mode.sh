@@ -63,10 +63,9 @@ install_services() {
   echo "▶ 서비스 자동 실행 (launchd)"
   "$ROOT/scripts/agent.sh" stop >/dev/null 2>&1 || true   # nohup 으로 띄운 것은 정리
   MODEL="$(pick_model)"; [[ -n "$MODEL" ]] || { bad "모델 없음: ./install.sh --model 30b"; exit 1; }
-  write_plist com.localagent.engine "$HOME" "$STATE/engine.log" \
-    "$ROOT/engine/target/release/agent-engine" --model "$MODEL" --port "$ENGINE_PORT" --ctx 32768
-  write_plist com.localagent.backend "$HOME" "$STATE/backend.log" \
-    "$ROOT/backend/.venv/bin/uvicorn" app.main:app --app-dir "$ROOT/backend" --host 127.0.0.1 --port "$API_PORT"
+  # 실제 실행 인자는 scripts/service.sh 가 agent.env(관리 페이지 '서버 관리' 설정)를 읽어 정한다
+  write_plist com.localagent.engine "$HOME" "$STATE/engine.log" /bin/sh "$ROOT/scripts/service.sh" engine
+  write_plist com.localagent.backend "$HOME" "$STATE/backend.log" /bin/sh "$ROOT/scripts/service.sh" backend
   load com.localagent.engine; load com.localagent.backend
   printf '  서비스 시작 확인 중'
   for _ in $(seq 1 120); do

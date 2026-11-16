@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { OutputAgentLog } from './agentLog';
+import { syncPendingProjects } from './remoteIndex';
 import { ChatViewProvider } from './chatView';
 import { backend, getDefaultServer, initClients, isRemote, SECRET_CF_ID, SECRET_CF_SECRET, SECRET_TOKEN, serverUrl, setDefaultServer, setSecret } from './clients';
 import { OriginalContentProvider } from './tools';
@@ -189,6 +190,15 @@ export async function activate(ctx: vscode.ExtensionContext) {
 
   if (!isRemote() && vscode.workspace.getConfiguration('localAgent').get<boolean>('autoStartBackend', true)) {
     void startBackend(ctx, false);
+  }
+  if (isRemote()) {
+    // 웹 관리 페이지에서 '이 PC 의 경로'로 등록한 프로젝트를 찾아 올린다 (켜질 때 + 10분마다)
+    const sync = () => syncPendingProjects(agentLog).then((done) => {
+      if (done.length) vscode.window.showInformationMessage(`Yang Coding: 원격 등록 프로젝트를 올려 분석을 시작했습니다 (${done.join(', ')})`);
+    });
+    setTimeout(sync, 5000);
+    const timer = setInterval(sync, 10 * 60_000);
+    ctx.subscriptions.push({ dispose: () => clearInterval(timer) });
   }
 }
 

@@ -17,6 +17,7 @@ export type ToolCall =
   | { kind: 'harness'; task: string }
   | { kind: 'model'; action: string; arg: string }
   | { kind: 'connect'; location: string }
+  | { kind: 'analyze'; path: string }
   | { kind: 'check' }
   | { kind: 'play'; req: PlayRequest }
   | { kind: 'image'; path: string; fields: Record<string, string> }
@@ -28,7 +29,8 @@ export const TOOL_DOCS = `## 도구 (필요할 때만, 한 응답에 여러 개 
 도구 블록은 줄 맨 앞에서 시작한다. 결과는 다음 메시지로 돌려준다. 도구 없이 답하면 대화 턴이 끝난다.
 
 <<<READ path/to/file>>>            파일 읽기 (부분: <<<READ path:120-200>>>)
-<<<LIST src/**/*.ts>>>             파일 목록 (glob)
+<<<LIST src/**/*.ts>>>             파일 찾기 (glob)
+<<<LIST lib/screens>>>              폴더 한 단계 보기 (폴더는 / 로 끝남 · LIST . = 최상위)
 <<<GREP 정규식>>>                    워크스페이스 텍스트 검색
 <<<SEARCH 자연어 질의>>>             벡터 DB 에서 관련 코드·코딩 방법 검색
 <<<FILE path/to/file
@@ -54,7 +56,9 @@ REMEMBER>>>                        사용자 스타일/선호/제약을 영구 �
 요구사항
 HARNESS>>>                         요구사항→테스트 하네스→구현→테스트 반복을 새 브랜치에서 자동 수행 (큰 기능 구현 시)
 <<<MODEL list|status|download <key>|start [key]|stop>>>   로컬 모델 관리
-<<<CONNECT 경로 또는 git URL>>>      다른 레포 연결 + 벡터화
+<<<ANALYZE>>>                       프로젝트 전체 분석: 코드·문서를 임베딩하고 코딩 스타일·아키텍처 문서를 새로 만든다 (승인 필요, 1~3분).
+                                   구조를 모르거나 아키텍처 규칙이 없을 때, 큰 구조 변경 뒤에 쓴다. 결과로 아키텍처 문서를 돌려준다.
+<<<CONNECT git URL 또는 다른 폴더>>>  작업 폴더 밖의 다른 레포를 벡터화 (작업 폴더는 이미 연결됨 → 쓰지 말 것)
 ${PLAY_DOC}
 <<<IMAGE 저장경로.png
 prompt: 영어로 '무엇을' 그릴지 구체적으로 (대상·자세·방향·특징·색 등). 화풍은 프로젝트 아트 컨셉이 자동으로 붙음
@@ -72,7 +76,7 @@ overwrite: yes                     같은 경로에 그림이 이미 있으면 �
 IMAGE>>>                           프로젝트용 그림을 맥의 이미지 모델(FLUX)로 생성·가공해 저장. 한 장에 15~40초.
                                    sheet-split 은 경로_0.png, 경로_1.png … 로 저장. 웹 참고 이미지는 CC0·퍼블릭 도메인만 쓰고 ASSET_CREDITS.md 에 기록.`;
 
-const SIMPLE_RE = /^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT|CHECK|PLAY|DELETE|MOVE|MKDIR)(?:[ \t]+([^\n]*?))?>>>[ \t]*$/gm;
+const SIMPLE_RE = /^<<<(READ|LIST|GREP|SEARCH|RUN|MODEL|CONNECT|ANALYZE|CHECK|PLAY|DELETE|MOVE|MKDIR)(?:[ \t]+([^\n]*?))?>>>[ \t]*$/gm;
 const FILE_RE = /^<<<FILE[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^FILE>>>/gm;
 const EDIT_RE = /^<<<EDIT[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^EDIT>>>/gm;
 const REMEMBER_RE = /^<<<REMEMBER[ \t]*([^\n]*)\n([\s\S]*?)\n?^REMEMBER>>>/gm;
@@ -80,12 +84,72 @@ const HARNESS_RE = /^<<<HARNESS[ \t]*\n([\s\S]*?)\n?^HARNESS>>>/gm;
 const IMAGE_RE = /^<<<IMAGE[ \t]+([^\n>]+?)[ \t]*\n([\s\S]*?)\n?^IMAGE>>>/gm;
 const SR_RE = /<<<<<<< SEARCH\n([\s\S]*?)\n?=======\n([\s\S]*?)\n?>>>>>>> REPLACE/g;
 
+/** 모델이 도구 블록을 엉뚱한 태그로 감싸는 경우 정리 (<tool_code> … </tool_code> 등) */
+export function normalizeToolText(text: string): string {
+  const t = text.replace(/<\/?tool_code>/g, '\n').replace(/<\/?tool_call>/g, '\n');
+  return closeOpenEdits(t);
+}
+
+/**
+ * 닫는 줄 EDIT>>> 를 빠뜨린 EDIT 블록을 닫아 준다 (다음 도구 시작 줄 앞 또는 끝에).
+ * 안의 SEARCH/REPLACE 블록은 따로 검사하므로 안전하다. FILE 은 잘린 파일일 수 있어 닫아 주지 않는다.
+ */
+export function closeOpenEdits(text: string): string {
+  const lines = text.split('\n');
+  const out: string[] = [];
+  let open = false;
+  for (const line of lines) {
+    if (open && /^<<<[A-Z]/.test(line)) { out.push('EDIT>>>'); open = false; }
+    if (/^<<<EDIT[ \t]+\S/.test(line)) open = true;
+    else if (/^EDIT>>>\s*$/.test(line)) open = false;
+    out.push(line);
+  }
+  if (open) out.push('EDIT>>>');
+  return out.join('\n');
+}
+
+/**
+ * EDIT 본문의 SEARCH/REPLACE 블록을 줄 단위로 읽는다. 흔한 형식 실수도 바르게 해석:
+ *  - 블록 끝을 '>>>>>>> REPLACE' 대신 '=======' 로 닫음 · 마지막 블록의 REPLACE 줄 빠짐 · 표식 줄 앞뒤 공백
+ * 해석할 수 없는 블록(구분선이 없는 SEARCH)은 search 에 표식을 남겨 적용 단계에서 실패하게 한다 (파일을 망가뜨리지 않음).
+ */
+export function parseSearchReplace(body: string): { search: string; replace: string }[] {
+  const out: { search: string; replace: string }[] = [];
+  let state: 'idle' | 'search' | 'replace' = 'idle';
+  let sea: string[] = [];
+  let rep: string[] = [];
+  const close = () => { out.push({ search: sea.join('\n'), replace: rep.join('\n') }); sea = []; rep = []; state = 'idle'; };
+  for (const line of body.split('\n')) {
+    const t = line.trim();
+    if (/^<{5,9}\s*SEARCH$/.test(t)) {
+      if (state === 'replace') close();
+      else if (state === 'search') { out.push({ search: '\u0000FORMAT\u0000' + sea.join('\n'), replace: '' }); sea = []; }
+      state = 'search';
+      continue;
+    }
+    if (/^={5,9}$/.test(t)) {
+      if (state === 'search') { state = 'replace'; continue; }
+      if (state === 'replace') { close(); continue; } // REPLACE 대신 ======= 로 닫은 실수
+    }
+    if (/^>{5,9}\s*REPLACE$/.test(t)) {
+      if (state === 'replace') close();
+      continue;
+    }
+    if (state === 'search') sea.push(line);
+    else if (state === 'replace') rep.push(line);
+  }
+  if (state === 'replace') close();
+  else if (state === 'search') out.push({ search: '\u0000FORMAT\u0000' + sea.join('\n'), replace: '' });
+  return out;
+}
+
 function cleanPath(p: string): string {
   return p.trim().replace(/^["'`]|["'`]$/g, '').replace(/^\.\//, '');
 }
 
 /** 응답 텍스트에서 도구 호출을 등장 순서대로 추출한다. */
 export function parseToolCalls(text: string): ToolCall[] {
+  text = normalizeToolText(text);
   const found: { index: number; call: ToolCall }[] = [];
   const push = (index: number, call: ToolCall) => found.push({ index, call });
   // 본문을 가지는 블록(FILE/EDIT/REMEMBER/HARNESS) 범위. 이 안의 텍스트는 도구 호출로 해석하지 않는다.
@@ -98,7 +162,7 @@ export function parseToolCalls(text: string): ToolCall[] {
   for (const m of text.matchAll(SIMPLE_RE)) {
     const [, tag, raw = ''] = m;
     const arg = raw.trim();
-    if (!arg && !['CHECK', 'PLAY', 'MODEL', 'LIST'].includes(tag)) continue;
+    if (!arg && !['CHECK', 'PLAY', 'MODEL', 'LIST', 'ANALYZE'].includes(tag)) continue;
     switch (tag) {
       case 'READ': {
         const range = /^(.*?):(\d+)-(\d+)$/.exec(arg);
@@ -107,11 +171,12 @@ export function parseToolCalls(text: string): ToolCall[] {
           : { kind: 'read', path: cleanPath(arg) });
         break;
       }
-      case 'LIST': push(m.index!, { kind: 'list', pattern: arg || '**/*' }); break;
+      case 'LIST': push(m.index!, { kind: 'list', pattern: arg || '.' }); break;
       case 'GREP': push(m.index!, { kind: 'grep', pattern: arg }); break;
       case 'SEARCH': push(m.index!, { kind: 'search', query: arg }); break;
       case 'RUN': push(m.index!, { kind: 'run', command: arg }); break;
       case 'CONNECT': push(m.index!, { kind: 'connect', location: arg }); break;
+      case 'ANALYZE': push(m.index!, { kind: 'analyze', path: arg ? cleanPath(arg) : '' }); break;
       case 'CHECK': push(m.index!, { kind: 'check' }); break;
       case 'DELETE': push(m.index!, { kind: 'delete', path: cleanPath(arg) }); break;
       case 'MKDIR': push(m.index!, { kind: 'mkdir', path: cleanPath(arg) }); break;
@@ -132,7 +197,7 @@ export function parseToolCalls(text: string): ToolCall[] {
     push(m.index!, { kind: 'write', path: cleanPath(m[1]), content: m[2] });
   }
   for (const m of text.matchAll(EDIT_RE)) {
-    const blocks = [...m[2].matchAll(SR_RE)].map((b) => ({ search: b[1], replace: b[2] }));
+    const blocks = parseSearchReplace(m[2]);
     push(m.index!, { kind: 'edit', path: cleanPath(m[1]), blocks });
   }
   for (const m of text.matchAll(REMEMBER_RE)) {
@@ -163,7 +228,7 @@ export function parseToolCalls(text: string): ToolCall[] {
  * 채팅 화면 표시용: 도구 블록을 제거한다. 스트리밍 중 아직 닫히지 않은 블록(<<<FILE … 진행 중)도 숨긴다.
  */
 export function stripToolBlocks(text: string): string {
-  let out = text
+  let out = normalizeToolText(text)
     .replace(FILE_RE, '')
     .replace(EDIT_RE, '')
     .replace(REMEMBER_RE, '')
@@ -189,6 +254,10 @@ export function applySearchReplace(original: string, blocks: { search: string; r
   let applied = 0;
   const failed: string[] = [];
   for (const { search, replace } of blocks) {
+    if (search.startsWith('\u0000FORMAT\u0000')) {
+      failed.push('EDIT 형식 오류: <<<<<<< SEARCH 다음에 ======= 와 >>>>>>> REPLACE 가 있어야 합니다 (블록마다).');
+      continue;
+    }
     if (search === '') {
       content = content + (content.endsWith('\n') || content === '' ? '' : '\n') + replace + '\n';
       applied++;
@@ -218,11 +287,52 @@ export function applySearchReplace(original: string, blocks: { search: string; r
       lines.splice(hit, needle.length, ...replace.split('\n'));
       content = lines.join('\n');
       applied++;
-    } else {
-      failed.push(`SEARCH 블록을 파일에서 찾지 못했습니다:\n${search.slice(0, 200)}`);
+      continue;
     }
+    // 빈 줄 차이 허용: 빈 줄을 뺀 줄들로 비교해 유일하게 맞으면 그 범위를 바꾼다
+    const nonEmpty = lines.map((l, i) => [l.trim(), i] as [string, number]).filter(([t]) => t !== '');
+    const need2 = needle.filter((n) => n !== '');
+    let hit2 = -1;
+    if (need2.length >= 2) {
+      for (let i = 0; i + need2.length <= nonEmpty.length; i++) {
+        if (need2.every((n, j) => nonEmpty[i + j][0] === n)) {
+          if (hit2 !== -1) { hit2 = -2; break; }
+          hit2 = i;
+        }
+      }
+    }
+    if (hit2 >= 0) {
+      const from = nonEmpty[hit2][1];
+      const to = nonEmpty[hit2 + need2.length - 1][1];
+      lines.splice(from, to - from + 1, ...replace.split('\n'));
+      content = lines.join('\n');
+      applied++;
+      continue;
+    }
+    failed.push(`SEARCH 블록을 파일에서 찾지 못했습니다${hit === -2 || hit2 === -2 ? ' (여러 곳과 비슷함 — 앞뒤 줄을 더 넣어 고유하게)' : ''}:\n` +
+      `${search.slice(0, 200)}\n${closestSnippet(lines, needle)}`);
   }
   return { content, applied, failed };
+}
+
+/** SEARCH 가 안 맞을 때: 파일에서 가장 비슷한 부분을 줄 번호와 함께 보여 준다 (그 원문으로 EDIT 를 다시 하도록) */
+export function closestSnippet(lines: string[], needle: string[]): string {
+  const need = needle.filter((n) => n !== '');
+  if (!need.length || !lines.length) return '';
+  const set = new Set(need);
+  let best = -1;
+  let bestScore = 0;
+  const win = Math.max(need.length, 1);
+  for (let i = 0; i < lines.length; i++) {
+    let score = 0;
+    for (let j = i; j < Math.min(lines.length, i + win + 2); j++) if (set.has(lines[j].trim())) score++;
+    if (score > bestScore) { bestScore = score; best = i; }
+  }
+  if (best < 0 || bestScore === 0) return '(비슷한 부분 없음: 파일을 다시 READ 해서 실제 내용을 확인하세요)';
+  const from = Math.max(0, best - 2);
+  const to = Math.min(lines.length, best + win + 4);
+  return `파일에서 가장 비슷한 부분 (${from + 1}~${to}줄) — 이 원문을 그대로 SEARCH 에 넣어 EDIT 를 다시 하세요 (FILE 로 전체를 다시 쓰지 말 것):\n` +
+    lines.slice(from, to).map((l, k) => `${String(from + k + 1).padStart(4)}| ${l}`).join('\n');
 }
 
 export function lineDiffStats(before: string, after: string): { added: number; removed: number } {
@@ -256,6 +366,7 @@ export function describeCall(c: ToolCall): string {
     case 'harness': return `HARNESS ${one(c.task)}`;
     case 'model': return `MODEL ${c.action}${c.arg ? ' ' + c.arg : ''}`;
     case 'connect': return `CONNECT ${c.location}`;
+    case 'analyze': return `ANALYZE ${c.path}`.trim();
     case 'check': return 'CHECK';
     case 'delete': return `DELETE ${c.path}`;
     case 'move': return `MOVE ${c.from} -> ${c.to}`;

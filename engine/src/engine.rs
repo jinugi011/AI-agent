@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::session::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -40,6 +41,12 @@ pub struct GenerateRequest {
     /// true 면 토큰 단위 NDJSON 스트리밍 응답
     #[serde(default)]
     pub stream: bool,
+    /// 생각(추론) 모드를 이 요청만 켜고/끈다 (없으면 엔진 설정). 에이전트는 요청의 첫 단계에서만 짧게 켠다.
+    #[serde(default)]
+    pub think: Option<bool>,
+    /// 생각에 쓸 최대 토큰 (기본 6000)
+    #[serde(default)]
+    pub think_budget: Option<usize>,
 }
 
 fn default_max_tokens() -> usize {
@@ -63,6 +70,8 @@ pub struct GenerateResponse {
     pub cached_tokens: usize,
     /// 프롬프트 처리(프리필) 시간 (초)
     pub prompt_seconds: f64,
+    /// 생각(추론)에 쓴 토큰 수 (응답에는 안 나감)
+    pub think_tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +94,8 @@ pub struct EngineConfig {
     pub kv_type: String,
     /// Flash Attention: auto | on | off
     pub flash: String,
+    /// 생각(추론) 모드: auto (QwQ·R1 같은 추론 모델만 켬) | on | off
+    pub thinking: String,
 }
 
 pub fn kv_cache_type(name: &str) -> Result<llama_cpp_2::context::params::KvCacheType> {
@@ -112,6 +123,13 @@ pub struct Engine<'m> {
     n_batch: usize,
     /// 현재 KV 캐시에 들어 있는 토큰 열. 다음 요청과 공통된 앞부분은 다시 계산하지 않는다.
     cached: Vec<LlamaToken>,
+    /// 하이브리드(선형 어텐션+어텐션, 예: Qwen3.5/3.6) 모델은 KV 를 중간부터 지울 수 없다.
+    /// 프롬프트 끝마다 순환 상태를 저장해 두고(체크포인트), 다음 요청에서 그 지점부터 이어 계산한다 (llama-server 방식).
+    hybrid: bool,
+    /// 생각 블록(<think>)을 쓰는 모델인지 · 이번 실행에서 생각을 켤지
+    think_capable: bool,
+    think_on: bool,
+    checkpoints: Vec<(usize, SeqState)>,
     pub info: ModelInfo,
 }
 
@@ -183,10 +201,19 @@ impl<'m> Engine<'m> {
             n_params: model.n_params(),
             size_bytes: model.size(),
         };
-        Ok(Self { model, ctx, n_batch: cfg.n_batch as usize, cached: Vec::new(), info })
+        let hybrid = model.is_hybrid() || model.is_recurrent();
+        let name = Path::new(&cfg.model_path).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let reasoner = name.contains("qwq") || name.contains("-r1") || name.contains("deepseek-r1");
+        let think_capable = reasoner
+            || model.chat_template(None).ok().and_then(|t| t.to_string().ok()).map_or(false, |t| t.contains("<think>"));
+        let think_on = think_capable && match cfg.thinking.as_str() { "on" => true, "off" => false, _ => reasoner };
+        if think_capable {
+            eprintln!("[engine] 생각(추론) 모드: {}", if think_on { "켬 (답 전에 추론 · 추론 내용은 응답에서 뺌)" } else { "끔 (바로 답)" });
+        }
+        Ok(Self { model, ctx, n_batch: cfg.n_batch as usize, cached: Vec::new(), hybrid, think_capable, think_on, checkpoints: Vec::new(), info })
     }
 
-    fn render_prompt(&self, messages: &[ChatMessage]) -> Result<String> {
+    fn render_prompt(&self, messages: &[ChatMessage], think: bool) -> Result<String> {
         let chat = messages
             .iter()
             .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
@@ -194,7 +221,11 @@ impl<'m> Engine<'m> {
             .map_err(|e| anyhow!("메시지에 NUL 문자가 포함되어 있습니다: {e}"))?;
         // GGUF 내장 템플릿을 우선 사용하고, 없으면 ChatML(Qwen 계열 표준)로 대체한다.
         if let Ok(tmpl) = self.model.chat_template(None) {
-            if let Ok(prompt) = self.model.apply_chat_template(&tmpl, &chat, true) {
+            if let Ok(mut prompt) = self.model.apply_chat_template(&tmpl, &chat, true) {
+                // 생각(thinking) 모델(Qwen3.5/3.6 등): 코딩 에이전트는 빠른 응답이 중요 → 생각 없이 바로 답 (enable_thinking=false 와 같음)
+                if self.think_capable && prompt.ends_with("<|im_start|>assistant\n") {
+                    prompt.push_str(if think { "<think>\n" } else { "<think>\n\n</think>\n\n" });
+                }
                 return Ok(prompt);
             }
         }
@@ -232,23 +263,46 @@ impl<'m> Engine<'m> {
         if req.messages.is_empty() {
             bail!("messages 가 비어 있습니다");
         }
-        let prompt = self.render_prompt(&req.messages)?;
+        let think = self.think_capable && req.think.unwrap_or(self.think_on);
+        let prompt = self.render_prompt(&req.messages, think)?;
         let vocab = self.model.vocab();
         let tokens = vocab.tokenize(prompt.as_bytes(), vocab.should_add_bos(), true);
         let n_ctx = self.ctx.n_ctx() as usize;
         if tokens.len() + 16 >= n_ctx {
             bail!("프롬프트가 너무 깁니다: {} 토큰 (컨텍스트 {n_ctx})", tokens.len());
         }
-        let max_new = req.max_tokens.min(n_ctx - tokens.len() - 1);
+        // 생각 모드: 추론 토큰은 답 길이(max_tokens)와 따로 최대 THINK_MAX 까지
+        let think_max: usize = req.think_budget.unwrap_or(6000).clamp(64, 16000);
+        let thinking_now = think && prompt.ends_with("<think>\n");
+        let mut max_new = (req.max_tokens + if thinking_now { think_max } else { 0 }).min(n_ctx - tokens.len() - 1);
+        let mut in_think = thinking_now;
+        let mut think_tokens = 0usize;
 
         // ---- KV 프리픽스 캐시: 이전 요청과 같은 앞부분(시스템 프롬프트·이전 대화)은 재사용 ----
         // 마지막 토큰의 logits 가 필요하므로 최소 1토큰은 다시 계산한다.
         let mut common = self.cached.iter().zip(tokens.iter()).take_while(|(a, b)| a == b).count();
         common = common.min(tokens.len() - 1);
-        if !self.ctx.clear_kv_cache_seq(Some(0), Some(common as u32), None).unwrap_or(false) {
+        let mut ok = self.ctx.clear_kv_cache_seq(Some(0), Some(common as u32), None).unwrap_or(false);
+        if !ok && self.hybrid {
+            // 공통 부분 안쪽의 가장 최근 체크포인트로 순환 상태를 되돌리고 그 뒤만 지운다
+            if let Some(i) = self.checkpoints.iter().rposition(|(p, _)| *p > 0 && *p <= common) {
+                let pos = self.checkpoints[i].0;
+                let restored = self.ctx.state_seq_set(&self.checkpoints[i].1, 0);
+                if restored.is_ok()
+                    && self.ctx.clear_kv_cache_seq(Some(0), Some(pos as u32), None).unwrap_or(false)
+                {
+                    common = pos;
+                    ok = true;
+                }
+                self.checkpoints.truncate(i + 1);
+            }
+        }
+        if !ok {
             self.ctx.clear_kv_cache(); // 부분 삭제가 안 되면 전부 다시 계산
+            self.checkpoints.clear();
             common = 0;
         }
+        self.checkpoints.retain(|(p, _)| *p <= common);
         // 실패 시 캐시 상태를 믿을 수 없으므로, 성공적으로 끝날 때만 갱신한다.
         self.cached.clear();
 
@@ -258,13 +312,42 @@ impl<'m> Engine<'m> {
         // 프롬프트 프리필: 재사용하지 못한 부분만 n_batch 단위로 디코딩, 마지막 토큰에서만 logits 계산
         let prefill_started = Instant::now();
         let last = tokens.len() - 1;
-        for (chunk_idx, chunk) in tokens[common..].chunks(self.n_batch.max(1)).enumerate() {
-            batch.clear();
-            for (i, tok) in chunk.iter().enumerate() {
-                let pos = common + chunk_idx * self.n_batch + i;
-                batch.add(*tok, pos as i32, &[0], pos == last)?;
+        // 하이브리드 모델: 체크포인트는 마지막 "<|im_start|>"(답변 머리) 바로 앞에서 저장한다.
+        // 다음 요청은 이 대화 + 답변 + 도구 결과라 거기까지는 같지만, 답변 머리 뒤(<think> 표식 등)는 다르게 렌더링된다.
+        let cp_at: Option<usize> = if self.hybrid {
+            let im = vocab.tokenize(b"<|im_start|>", false, true);
+            if im.len() == 1 { tokens.iter().rposition(|t| *t == im[0]).filter(|&i| i > common) } else { None }
+                .or(Some(tokens.len()))
+        } else {
+            None
+        };
+        let bounds: Vec<usize> = match cp_at {
+            Some(c) if c < tokens.len() => vec![common, c, tokens.len()],
+            _ => vec![common, tokens.len()],
+        };
+        let step = self.n_batch.max(1);
+        for w in bounds.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let mut start = a;
+            while start < b {
+                let end = (start + step).min(b);
+                batch.clear();
+                for pos in start..end {
+                    batch.add(tokens[pos], pos as i32, &[0], pos == last)?;
+                }
+                self.ctx.decode(&mut batch).map_err(|e| anyhow!("프롬프트 디코딩 실패: {e}"))?;
+                start = end;
             }
-            self.ctx.decode(&mut batch).map_err(|e| anyhow!("프롬프트 디코딩 실패: {e}"))?;
+            if cp_at == Some(b) {
+                // 순환 상태만 저장 (수십 MB) → 다음 요청이 여기서부터 이어 계산
+                if let Ok(state) = self.ctx.state_seq_get(0, LlamaStateSeqFlags::PARTIAL_ONLY) {
+                    self.checkpoints.retain(|(p, _)| *p < b);
+                    self.checkpoints.push((b, state));
+                    if self.checkpoints.len() > 4 {
+                        self.checkpoints.remove(0);
+                    }
+                }
+            }
         }
         let prompt_seconds = prefill_started.elapsed().as_secs_f64();
         let mut decoded: Vec<LlamaToken> = Vec::new(); // KV 에 들어간 생성 토큰
@@ -284,6 +367,41 @@ impl<'m> Engine<'m> {
             }
             out_bytes.extend(vocab.token_to_piece(token, false, None));
             produced += 1;
+
+            if in_think {
+                // 추론 내용은 내보내지 않는다. </think> 이후의 답만 응답으로
+                think_tokens += 1;
+                let text = String::from_utf8_lossy(&out_bytes).into_owned();
+                let mut force_end = false;
+                if let Some(i) = text.find("</think>") {
+                    out_bytes = text[i + 8..].trim_start().as_bytes().to_vec();
+                    in_think = false;
+                } else if think_tokens >= think_max {
+                    force_end = true; // 추론이 너무 길면 끊고 답하게 한다
+                }
+                batch.clear();
+                batch.add(token, n_past as i32, &[0], !force_end)?;
+                n_past += 1;
+                decoded.push(token);
+                if force_end {
+                    let close = vocab.tokenize("\n</think>\n\n".as_bytes(), false, true);
+                    for (k, t) in close.iter().enumerate() {
+                        batch.add(*t, n_past as i32, &[0], k == close.len() - 1)?;
+                        n_past += 1;
+                        decoded.push(*t);
+                    }
+                    out_bytes.clear();
+                    in_think = false;
+                }
+                self.ctx.decode(&mut batch).map_err(|e| anyhow!("토큰 디코딩 실패: {e}"))?;
+                if !in_think {
+                    // 답은 이제부터 max_tokens 만큼 (남은 컨텍스트 안에서)
+                    produced = 0;
+                    max_new = req.max_tokens.min(n_ctx.saturating_sub(n_past + 1));
+                    emitted = 0;
+                }
+                continue;
+            }
 
             // 한글 등 멀티바이트 문자가 토큰 경계에서 잘릴 수 있으므로 완결된 부분만 내보낸다
             let pending = &out_bytes[emitted..];
@@ -326,7 +444,8 @@ impl<'m> Engine<'m> {
             prompt_tokens: tokens.len(),
             completion_tokens: produced,
             finish_reason,
-            tokens_per_second: produced as f64 / secs,
+            tokens_per_second: (produced + think_tokens) as f64 / secs,
+            think_tokens,
             cached_tokens: common,
             prompt_seconds,
         })

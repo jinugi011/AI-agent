@@ -11,6 +11,11 @@ const STEPS = {
     'Settings → Tools → Yang Coding → 접속 방식 remote → 서버 주소·접속 토큰 입력 → 원격 연결 테스트',
     '오른쪽 사이드바 Yang Coding 채팅, 하단 Yang Coding 로그 콘솔에서 사용',
   ],
+  'android-studio': [
+    'Android Studio → Settings → Plugins → ⚙ → "Install Plugin from Disk…" → 받은 zip 선택 → 재시작 (IntelliJ 용 zip 과 다름)',
+    'Settings → Tools → Yang Coding → 접속 방식 remote → 서버 주소·접속 토큰 입력 → 원격 연결 테스트',
+    'Flutter 프로젝트를 열고 오른쪽 Yang Coding 채팅에서 사용 (flutter analyze · flutter test · PLAY flutter 자동)',
+  ],
 };
 
 const kb = (n) => (n > 1e6 ? `${(n / 1e6).toFixed(1)}MB` : `${Math.round(n / 1e3)}KB`);

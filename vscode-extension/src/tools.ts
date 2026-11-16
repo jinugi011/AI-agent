@@ -6,6 +6,11 @@ import { backend, isRemote } from './clients';
 import { applySearchReplace, lineDiffStats, ToolCall } from './protocol';
 import { runCheck, runPlay } from './debugRunner';
 import * as art from './art';
+import { isDirListing, isReadOnlyGit, keptRatio, pickStyleSibling } from './wsinfo';
+import { listDir } from './workspace';
+import { analyzeProject, ensureRemoteIndex, remoteProjectName } from './remoteIndex';
+import { detectTestCommand, harnessFromRequestPrompt, harnessName, HARNESS_DIR } from './harnesskit';
+import { listFiles } from './debugRunner';
 
 const EXCLUDE = '**/{node_modules,.git,dist,build,target,.venv,venv,__pycache__,.next,Pods,.dart_tool,.gradle,models}/**';
 const MAX_READ = 24_000; // 큰 파일 하나가 대화 예산을 다 쓰지 않게 (나머지는 줄 범위로)
@@ -19,7 +24,7 @@ export interface ToolHost {
   root: vscode.Uri;
   repoName: string;
   signal: AbortSignal;
-  approve(kind: 'edit' | 'run', title: string, detail: string): Promise<boolean>;
+  approve(kind: 'edit' | 'run' | 'files' | 'index', title: string, detail: string): Promise<boolean>;
   emit(ev: UiEvent): void;
   checkpoint: Checkpoint;
 }
@@ -28,7 +33,10 @@ export interface ToolHost {
 export class Checkpoint {
   readonly originals = new Map<string, string | null>(); // fsPath → 원본(null = 새 파일)
   readonly binaries = new Map<string, Uint8Array>();     // 이미지 등 바이너리 원본
-  readonly moves: [string, string][] = [];               // 이동 기록 [원래, 새] (되돌릴 때 역순으로)
+  readonly moves: [string, string][] = [];
+  readonly readPaths = new Set<string>();     // 이번 턴에 READ 한 파일 (스타일 기준 확인용)
+  readonly styleChecked = new Set<string>();  // 스타일 확인을 이미 한 새 파일
+  readonly overwriteOk = new Set<string>();   // 전체 재작성 경고를 이미 한 파일 (두 번째는 허용)               // 이동 기록 [원래, 새] (되돌릴 때 역순으로)
 
   record(uri: vscode.Uri, before: string | null) {
     if (!this.originals.has(uri.fsPath)) this.originals.set(uri.fsPath, before);
@@ -160,7 +168,7 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
     host.emit({ type: 'tool', id, title, status, ...extra });
 
   // 원격 모드: 서버(맥)에서 코드를 실행하거나 서버 설정을 바꾸는 기능은 쓸 수 없다
-  const serverSide = call.kind === 'harness' || call.kind === 'connect' ||
+  const serverSide = call.kind === 'connect' ||
     (call.kind === 'model' && ['download', 'start', 'stop'].includes(call.action));
   if (isRemote() && serverSide) {
     emit(`${call.kind}`, 'denied', { detail: '원격 모드에서는 사용할 수 없음' });
@@ -176,6 +184,7 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
           emit(`Read ${call.path}`, 'error', { detail: '파일 없음' });
           return `[READ ${call.path}] 파일이 없습니다.`;
         }
+        host.checkpoint.readPaths.add(call.path.replace(/^\.?\//, ''));
         let body = text;
         if (call.start) {
           const lines = text.split('\n');
@@ -186,6 +195,17 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
       }
 
       case 'list': {
+        if (isDirListing(call.pattern)) {
+          try {
+            resolveInRoot(host.root, call.pattern === '.' ? '' : call.pattern);
+            const items = await listDir(host.root, call.pattern === '.' ? '' : call.pattern);
+            emit(`List ${call.pattern || '.'}`, 'done', { detail: `${items.length}개` });
+            return `[LIST ${call.pattern || '.'}] ${items.length}개 (폴더는 / 로 끝남)\n${items.join('\n')}`;
+          } catch (e: any) {
+            if (!/ENOENT|EntryNotFound|not found|FileNotFound/i.test(String(e?.code ?? e?.message))) throw e;
+            return `[LIST ${call.pattern}] 그런 폴더가 없습니다. LIST . 으로 최상위부터 확인하세요.`;
+          }
+        }
         const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(host.root, call.pattern), EXCLUDE, 400);
         const files = uris.map((u) => path.relative(host.root.fsPath, u.fsPath).replace(/\\/g, '/')).sort();
         emit(`List ${call.pattern}`, 'done', { detail: `${files.length}개` });
@@ -217,6 +237,20 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
         let warn = '';
         if (call.kind === 'write') {
           after = call.content.endsWith('\n') ? call.content : call.content + '\n';
+          // 같은 스타일 강제: 새 파일인데 같은 역할의 기존 파일을 아직 안 읽었으면 한 번 멈추고 그 파일을 보여 준다
+          const rel = call.path.replace(/^\.?\//, '');
+          if (before === null && !host.checkpoint.styleChecked.has(rel)) {
+            host.checkpoint.styleChecked.add(rel);
+            const files = await listFiles(host.root, 6000);
+            const sib = pickStyleSibling(rel, files);
+            if (sib && !host.checkpoint.readPaths.has(sib)) {
+              const ex = (await readText(resolveInRoot(host.root, sib))) ?? '';
+              emit(`Style check ${call.path}`, 'done', { detail: `기준 파일: ${sib}` });
+              return `[FILE ${call.path}] 아직 만들지 않았습니다 — 같은 스타일로 만들기 위해 같은 역할의 기존 파일을 먼저 보세요.\n` +
+                `기준 파일: ${sib}\n\`\`\`\n${ex.split('\n').slice(0, 80).join('\n')}\n\`\`\`\n` +
+                '위 파일의 구조·네이밍·어노테이션·예외 처리·주석 습관에 맞춰 FILE 을 다시 보내세요 (같은 내용이면 그대로 다시 보내도 됨).';
+            }
+          }
         } else {
           if (before === null) {
             emit(`Edit ${call.path}`, 'error', { detail: '파일 없음' });
@@ -226,12 +260,25 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
           const r = applySearchReplace(before, call.blocks);
           if (r.applied === 0) {
             emit(`Edit ${call.path}`, 'error', { detail: r.failed.join('\n') });
-            return `[EDIT ${call.path}] 실패:\n${r.failed.join('\n')}\n파일을 다시 READ 한 뒤 정확한 원문으로 SEARCH 하세요.`;
+            return `[EDIT ${call.path}] 실패 (파일은 그대로):\n${r.failed.join('\n')}\n위에 보인 실제 원문으로 SEARCH 를 고쳐 EDIT 를 다시 하세요. FILE 로 파일 전체를 다시 쓰지 마세요.`;
           }
           after = r.content;
           if (r.failed.length) warn = `\n일부 블록 실패:\n${r.failed.join('\n')}`;
         }
         if (before === after) return `[${call.kind.toUpperCase()} ${call.path}] 변경 사항 없음`;
+        // 처음부터 다시 쓰기 방지: 기존 파일 대부분을 FILE 로 갈아엎으려 하면 한 번 멈추고 EDIT 를 권한다
+        if (before !== null) {
+          const rel = call.path.replace(/^\.?\//, '');
+          const kept = keptRatio(before, after);
+          if (before.split('\n').length > 15 && kept < 0.6 && !host.checkpoint.overwriteOk.has(rel)) {
+            host.checkpoint.overwriteOk.add(rel);
+            const tag = call.kind === 'write' ? 'FILE' : 'EDIT';
+            emit(`Overwrite check ${call.path}`, 'done', { detail: `기존 코드 ${Math.round(kept * 100)}% 만 남음` });
+            return `[${tag} ${call.path}] 적용하지 않았습니다 — 이 변경으로 기존 파일(${before.split('\n').length}줄)의 코드 ${Math.round((1 - kept) * 100)}% 가 사라집니다.\n` +
+              '사용자가 기존 기능을 없애거나 바꾸라고 하지 않았다면, 기존 코드는 그대로 두고 필요한 부분만 추가·수정하세요 (작은 EDIT 여러 개).\n' +
+              `사용자가 정말 기존 것을 대체하라고 했다면 같은 ${tag} 를 한 번 더 보내세요.`;
+          }
+        }
 
         const stats = lineDiffStats(before ?? '', after);
         const title = `${before === null ? 'Create' : 'Edit'} ${call.path}`;
@@ -248,7 +295,7 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
 
       case 'run': {
         const title = `Run: ${call.command}`;
-        if (!(await host.approve('run', title, call.command))) {
+        if (!isReadOnlyGit(call.command) && !(await host.approve('run', title, call.command))) {
           emit(title, 'denied');
           return `[RUN ${call.command}] 사용자가 실행을 거부했습니다. 다른 방법을 제안하거나 이유를 물어보세요.`;
         }
@@ -288,8 +335,29 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
         return `[REMEMBER] 저장됨: ${call.text}`;
       }
 
+      case 'analyze': {
+        const target = call.path ? resolveInRoot(host.root, call.path) : host.root;
+        const name = call.path ? '' : remoteProjectName(host.root);
+        const title = `Analyze: ${call.path || name}`;
+        if (!(await host.approve('index', title, `이 PC 의 ${target.fsPath} 코드·문서를 서버(맥)로 올려 임베딩하고 코딩 스타일·아키텍처를 분석합니다 (1~3분).`))) {
+          emit(title, 'denied');
+          return `[ANALYZE] 사용자가 분석을 거부했습니다. 지금 있는 정보(LIST/READ)로 진행하세요.`;
+        }
+        emit(title, 'running', { detail: '분석 시작' });
+        const r = await analyzeProject(target, { line: () => undefined, raw: () => undefined, show: () => undefined },
+          (p) => emit(title, 'running', { detail: p }), host.signal, name);
+        emit(title, 'done', { detail: r.summary });
+        return `[ANALYZE] 완료\n${r.summary}\n\n## 아키텍처 · 코딩 규칙 (새로 분석)\n${r.architecture.slice(0, 7000) || '(아키텍처 문서 없음)'}`;
+      }
+
       case 'harness': {
-        if (!host.repoName) return '[HARNESS] 연결된 레포가 없습니다. 먼저 CONNECT 하세요.';
+        if (isRemote() || !host.repoName) {
+          // 원격: 코드가 이 PC 에 있으므로 서버 하네스 대신 여기서 테스트 우선으로 직접 진행
+          const files = await listFiles(host.root, 3000);
+          const target = `${HARNESS_DIR}/${harnessName(call.task.split('\n')[0].slice(0, 40))}.md`;
+          emit('Harness (이 PC 에서 테스트 우선)', 'done', { detail: target });
+          return '[HARNESS] 이 PC 에서 직접 진행합니다.\n' + harnessFromRequestPrompt(call.task, target, detectTestCommand(files, process.platform === 'win32'));
+        }
         const title = `Harness: ${call.task.split('\n')[0].slice(0, 60)}`;
         emit(title, 'running', { detail: '요구사항 → 테스트 → 구현 반복 시작' });
         const { job } = await backend.post('/api/agent/run', { repo: host.repoName, task: call.task });
@@ -339,6 +407,24 @@ export async function executeTool(call: ToolCall, host: ToolHost, diffProvider: 
       }
 
       case 'connect': {
+        const loc = call.location.trim();
+        if (!/^(https?:\/\/|git@|ssh:\/\/)/.test(loc)) {
+          // 로컬 경로: 서버(맥)가 원격 PC 의 폴더를 열 수는 없다 → 이 PC 에서 읽어 서버로 올려 색인
+          const abs = vscode.Uri.file(path.resolve(host.root.fsPath, loc));
+          const rel = path.relative(host.root.fsPath, abs.fsPath);
+          if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+            emit(`Connect ${loc}`, 'done', { detail: '이미 작업 폴더 안' });
+            return `[CONNECT ${loc}] 작업 폴더 안의 경로입니다. 이미 연결되어 있으니 READ / LIST / GREP 를 바로 쓰세요.`;
+          }
+          const st = await vscode.workspace.fs.stat(abs).then((x) => x, () => null);
+          if (!st || !(st.type & vscode.FileType.Directory)) return `[CONNECT ${loc}] 이 PC 에 그런 폴더가 없습니다: ${abs.fsPath}`;
+          if (isRemote()) {
+            emit(`Connect ${loc}`, 'running', { detail: '이 PC 에서 읽어 서버로 올려 벡터화' });
+            await ensureRemoteIndex(abs, { line: () => undefined, raw: () => undefined, show: () => undefined }, true);
+            emit(`Connect ${remoteProjectName(abs)}`, 'done', { detail: '색인 시작 (SEARCH 로 검색 가능)' });
+            return `[CONNECT ${loc}] ${remoteProjectName(abs)} 를 서버로 올려 벡터화를 시작했습니다. 그 레포의 코드는 SEARCH 로 찾을 수 있습니다 (파일 수정은 작업 폴더 안에서만).`;
+          }
+        }
         emit(`Connect ${call.location}`, 'running', { detail: '연결 + 벡터화 중' });
         const { repo } = await backend.post('/api/repos/connect', { location: call.location, init_if_missing: false }, 600_000);
         emit(`Connect ${repo.name}`, 'done', { detail: `${repo.profile} · ${repo.index_stats?.chunks} chunks` });
@@ -483,7 +569,7 @@ async function fileOp(call: Extract<ToolCall, { kind: 'delete' | 'move' | 'mkdir
     const stat = await vscode.workspace.fs.stat(src).then((st) => st, () => null);
     if (!stat) return `[${tag} ${label}] 오류: 파일이 없습니다`;
     const isDir = (stat.type & vscode.FileType.Directory) !== 0;
-    if (!(await host.approve('edit', title, isDir ? '폴더 전체 (되돌리기 대신 휴지통에서 복구)' : '파일'))) {
+    if (!(await host.approve('files', title, isDir ? '폴더 전체 (되돌리기 대신 휴지통에서 복구)' : '파일 (/undo 로 복구 가능)'))) {
       emit(title, 'denied');
       return `[${tag} ${label}] 사용자가 거부했습니다`;
     }
@@ -494,7 +580,14 @@ async function fileOp(call: Extract<ToolCall, { kind: 'delete' | 'move' | 'mkdir
         if (isText) host.checkpoint.record(src, Buffer.from(bytes).toString('utf8'));
         else host.checkpoint.recordBinary(src, bytes);
       }
-      await vscode.workspace.fs.delete(src, { recursive: true, useTrash: true });
+      try {
+        await vscode.workspace.fs.delete(src, { recursive: true, useTrash: true });
+      } catch (e: any) {
+        // 휴지통을 쓸 수 없는 위치(네트워크 드라이브·일부 Windows/회사 PC 설정) → 바로 삭제
+        host.emit({ type: 'notice', level: 'info', text: `휴지통으로 옮길 수 없어 바로 삭제합니다 (${e.message})` });
+        await vscode.workspace.fs.delete(src, { recursive: true, useTrash: false });
+      }
+      if (await vscode.workspace.fs.stat(src).then(() => true, () => false)) throw new Error('삭제 후에도 파일이 남아 있습니다 (다른 프로그램이 사용 중이거나 권한 문제)');
       emit(title, 'done', { detail: isDir ? '폴더 → 휴지통' : '파일 삭제 (/undo 로 복구)' });
       return `[DELETE ${label}] 완료${isDir ? ' (폴더는 휴지통으로)' : ''}`;
     }

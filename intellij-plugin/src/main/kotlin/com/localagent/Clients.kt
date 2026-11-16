@@ -95,9 +95,12 @@ object Clients {
         temperature: Double,
         cancel: AtomicReference<InputStream?>,
         isCancelled: () -> Boolean,
+        think: Boolean? = null,
+        thinkBudget: Int? = null,
         onToken: (String) -> Unit,
     ): Pair<String, GenerateStats?> {
-        val body = mapOf("messages" to messages, "max_tokens" to maxTokens, "temperature" to temperature, "stream" to true)
+        val body = mapOf("messages" to messages, "max_tokens" to maxTokens, "temperature" to temperature, "stream" to true) +
+            (if (think != null) mapOf("think" to think, "think_budget" to thinkBudget) else emptyMap())
         val url = if (remote) "$backendBase/api/llm/generate" else AgentSettings.current.engineUrl.trimEnd('/') + "/generate"
         val rb = HttpRequest.newBuilder(URI.create(url))
             .header("Content-Type", "application/json")

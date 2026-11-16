@@ -13,6 +13,12 @@
   const assistants = new Map();
   const tools = new Map();
   let busy = false;
+  const workMode = document.createElement('select');
+  workMode.setAttribute('aria-label', '작업 방식');
+  for (const [value, label] of [['', '일반 코딩'], ['/harness ', '자연어 하네스'], ['/langchain ', 'LangChain 구현'], ['/langchain 하네스 ', 'LangChain 하네스']]) {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; workMode.appendChild(option);
+  }
+  sendBtn.parentElement?.insertBefore(workMode, sendBtn);
 
   // ---- 렌더링 유틸 ------------------------------------------------------------
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -205,7 +211,7 @@
       case 'approval': {
         const card = add(div('approval'));
         card.dataset.req = m.reqId;
-        card.innerHTML = `<div><strong>${m.kind === 'run' ? '명령 실행 승인' : '파일 수정 승인'}</strong></div>
+        card.innerHTML = `<div><strong>${m.kind === 'run' ? '명령 실행 승인' : m.kind === 'files' ? '파일·폴더 삭제/이동 승인' : m.kind === 'index' ? '프로젝트 분석·임베딩 승인' : '파일 수정 승인'}</strong></div>
           <pre>${esc(m.kind === 'run' ? m.detail : `${m.title}  ${m.detail}`)}</pre>
           <div class="buttons"><button data-answer="allow">허용</button><button class="secondary" data-answer="always">항상 허용</button><button class="secondary" data-answer="deny">거부</button></div>`;
         log.scrollTop = log.scrollHeight;
@@ -313,7 +319,7 @@
     }
     vscode.postMessage({
       type: 'send',
-      text: text || '첨부한 파일을 분석해서 무엇을 만들 수 있는지 정리해 주세요.',
+      text: (text.startsWith('/') ? '' : workMode.value) + (text || '첨부한 파일을 분석해서 무엇을 만들 수 있는지 정리해 주세요.'),
       attachments: ready.map((a) => a.id),
     });
     atts.clear();

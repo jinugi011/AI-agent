@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+import re
 from typing import Dict, List, Optional
 
 from . import llm_client
@@ -15,11 +16,13 @@ from .coding_agent import CodingAgent
 from .config import settings
 from .harness import Harness
 from .model_manager import ModelManager
+from .langchain_builder import create_router as create_langchain_router
+from .remote_tasks import create_router as create_remote_work_router
 from .preferences import PreferenceStore
 from .profiles import PROFILES, get_profile
 from .repo_manager import RepoManager
 from .vector_store import CodeVectorStore
-from . import artstyle, attachments, imagegen, imageops, remote, security
+from . import archinfo, artstyle, attachments, imagegen, imageops, remote, security, sysadmin, worklog
 
 app = FastAPI(title="Yang Coding", version="1.0.0")
 app.add_middleware(
@@ -58,6 +61,8 @@ preferences = PreferenceStore(vector_store)
 repos = RepoManager(vector_store)
 coding_agent = CodingAgent(vector_store, repos, preferences)
 models = ModelManager()
+app.include_router(create_langchain_router(vector_store, repos))
+app.include_router(create_remote_work_router())
 
 
 class PromptRequest(BaseModel):
@@ -89,6 +94,7 @@ class RepoConnectRequest(BaseModel):
     language: str = ""
     description: str = ""
     init_if_missing: bool = False
+    target: str = "auto"  # auto | remote(원격 PC 의 경로 → PC 대기 등록) | server(이 맥의 경로 · git URL)
 
 
 class PreferenceRequest(BaseModel):
@@ -143,6 +149,8 @@ class LLMRequest(BaseModel):
     top_p: float = 0.9
     stop: List[str] = []
     stream: bool = True
+    think: Optional[bool] = None       # 이 요청만 생각(추론) 켜기/끄기 (에이전트: 요청의 첫 단계에서 짧게)
+    think_budget: Optional[int] = None
 
 
 class RemoteFile(BaseModel):
@@ -154,6 +162,10 @@ class RemoteIndexRequest(BaseModel):
     project: str
     files: List[RemoteFile]
     language: str = ""
+    client_path: str = ""  # 원격 PC 의 폴더 경로 (표시·재색인용)
+    partial: bool = False  # true: 바뀐 파일만 (에이전트가 고친 직후) · deleted: 지워진 파일 경로
+    deleted: List[str] = []
+    arch: str = "auto"  # 아키텍처 분석: auto(없거나 7일 지났을 때) | force | off
 
 
 @app.get("/api/models")
@@ -221,11 +233,53 @@ def chat_context(request: ContextRequest):
                                               profile=repo["profile"] if repo else ""),
         "methods": vector_store.project_methods(project) if project else None,
         "hits": vector_store.search(request.query, top_k=request.top_k, project=project or None) if request.query else [],
+        "worklog": worklog.render(request.attachment_project or project),
+        "architecture": archinfo.get(project) if project else None,  # 아키텍처 · 코딩 규칙 (자동 분석)  # 최근 작업 기록 (새 대화에서 이어서 작업)
         "art": artstyle.summary(request.attachment_project or project),  # 프로젝트 아트 컨셉 (그림 생성 프롬프트에 반영)
         # 업로드한 첨부(이미지·PDF·MD) 중 질문과 관련된 부분
         "attachments": attachments.search(vector_store, request.query, project=request.attachment_project or project, top_k=3)
         if request.query else [],
     }
+
+
+class ArchSaveRequest(BaseModel):
+    markdown: str
+
+
+@app.get("/api/arch/{project}")
+def get_arch(project: str):
+    from .repo_manager import slugify
+    project = slugify(project)
+    md = archinfo.get(project)
+    rp = remote.get_project(project) or {}
+    return {"success": True, "markdown": md, "status": rp.get("arch_status"), "error": rp.get("arch_error")}
+
+
+@app.put("/api/arch/{project}")
+def save_arch(project: str, request: ArchSaveRequest):
+    from .repo_manager import slugify
+    project = slugify(project)
+    return {"success": True, "markdown": archinfo.save_manual(project, request.markdown)}
+
+
+class WorklogRequest(BaseModel):
+    project: str
+    request: str
+    summary: str
+    files: List[str] = []
+
+
+@app.post("/api/worklog")
+def add_worklog(request: WorklogRequest):
+    try:
+        return {"success": True, "item": worklog.add(request.project, request.request, request.summary, request.files)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/worklog/{project}")
+def get_worklog(project: str, n: int = 20):
+    return {"success": True, "items": worklog.recent(project, n)}
 
 
 # ---- 첨부 파일: 이미지 · PDF · MD 업로드 → 분석 → 코딩에 사용 ----------------------------
@@ -511,7 +565,7 @@ def delete_attachment(att_id: str):
 def llm_generate(request: LLMRequest):
     """엔진은 localhost 에만 두고 백엔드가 중계한다 (원격 PC 의 IDE 플러그인용)."""
     attachments.unload_now_if_pending()  # 코딩 중에는 비전 모델을 내려 코딩 속도 확보
-    body = request.model_dump()
+    body = request.model_dump(exclude_none=True)
     body["max_tokens"] = min(body["max_tokens"], 8192)
     if not request.stream:
         try:
@@ -528,11 +582,37 @@ def llm_generate(request: LLMRequest):
 
 @app.post("/api/remote/index")
 def remote_index(request: RemoteIndexRequest):
+    if request.partial:
+        # 바뀐 파일만 바로 갱신 (작고 빠름 · 기다렸다가 결과 반환). 아직 전체 색인이 없는 프로젝트면 무시.
+        from .repo_manager import slugify
+        name = slugify(request.project)
+        if not remote.get_project(name):
+            return {"success": True, "skipped": "전체 색인 전"}
+        docs = [(f.path, f.content) for f in request.files if remote._clean_rel(f.path)]
+        stats = vector_store.index_docs(name, docs, {}, partial=True,
+                                        deleted=[d for d in request.deleted if remote._clean_rel(d)])
+        return {"success": True, "partial": stats}
     try:
-        record = remote.start_index(vector_store, request.project, [f.model_dump() for f in request.files], request.language)
+        record = remote.start_index(vector_store, request.project, [f.model_dump() for f in request.files], request.language, arch=request.arch,
+                                     client_path=request.client_path)
     except ValueError as exc:
         raise HTTPException(status_code=413, detail=str(exc))
     return {"success": True, "project": record}
+
+
+@app.get("/api/remote/pending")
+def remote_pending():
+    """플러그인이 주기적으로 확인: 이 PC 에서 올려야 할 프로젝트 경로들"""
+    return {"success": True, "items": remote.pending()}
+
+
+@app.delete("/api/remote/projects/{name}")
+def remote_delete(name: str):
+    """원격 프로젝트 등록 삭제 + 그 프로젝트의 임베딩 데이터도 정리 (PC 의 파일은 그대로)"""
+    from .repo_manager import slugify
+    remote.remove(name)
+    vector_store.delete_where(vector_store.collection_name, "project", slugify(name))
+    return {"success": True}
 
 
 @app.get("/api/remote/projects")
@@ -561,9 +641,18 @@ def list_repos():
 
 @app.post("/api/repos/connect")
 def connect_repo(request: RepoConnectRequest):
+    loc = request.location.strip()
+    is_url = bool(re.match(r"^(https?://|git@|ssh://)", loc))
+    if request.target == "remote" or (request.target == "auto" and not is_url and not Path(loc).expanduser().exists()
+                                       and not request.init_if_missing):
+        # 이 맥에 없는 경로 = 원격 PC 의 경로 → 'PC 대기'로 등록, 그 PC 의 플러그인이 올려 색인한다
+        rec = remote.register_pending(loc, request.name, request.language, request.profile)
+        return {"success": True, "pending": True, "project": rec,
+                "message": f"원격 PC 프로젝트 '{rec['name']}' 를 등록했습니다. 그 PC 에서 IDE(Yang Coding)가 서버에 연결되면 "
+                           "자동으로 파일을 올려 코드 임베딩 · 코딩 스타일 · 아키텍처를 분석합니다."}
     try:
-        record = repos.connect(**request.model_dump())
-    except (FileNotFoundError, ValueError, KeyError, RuntimeError) as exc:
+        record = repos.connect(**request.model_dump(exclude={"target"}))
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"success": True, "repo": asdict(record)}
 
@@ -818,6 +907,74 @@ def admin_revoke_token(token_id: str):
     return {"success": True}
 
 
+class AdminConfigRequest(BaseModel):
+    values: Dict[str, str]
+
+
+@app.get("/api/admin/system")
+def admin_system():
+    return {"success": True, **sysadmin.status()}
+
+
+@app.post("/api/admin/system/{name}")
+def admin_system_action(name: str):
+    try:
+        return {"success": True, **sysadmin.action(name)}
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class ModelSwitchRequest(BaseModel):
+    preset: str
+
+
+@app.get("/api/admin/models")
+def admin_models():
+    return {"success": True, "presets": sysadmin.presets()}
+
+
+@app.post("/api/admin/models")
+def admin_switch_model(request: ModelSwitchRequest):
+    try:
+        return {"success": True, **sysadmin.switch_model(request.preset)}
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/admin/config")
+def admin_config():
+    return {"success": True, **sysadmin.get_config()}
+
+
+@app.put("/api/admin/config")
+def admin_config_save(request: AdminConfigRequest):
+    try:
+        return {"success": True, **sysadmin.save_config(request.values)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class ShellRequest(BaseModel):
+    command: str
+    cwd: str = ""
+
+
+@app.post("/api/admin/shell")
+def admin_shell(request: ShellRequest):
+    """관리 페이지 명령 창: 이 맥에서 명령 실행 (소유자만 · 출력은 NDJSON 스트림)"""
+    if not request.command.strip():
+        raise HTTPException(status_code=400, detail="명령을 입력하세요")
+    return StreamingResponse(sysadmin.shell_stream(request.command, request.cwd), media_type="application/x-ndjson")
+
+
+@app.get("/api/admin/logs/{name}")
+def admin_logs(name: str, lines: int = 200, grep: str = ""):
+    try:
+        return {"success": True, **sysadmin.logs(name, lines, grep)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 @app.get("/api/admin/tokens/default")
 def admin_default_token():
     return {"success": True, "token": security.get_token()}
@@ -831,7 +988,9 @@ def admin_rotate_default():
 # ---- IDE 플러그인 다운로드 (이 맥 또는 '내 Tailscale 계정'으로만) ---------------------------
 _PLUGINS = {
     "vscode": ("vscode-extension", "local-coding-agent-*.vsix", "VS Code 확장", "application/octet-stream"),
-    "intellij": ("intellij-plugin/build/distributions", "local-coding-agent-intellij-*.zip", "IntelliJ 플러그인", "application/zip"),
+    "intellij": ("intellij-plugin/build/distributions", "local-coding-agent-intellij-*.zip", "IntelliJ 플러그인 (2025.2+)", "application/zip"),
+    "android-studio": ("intellij-plugin/build-android/distributions", "local-coding-agent-android-studio-*.zip",
+                       "Android Studio 플러그인 (2025.1+ · Flutter)", "application/zip"),
 }
 
 

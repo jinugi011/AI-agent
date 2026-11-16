@@ -27,7 +27,6 @@ private fun indent(s: String, max: Int = 40): String {
     val shown = lines.take(max).joinToString("\n") { "    $it" }
     return if (lines.size > max) "$shown\n    …(${lines.size - max}줄 더)" else shown
 }
-private val TREE_EXCLUDES = setOf("node_modules", ".git", "dist", "build", "target", ".venv", "venv", "__pycache__", ".next", "Pods", ".dart_tool", ".gradle", "models", "out", ".idea")
 
 /** 채팅 에이전트 루프 (VS Code agent.ts 와 동일한 동작). 백그라운드 스레드에서 send() 를 호출한다. */
 /** 서버가 분석한 첨부 파일 (이미지 · PDF · MD) */
@@ -84,6 +83,7 @@ class AgentSession(
 ) {
     private val history = mutableListOf<ChatMessage>()
     private val alwaysAllowed = mutableSetOf<String>()
+    private val indexDenied = mutableSetOf<String>() // 이번 세션에서 분석을 거절한 폴더
     private val cancelled = AtomicBoolean(false)
     private val streamHandle = AtomicReference<InputStream?>(null)
     @Volatile private var runningProcess: Process? = null
@@ -108,7 +108,7 @@ class AgentSession(
 
     private fun approve(kind: String, title: String, detail: String): Boolean {
         val s = AgentSettings.current
-        val mode = if (kind == "edit") s.approveEdits else s.approveCommands
+        val mode = when (kind) { "edit" -> s.approveEdits; "files" -> s.approveFileOps; "index" -> "ask"; else -> s.approveCommands }
         if (mode == "auto" || kind in alwaysAllowed) return true
         log.line("[승인 대기] $title")
         val answer = requestApproval(kind, title, detail)
@@ -137,20 +137,12 @@ class AgentSession(
         override fun registerProcess(p: Process?) { runningProcess = p }
     }
 
-    private fun fileTree(root: Path): String {
-        val files = Files.walk(root).use { s ->
-            s.filter { p -> !p.isDirectory() && p.relativeTo(root).none { it.name in TREE_EXCLUDES } }
-                .limit(250).map { it.relativeTo(root).toString() }.sorted().toList()
-        }
-        return files.joinToString("\n") + if (files.size >= 250) "\n…(더 있음: LIST 로 확인)" else ""
-    }
-
     private fun editorBlock(editor: EditorContext): String =
         "(에디터 상태) 현재 파일: ${editor.file ?: "없음"} · 열린 파일: ${editor.openFiles.take(15).joinToString(", ").ifBlank { "없음" }}" +
             (editor.selection?.let { "\n선택 영역 (${editor.selectionRange}):\n```\n${it.take(4000)}\n```" } ?: "")
 
     // 시스템 프롬프트는 대화 중 바뀌지 않는 내용만 담는다 → 엔진 KV 캐시 재사용으로 다음 요청이 빨라짐.
-    private fun systemPrompt(ctx: JsonObject?, repoInfo: String, tree: String): String {
+    private fun systemPrompt(ctx: JsonObject?, repoInfo: String, tree: String, rootPath: String, gitInfo: String): String {
         fun s(key: String) = ctx?.get(key)?.takeIf { !it.isJsonNull }?.asString
         return """당신은 "Yang Coding" — 사용자의 IntelliJ IDE 안에서 동작하는 로컬 코딩 에이전트입니다 (Claude Code 와 유사). 이름을 물으면 Yang Coding 이라고 답한다.
 사용자 PC 운영체제: ${if (Shell.isWindows) "Windows (RUN 은 PowerShell 로 실행됨: rm/mv 대신 DELETE/MOVE 도구, 경로 구분은 / 로 써도 됨)" else System.getProperty("os.name")}
@@ -174,6 +166,23 @@ class AgentSession(
 - 답변은 사용자의 언어(기본 한국어)로 간결하게. 완료 후에는 무엇을 바꿨는지 1~3줄로 요약한다.
 - 도구 결과를 기다려야 하면 그 응답에서는 도구 블록까지만 쓰고 멈춘다. 파일을 READ 하기 전에는 EDIT 하지 않는다.
 
+## 요청 이해
+- 요청이 짧고 단순하면 그대로 단순하게 한다. 요청 범위를 넓히거나, 새 앱·새 화면을 통째로 만들지 않는다.
+- 무언가를 '만들어줘/추가해줘'는 기존 화면·기능에 더하라는 뜻이다. 사용자가 바꾸라고 하지 않은 기존 기능(예: 카운터)은 지우거나 대체하지 않는다.
+- 요청에 오타·줄임말이 있을 수 있다 (예: '덱스트 박스' = '텍스트 박스'). 기존 코드와 문맥에 맞는 가장 평범한 해석을 고른다.
+  해석이 둘 이상이고 결과가 크게 달라지면, 작업 전에 한 줄로 확인 질문만 하고 멈춘다.
+- 기존 파일은 EDIT 로 필요한 부분만 고친다. FILE 로 기존 파일 전체를 다시 쓰거나, 기존 코드를 지우고 처음부터 다시 만들지 않는다.
+- EDIT 가 실패하면 결과에 보여 준 실제 원문(줄 번호 부분)으로 SEARCH 를 고쳐 다시 EDIT 한다. 실패했다고 FILE 로 갈아엎지 않는다.
+
+## 작업 폴더 · 권한
+- 모든 도구(READ/LIST/GREP/FILE/EDIT/RUN/DELETE/MOVE/MKDIR/CHECK/PLAY)는 사용자 PC 의 작업 폴더에서 직접 실행된다.
+  서버(맥)는 이 폴더를 직접 보지 못하므로, 작업 폴더나 그 하위 폴더를 CONNECT 하지 않는다 (이미 연결·색인되어 있음).
+- 파일·폴더의 생성·삭제·이동 권한이 있다. 사용자가 요청하면 망설이지 말고 DELETE / MOVE / MKDIR 를 쓴다
+  (실행 전에 사용자 승인 창이 뜬다). "권한이 없다", "직접 지워 달라"고 답하지 않는다.
+- git 은 사용자 PC 에서 RUN git … 으로 실행한다. status·log·diff·branch·show 같은 조회는 승인 없이 바로 실행된다.
+  커밋·푸시·브랜치 변경은 사용자가 요청할 때만 한다.
+- 폴더 내용은 LIST 폴더경로 (예: LIST src/main/kotlin) 로, 파일 찾기는 LIST 글롭 (예: LIST **/*.kt) 로 본다.
+
 ${DebugKit.DEBUG_RULES}
 
 ${Protocol.TOOL_DOCS}
@@ -181,13 +190,16 @@ ${Protocol.TOOL_DOCS}
 ## 레포
 $repoInfo
 
-${ctx?.get("art")?.takeIf { !it.isJsonNull && it.asString.isNotBlank() }?.let { "## 프로젝트 아트 컨셉 (그림을 만들 때 이 컨셉에 맞게 · IMAGE 에 자동 적용됨)\n${it.asString}\n\n" } ?: ""}## 사용자 선호 · 스타일 · 제약 (항상 준수)
+${ctx?.get("architecture")?.takeIf { !it.isJsonNull && it.asString.isNotBlank() }?.let { "## 이 프로젝트의 아키텍처 · 코딩 규칙 (자동 분석 · 반드시 따른다)\n새 코드는 아래 레이어·패턴·네이밍을 그대로 따른다. 새 파일을 만들기 전에 같은 레이어의 기존 파일을 READ 해 구조를 맞춘다.\n${it.asString}\n\n" } ?: ""}${ctx?.get("art")?.takeIf { !it.isJsonNull && it.asString.isNotBlank() }?.let { "## 프로젝트 아트 컨셉 (그림을 만들 때 이 컨셉에 맞게 · IMAGE 에 자동 적용됨)\n${it.asString}\n\n" } ?: ""}## 사용자 선호 · 스타일 · 제약 (항상 준수)
 ${s("preferences")?.ifBlank { null } ?: "- (없음)"}
 
 ## 이 레포의 코딩 방법 (자동 추출)
 ${s("methods") ?: "(색인 전)"}
 
-## 파일 목록 (일부)
+## 작업 폴더 (사용자 PC)
+경로: $rootPath
+$gitInfo
+폴더 구조 (깊이 3, 폴더별 파일 수):
 $tree"""
     }
 
@@ -217,7 +229,7 @@ $tree"""
         return executeTool(call, host(root, Checkpoint(), autoApprove = true))
     }
 
-    fun send(userText: String, editor: EditorContext, attachments: List<Attachment> = emptyList(), debug: Boolean = false) {
+    fun send(userText: String, editor: EditorContext, attachments: List<Attachment> = emptyList(), debug: Boolean = false, harness: Boolean = false) {
         if (running) return
         running = true
         cancelled.set(false)
@@ -226,6 +238,8 @@ $tree"""
         val started = System.currentTimeMillis()
         var steps = 0
         var outcome = "완료"
+        var finalText = ""
+        var rootForLog: Path? = null
         log.show()
         log.line("━━━━━━━━ [${java.time.LocalTime.now().withNano(0)}] 요청 ━━━━━━━━", "head")
         log.line(if (userText.length > 500) userText.take(500) + "…" else userText)
@@ -243,7 +257,16 @@ $tree"""
             val ctx = try {
                 if (Clients.remote) {
                     // 원격: 이 PC 의 파일을 서버로 올려 벡터화(처음/6시간마다) 후 프로젝트 이름으로 컨텍스트 조회
-                    runCatching { RemoteIndex.ensure(root, log) }.onFailure { log.line("[원격 색인] 실패: ${it.message}", "error") }
+                    com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread { RemoteIndex.syncPending(log) }
+                    // 처음 보는 프로젝트: 올리기 전에 먼저 묻는다 (능동적 권한 요청)
+                    val key = RemoteIndex.projectName(root).lowercase().replace(Regex("[^a-z0-9_-]+"), "-").trim('-')
+                    val known = runCatching { Clients.get("/api/remote/projects", 5).getAsJsonObject("projects") }.getOrNull()
+                    if (known != null && !known.has(key) && root.toString() !in indexDenied) {
+                        val ok = approve("index", "Analyze: ${RemoteIndex.projectName(root)}",
+                            "처음 보는 프로젝트입니다. 이 PC 의 $root 코드·문서를 서버(맥)로 올려 임베딩하고 코딩 스타일·아키텍처를 분석할까요? (같은 스타일로 코딩하려면 필요 · 1~3분, 백그라운드)")
+                        if (!ok) indexDenied += root.toString()
+                    }
+                    if (root.toString() !in indexDenied) runCatching { RemoteIndex.ensure(root, log) }.onFailure { log.line("[원격 색인] 실패: ${it.message}", "error") }
                     Clients.post("/api/context", mapOf("query" to userText, "project" to RemoteIndex.projectName(root), "attachment_project" to RemoteIndex.projectName(root), "top_k" to 6), 60)
                 } else {
                     Clients.post("/api/context", mapOf("query" to userText, "workspace_path" to root.toString(), "attachment_project" to RemoteIndex.projectName(root), "top_k" to 6), 600)
@@ -255,7 +278,20 @@ $tree"""
             }
             val repo = ctx?.get("repo")?.takeIf { it.isJsonObject }?.asJsonObject
             repoName = repo?.get("name")?.asString ?: ""
-            val repoInfo = repo?.let { "${it.get("name").asString} · ${it.get("profile").asString} · ${it.get("language").asString} · $root" } ?: "$root (미연결)"
+            rootForLog = root
+            if (Clients.remote && ctx != null && root.toString() !in indexDenied && (repo == null || repo.get("status")?.takeIf { !it.isJsonNull }?.asString == "error")) {
+                // 색인이 없거나 실패한 프로젝트 → 다시 올려 분석 (코드 임베딩 · 코딩 스타일 · 아키텍처)
+                log.line("[원격 색인] ${if (repo == null) "색인 없음" else "이전 색인 실패"} → 다시 분석합니다")
+                com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+                    runCatching { RemoteIndex.ensure(root, log, force = true) }.onFailure { log.line("[원격 색인] 실패: ${it.message}", "error") }
+                }
+            }
+            val worklogText = ctx?.get("worklog")?.takeIf { !it.isJsonNull }?.asString.orEmpty()
+            val repoInfo = repo?.let { "${it.get("name").asString} · ${it.get("profile").asString} · ${it.get("language").asString} · $root" } ?: if (Clients.remote) "${RemoteIndex.projectName(root)} · 원격 PC 작업 폴더 (서버 색인 진행 중 — 도구는 모두 정상 사용 가능, CONNECT 불필요)"
+                else "$root (벡터 색인 전 — 도구는 모두 정상 사용 가능)"
+            val tree = WorkspaceInfo.folderTree(root)
+            val gitInfo = WorkspaceInfo.gitStable(root)
+            val gitState = WorkspaceInfo.gitNow(root)
             val related = ctx?.getAsJsonArray("hits")?.take(4)?.joinToString("\n") {
                 val h = it.asJsonObject; "--- ${h.get("source").asString} ---\n${h.get("content").asString}"
             }.orEmpty()
@@ -270,12 +306,14 @@ $tree"""
                 log.line("[첨부] ${attachments.joinToString(", ") { "${it.name}(${"%,d".format(it.chars)}자)" }} → 대화에 포함 · 전체는 $ATT_DIR/")
             }
             synchronized(history) {
-                history += ChatMessage("user", "$userText\n\n${editorBlock(editor)}" + attachmentBlock(attachments, attPaths) +
+                val isNewChat = history.isEmpty()
+                history += ChatMessage("user", "$userText\n\n${editorBlock(editor)}" +
+                    (if (isNewChat && worklogText.isNotBlank()) "\n\n(이 프로젝트의 최근 작업 기록 — 이전 대화에서 한 일. 이어서 작업할 때 참고)\n$worklogText" else "") + (if (gitState.isNotEmpty()) "\n$gitState" else "") + attachmentBlock(attachments, attPaths) +
                     (if (pastAtts.isNotBlank()) "\n\n(참고: 이전에 첨부한 자료 중 관련 부분)\n$pastAtts" else "") +
                     if (related.isNotBlank()) "\n\n(참고: 벡터 검색으로 찾은 관련 코드)\n$related" else "")
             }
             // 같은 대화에서 시스템 프롬프트가 그대로면 엔진이 앞부분을 재사용한다
-            val system = systemPrompt(ctx, repoInfo, fileTree(root))
+            val system = systemPrompt(ctx, repoInfo, tree, root.toString(), gitInfo)
             val prefCount = ctx?.get("preferences")?.takeIf { !it.isJsonNull }?.asString?.lines()?.count { it.isNotBlank() } ?: 0
             val hitNames = ctx?.getAsJsonArray("hits")?.joinToString(", ") { it.asJsonObject.get("source").asString }.orEmpty()
             log.line("[컨텍스트] 레포 $repoInfo")
@@ -284,7 +322,7 @@ $tree"""
             val h = host(root, checkpoint)
             val s = AgentSettings.current
             // 디버그 모드는 재현 → 계측 → 수정 → 재검증으로 단계가 많아 두 배까지 허용
-            val maxSteps = if (debug) maxOf(24, s.maxSteps * 2) else s.maxSteps
+            val maxSteps = if (debug || harness) maxOf(24, s.maxSteps * 2) else s.maxSteps
             val gate = Gate()
 
             for (step in 0 until maxSteps) {
@@ -298,7 +336,9 @@ $tree"""
                 val messages = listOf(ChatMessage("system", system)) + synchronized(history) { history.toList() }
                 val stepStart = System.currentTimeMillis()
                 log.line("[모델 #$steps] 생성 시작 · 메시지 ${messages.size}개 · ${"%,d".format(messages.sumOf { it.content.length })}자", "head")
-                val (text, stats) = Clients.stream(messages, s.maxTokens, s.temperature, streamHandle, { cancelled.get() }) { tok ->
+                // 요청의 첫 단계: 무엇을 원하는지 짧게 생각한 뒤 시작 (오타·애매한 요청 오해 방지)
+                val (text, stats) = Clients.stream(messages, s.maxTokens, s.temperature, streamHandle, { cancelled.get() },
+                    think = if (step == 0) true else null, thinkBudget = if (step == 0) 600 else null) { tok ->
                     raw.append(tok)
                     log.raw(tok)
                     val shown = Protocol.stripToolBlocks(raw.toString())
@@ -316,13 +356,14 @@ $tree"""
 
                 var calls = Protocol.parseToolCalls(text)
                 if (calls.isEmpty()) {
-                    val nudge = if (step < maxSteps - 1) finishGate(checkpoint, gate, s.verifyBeforeFinish || debug) else ""
+                    val nudge = if (step < maxSteps - 1) finishGate(checkpoint, gate, s.verifyBeforeFinish || debug || harness) else ""
                     if (nudge.isNotEmpty()) {
                         log.line("[완료 관문] " + nudge.lineSequence().first())
                         synchronized(history) { history += ChatMessage("user", nudge) }
                         continue
                     }
                     log.line("[턴 종료] 도구 호출 없음 → 최종 답변")
+                    finalText = Protocol.stripToolBlocks(text)
                     break
                 }
                 // 결과를 보기 전에 수정·실행을 몰아서 호출하지 못하게: 앞쪽 조회 도구만 실행
@@ -390,6 +431,15 @@ $tree"""
                 if (outcome == "오류") "error" else "head")
             running = false
             emit(mapOf("type" to "turn-end", "changedFiles" to checkpoint.originals.size))
+            // 작업 기록: 새 대화에서도 이어서 작업하도록 서버에 남긴다
+            val r = rootForLog
+            if (r != null && finalText.isNotBlank() && outcome == "완료") {
+                val files = checkpoint.originals.keys.map { runCatching { r.relativize(Path.of(it)).toString().replace('\\', '/') }.getOrDefault(it) }
+                val req = userText.take(500); val sum = finalText.take(800)
+                com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+                    runCatching { Clients.post("/api/worklog", mapOf("project" to RemoteIndex.projectName(r), "request" to req, "summary" to sum, "files" to files), 10) }
+                }
+            }
             emit(mapOf("type" to "busy", "busy" to false))
         }
     }

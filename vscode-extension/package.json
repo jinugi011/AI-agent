@@ -2,7 +2,7 @@
   "name": "local-coding-agent",
   "displayName": "Yang Coding",
   "description": "Yang Coding — 로컬 코딩 모델(Rust + llama.cpp)로 자연어 채팅을 통해 코딩하는 에이전트",
-  "version": "0.6.0",
+  "version": "0.9.1",
   "publisher": "local",
   "license": "UNLICENSED",
   "private": true,
@@ -199,6 +199,20 @@
             "enumDescriptions": [
               "바로 수정 (대화별 되돌리기 가능)",
               "수정할 때마다 차이(diff)를 보여 주고 승인 받기"
+            ]
+          },
+          "localAgent.approveFileOps": {
+            "type": "string",
+            "enum": [
+              "ask",
+              "auto"
+            ],
+            "default": "ask",
+            "markdownDescription": "**파일·폴더 삭제/이동 승인 방식** (DELETE · MOVE)",
+            "order": 22,
+            "enumDescriptions": [
+              "삭제·이동마다 승인 받기 (권장 · '항상 허용'을 누르면 이번 창에서는 다시 묻지 않음)",
+              "승인 없이 바로 실행 (파일은 /undo, 폴더는 휴지통에서 복구)"
             ]
           },
           "localAgent.approveCommands": {
