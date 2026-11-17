@@ -19,6 +19,89 @@
     const option = document.createElement('option'); option.value = value; option.textContent = label; workMode.appendChild(option);
   }
   sendBtn.parentElement?.insertBefore(workMode, sendBtn);
+  // Keep the JCEF menu inside the webview so adjacent IDE tool windows cannot cover it.
+  if (document.body.dataset.host === 'intellij') {
+    workMode.hidden = true;
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'work-mode-trigger secondary';
+    trigger.setAttribute('aria-label', '작업 방식');
+    trigger.setAttribute('aria-haspopup', 'listbox');
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.setAttribute('aria-controls', 'work-mode-menu');
+    const menu = document.createElement('div');
+    menu.id = 'work-mode-menu';
+    menu.className = 'work-mode-menu';
+    menu.setAttribute('role', 'listbox');
+    menu.setAttribute('aria-label', '작업 방식');
+    menu.hidden = true;
+    const options = Array.from(workMode.options, (option, index) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.setAttribute('role', 'option');
+      item.tabIndex = -1;
+      item.textContent = option.textContent;
+      item.addEventListener('click', () => {
+        workMode.selectedIndex = index;
+        sync();
+        close(true);
+      });
+      menu.appendChild(item);
+      return item;
+    });
+    function sync() {
+      trigger.textContent = workMode.options[workMode.selectedIndex].textContent + ' ▴';
+      options.forEach((item, index) => item.setAttribute('aria-selected', String(index === workMode.selectedIndex)));
+    }
+    function close(restoreFocus = false) {
+      menu.hidden = true;
+      trigger.setAttribute('aria-expanded', 'false');
+      if (restoreFocus) trigger.focus();
+    }
+    function open(index = workMode.selectedIndex) {
+      const rect = trigger.getBoundingClientRect();
+      const gap = 6;
+      const width = Math.min(Math.max(rect.width, 190), window.innerWidth - gap * 2);
+      menu.style.width = `${width}px`;
+      menu.style.left = `${Math.max(gap, Math.min(rect.left, window.innerWidth - width - gap))}px`;
+      menu.style.bottom = `${window.innerHeight - rect.top + gap}px`;
+      menu.style.maxHeight = `${Math.max(0, rect.top - gap * 2)}px`;
+      menu.hidden = false;
+      trigger.setAttribute('aria-expanded', 'true');
+      options[index].focus();
+    }
+    trigger.addEventListener('click', () => menu.hidden ? open() : close());
+    trigger.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        open();
+      }
+    });
+    menu.addEventListener('keydown', (event) => {
+      const index = options.indexOf(/** @type {HTMLButtonElement} */ (document.activeElement));
+      let next = index;
+      if (event.key === 'ArrowDown') next = (index + 1) % options.length;
+      else if (event.key === 'ArrowUp') next = (index - 1 + options.length) % options.length;
+      else if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = options.length - 1;
+      else if (event.key === 'Escape') { event.preventDefault(); close(true); return; }
+      else if (event.key === 'Tab') { close(true); return; }
+      else return;
+      event.preventDefault();
+      options[next].focus();
+    });
+    document.addEventListener('pointerdown', (event) => {
+      if (!menu.contains(/** @type {Node} */ (event.target)) && !trigger.contains(/** @type {Node} */ (event.target))) close();
+    });
+    document.addEventListener('focusin', (event) => {
+      if (!menu.contains(/** @type {Node} */ (event.target)) && event.target !== trigger) close();
+    });
+    window.addEventListener('resize', () => close());
+    window.addEventListener('blur', () => close());
+    workMode.after(trigger);
+    document.body.appendChild(menu);
+    sync();
+  }
 
   // ---- 렌더링 유틸 ------------------------------------------------------------
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));

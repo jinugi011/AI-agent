@@ -225,7 +225,7 @@ class ChatPanel(private val project: Project) : Disposable {
 <html lang="ko"><head><meta charset="utf-8">
 <style id="theme">${themeCss()}</style>
 <style>${resource("chat.css")}</style>
-</head><body>
+</head><body data-host="intellij">
   <header id="status"><span class="dot"></span><span id="status-text">연결 확인 중…</span></header>
   <section id="setup" hidden></section>
   <main id="log" aria-live="polite"></main>
